@@ -1,0 +1,97 @@
+use crate::error::RdpError;
+use crate::protocol::Transport;
+use crate::protocol::tpkt::Tpkt;
+
+const TPDU_CONNECTION_REQUEST: u8 = 0xE0;
+const TPDU_CONNECTION_CONFIRM: u8 = 0xD0;
+
+const TYPE_RDP_NEG_REQ: u8 = 0x01;
+const TYPE_RDP_NEG_RSP: u8 = 0x02;
+const TYPE_RDP_NEG_FAILURE: u8 = 0x03;
+
+pub const PROTOCOL_RDP: u32 = 0x00000000;
+pub const PROTOCOL_SSL: u32 = 0x00000001;
+pub const PROTOCOL_HYBRID: u32 = 0x00000002;
+
+pub struct X224<T: Transport> {
+    tpkt: Tpkt<T>,
+    pub selected_protocol: u32,
+}
+
+impl<T: Transport> X224<T> {
+    pub fn new(tpkt: Tpkt<T>) -> Self {
+        X224 { tpkt, selected_protocol: PROTOCOL_RDP }
+    }
+
+    pub async fn connect(&mut self, username: &str) -> Result<(), RdpError> {
+        let cookie = format!("Cookie: mstshash={}\r\n", username);
+        let cookie_bytes = cookie.as_bytes();
+        let neg_req = [TYPE_RDP_NEG_REQ, 0x00, 0x08, 0x00, 0x03, 0x00, 0x00, 0x00];
+
+        let tpdu_len = 6 + cookie_bytes.len() + 8;
+        let li = (tpdu_len - 1) as u8;
+
+        let mut buf = Vec::new();
+        buf.push(li);
+        buf.push(TPDU_CONNECTION_REQUEST);
+        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.extend_from_slice(&[0x00, 0x00]);
+        buf.push(0x00);
+        buf.extend_from_slice(cookie_bytes);
+        buf.extend_from_slice(&neg_req);
+
+        self.tpkt.send(&buf).await
+    }
+
+    pub async fn recv_confirm(&mut self) -> Result<u32, RdpError> {
+        let (_, data) = self.tpkt.recv().await?;
+        if data.len() < 7 {
+            return Err(RdpError::Protocol("X224 confirm too short".into()));
+        }
+        let tpdu_code = data[1];
+        if tpdu_code != TPDU_CONNECTION_CONFIRM {
+            return Err(RdpError::Protocol(format!("Expected CC, got {:02x}", tpdu_code)));
+        }
+        let li = data[0] as usize;
+        if li >= 7 && data.len() >= 12 {
+            let neg_type = data[7];
+            if neg_type == TYPE_RDP_NEG_RSP {
+                let proto = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                self.selected_protocol = proto;
+                return Ok(proto);
+            } else if neg_type == TYPE_RDP_NEG_FAILURE {
+                return Err(RdpError::Protocol("RDP negotiation failure".into()));
+            }
+        }
+        Ok(PROTOCOL_RDP)
+    }
+
+    pub async fn send(&mut self, data: &[u8]) -> Result<(), RdpError> {
+        let mut buf = vec![0x02, 0xF0, 0x80];
+        buf.extend_from_slice(data);
+        self.tpkt.send(&buf).await
+    }
+
+    pub async fn recv(&mut self) -> Result<(bool, Vec<u8>), RdpError> {
+        let (is_fp, data) = self.tpkt.recv().await?;
+        if is_fp {
+            return Ok((true, data));
+        }
+        if data.len() < 3 {
+            return Err(RdpError::Protocol("X224 data too short".into()));
+        }
+        Ok((false, data[3..].to_vec()))
+    }
+
+    pub fn selected_protocol(&self) -> u32 {
+        self.selected_protocol
+    }
+
+    pub fn into_tpkt(self) -> Tpkt<T> {
+        self.tpkt
+    }
+
+    pub fn tpkt_mut(&mut self) -> &mut Tpkt<T> {
+        &mut self.tpkt
+    }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "rdp-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+thiserror = "1"
+log = "0.4"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+des = "0.8"
+aes = "0.8"
+cipher = "0.4"
+md4 = "0.10"
+rsa = { version = "0.9", features = ["sha2"] }
+getrandom = { version = "0.2", features = ["js"] }
+rand = "0.8"
+futures-channel = "0.3"
+futures-util = "0.3"

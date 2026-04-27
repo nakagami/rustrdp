@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>rdpwasm – WebAssembly RDP Client</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #1e1e1e; color: #ccc; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+    h1 { margin-bottom: 16px; color: #fff; }
+    form { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; justify-content: center; }
+    input { padding: 6px 10px; border: 1px solid #555; background: #2d2d2d; color: #eee; border-radius: 4px; }
+    button { padding: 6px 16px; background: #0066cc; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+    button:hover { background: #0055bb; }
+    canvas { border: 1px solid #444; background: #000; cursor: crosshair; }
+  </style>
+</head>
+<body>
+  <h1>rdpwasm</h1>
+  <form id="connect-form">
+    <input id="host"     type="text"     placeholder="RDP host"  value="localhost" />
+    <input id="port"     type="number"   placeholder="Port"      value="3389" />
+    <input id="user"     type="text"     placeholder="Username"  value="" />
+    <input id="pass"     type="password" placeholder="Password"  value="" />
+    <input id="domain"   type="text"     placeholder="Domain"    value="" />
+    <button type="submit">Connect</button>
+    <button type="button" id="disconnect-btn">Disconnect</button>
+  </form>
+  <canvas id="rdp-canvas" width="1280" height="720"></canvas>
+
+  <script type="module">
+    let client = null;
+
+    async function loadWasm() {
+      try {
+        const { default: init, RdpClient } = await import('./pkg/rdp_wasm.js');
+        await init();
+        return RdpClient;
+      } catch (e) {
+        console.warn('WASM module not yet built:', e.message);
+        return null;
+      }
+    }
+
+    document.getElementById('connect-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const host   = document.getElementById('host').value;
+      const port   = document.getElementById('port').value;
+      const target = `${host}:${port}`;
+
+      const wsUrl = `ws://${location.host}/ws`;
+
+      const RdpClient = await loadWasm();
+      if (!RdpClient) {
+        alert('WASM not built yet – run: make wasm');
+        return;
+      }
+
+      try {
+        client = new RdpClient(wsUrl, target);
+        console.log('RDP client created, connecting to', target);
+      } catch (err) {
+        console.error('Failed to create RDP client:', err);
+      }
+    });
+
+    document.getElementById('disconnect-btn').addEventListener('click', () => {
+      if (client) {
+        client.disconnect();
+        client = null;
+      }
+    });
+  </script>
+</body>
+</html>
