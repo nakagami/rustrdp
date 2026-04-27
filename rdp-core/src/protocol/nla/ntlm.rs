@@ -5,7 +5,7 @@ use md5::Md5;
 
 type HmacMd5 = Hmac<Md5>;
 
-const NTLM_NTLMv2_FLAGS: u32 =
+const NTLM_NTLMV2_FLAGS: u32 =
     0x80000000 | // NEGOTIATE_56
     0x40000000 | // NEGOTIATE_KEY_EXCH
     0x20000000 | // NEGOTIATE_128
@@ -36,7 +36,7 @@ impl Ntlm {
         let mut msg = Vec::new();
         msg.extend_from_slice(b"NTLMSSP\0");
         msg.extend_from_slice(&1u32.to_le_bytes());
-        msg.extend_from_slice(&NTLM_NTLMv2_FLAGS.to_le_bytes());
+        msg.extend_from_slice(&NTLM_NTLMV2_FLAGS.to_le_bytes());
         msg.extend_from_slice(&0u16.to_le_bytes());
         msg.extend_from_slice(&0u16.to_le_bytes());
         msg.extend_from_slice(&32u32.to_le_bytes());
@@ -128,7 +128,7 @@ impl Ntlm {
         msg.extend_from_slice(&(encrypted_random_session_key.len() as u16).to_le_bytes());
         msg.extend_from_slice(&(encrypted_random_session_key.len() as u16).to_le_bytes());
         msg.extend_from_slice(&(session_key_offset as u32).to_le_bytes());
-        msg.extend_from_slice(&NTLM_NTLMv2_FLAGS.to_le_bytes());
+        msg.extend_from_slice(&NTLM_NTLMV2_FLAGS.to_le_bytes());
         msg.extend_from_slice(&lm_response);
         msg.extend_from_slice(&nt_challenge_response);
         msg.extend_from_slice(&domain_utf16);
