@@ -5,7 +5,13 @@ pub fn decompress(input: &[u8], width: usize, height: usize, bpp: usize) -> Vec<
         32 => 4,
         _ => 1,
     };
-    let output_size = width * height * bytes_per_pixel;
+    let output_size = width
+        .saturating_mul(height)
+        .saturating_mul(bytes_per_pixel);
+    if output_size > 32 * 1024 * 1024 {
+        log::warn!("rle::decompress: suspiciously large output_size={}, skipping", output_size);
+        return vec![];
+    }
     let mut output = vec![0u8; output_size];
     let mut pos = 0usize;
     let mut out_pos = 0usize;

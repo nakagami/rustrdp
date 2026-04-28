@@ -11,7 +11,7 @@ use crate::protocol::pdu::{
     ShareControlHeader, ShareDataHeader,
     PDUTYPE_DEMANDACTIVEPDU, PDUTYPE_CONFIRMACTIVEPDU, PDUTYPE_DEACTIVATEALLPDU, PDUTYPE_DATAPDU,
     PDUTYPE2_UPDATE, PDUTYPE2_CONTROL, PDUTYPE2_SYNCHRONIZE, PDUTYPE2_INPUT,
-    PDUTYPE2_FONTMAP, PDUTYPE2_FONTLIST,
+    PDUTYPE2_FONTMAP, PDUTYPE2_FONTLIST, PDUTYPE2_SUPPRESS_OUTPUT,
     UPDATETYPE_BITMAP,
 };
 use crate::protocol::pdu::caps::build_all_capabilities;
@@ -41,6 +41,8 @@ pub struct RdpSession<T: Transport> {
     width: u16,
     height: u16,
     kbd_layout: u32,
+    /// Buffer for reassembling multi-PDU fragmented FastPath updates
+    frag_buf: Vec<u8>,
 }
 
 impl<T: Transport> RdpSession<T> {
@@ -57,20 +59,16 @@ impl<T: Transport> RdpSession<T> {
         // Step 1: X.224 connection negotiation
         let tpkt = Tpkt::new(transport);
         let mut x224 = X224::new(tpkt);
-        #[cfg(debug_assertions)]
-        eprintln!("[client] step1: X.224 connect");
+                log::debug!("[client] step1: X.224 connect");
         x224.connect(user).await?;
         let selected_protocol = x224.recv_confirm().await?;
-        #[cfg(debug_assertions)]
-        eprintln!("[client] step1 done: selected_protocol=0x{:08x}", selected_protocol);
+                log::debug!("[client] step1 done: selected_protocol=0x{:08x}", selected_protocol);
 
         // Step 2: TLS upgrade (proxy performs TLS and sends back the server public key)
         let pub_key = if selected_protocol == PROTOCOL_SSL || selected_protocol == PROTOCOL_HYBRID {
-            #[cfg(debug_assertions)]
-            eprintln!("[client] step2: start_tls");
+                        log::debug!("[client] step2: start_tls");
             let pk = x224.tpkt_mut().transport_mut().start_tls().await?;
-            #[cfg(debug_assertions)]
-            eprintln!("[client] step2 done: pub_key len={}", pk.len());
+                        log::debug!("[client] step2 done: pub_key len={}", pk.len());
             pk
         } else {
             Vec::new()
@@ -78,13 +76,11 @@ impl<T: Transport> RdpSession<T> {
 
         // Step 3: CredSSP / NLA authentication
         let transport = if selected_protocol == PROTOCOL_HYBRID {
-            #[cfg(debug_assertions)]
-            eprintln!("[client] step3: CredSSP/NLA authenticate");
+                        log::debug!("[client] step3: CredSSP/NLA authenticate");
             let inner_transport = x224.into_tpkt().into_transport();
             let mut cssp = Cssp::new(inner_transport, domain, user, password);
             cssp.authenticate(&pub_key).await?;
-            #[cfg(debug_assertions)]
-            eprintln!("[client] step3 done: CredSSP complete");
+                        log::debug!("[client] step3 done: CredSSP complete");
             cssp.into_transport()
         } else {
             x224.into_tpkt().into_transport()
@@ -96,28 +92,25 @@ impl<T: Transport> RdpSession<T> {
         x224.selected_protocol = selected_protocol;
 
         // Step 5: MCS / GCC connection
-        #[cfg(debug_assertions)]
-        eprintln!("[client] step5: MCS connect");
+                log::debug!("[client] step5: MCS connect");
         let client_data = ClientData {
             width,
             height,
             kbd_layout,
             color_depth: 0xca01,
-            channels: vec![],
             server_selected_protocol: selected_protocol,
+            ..ClientData::default()
         };
         let gcc_data = create_gcc_data(&client_data);
         let mut mcs = McsClient::new(x224);
         mcs.connect(&gcc_data).await?;
         let server_data = mcs.recv_connect_response().await?;
         mcs.io_channel = server_data.io_channel;
-        #[cfg(debug_assertions)]
-        eprintln!("[client] step5 done: io_channel={} channels={:?}", mcs.io_channel, server_data.channels);
+                log::debug!("[client] step5 done: io_channel={} channels={:?}", mcs.io_channel, server_data.channels);
         mcs.erect_domain().await?;
         mcs.attach_user().await?;
         mcs.recv_attach_user_confirm().await?;
-        #[cfg(debug_assertions)]
-        eprintln!("[client] attach_user done: user_channel={}", mcs.user_channel);
+                log::debug!("[client] attach_user done: user_channel={}", mcs.user_channel);
 
         // Step 6: Join all channels
         let user_channel = mcs.user_channel;
@@ -126,14 +119,18 @@ impl<T: Transport> RdpSession<T> {
         mcs.recv_channel_join_confirm().await?;
         mcs.channel_join(io_channel).await?;
         mcs.recv_channel_join_confirm().await?;
+        if let Some(msg_ch) = server_data.msg_channel {
+                        log::debug!("[client] joining msg_channel={}", msg_ch);
+            mcs.channel_join(msg_ch).await?;
+            mcs.recv_channel_join_confirm().await?;
+        }
         for &ch in &server_data.channels.clone() {
             mcs.channel_join(ch).await?;
             mcs.recv_channel_join_confirm().await?;
         }
 
         // Step 7: Send ClientInfo PDU (with 4-byte security header for enhanced security)
-        #[cfg(debug_assertions)]
-        eprintln!("[client] step7: send ClientInfo");
+                log::debug!("[client] step7: send ClientInfo");
         let info_pdu = build_client_info(domain, user, password);
         mcs.send_data(io_channel, &info_pdu).await?;
 
@@ -157,8 +154,7 @@ impl<T: Transport> RdpSession<T> {
                 if let Ok(hdr) = ShareControlHeader::parse(&data, &mut pos) {
                     if hdr.pdu_type == PDUTYPE_DEMANDACTIVEPDU && pos + 4 <= data.len() {
                         share_id = read_u32_le(&data, &mut pos);
-                        #[cfg(debug_assertions)]
-                        eprintln!("[client] Demand Active received: share_id=0x{:08x}", share_id);
+                                                log::debug!("[client] Demand Active received: share_id=0x{:08x}", share_id);
                         break;
                     }
                 }
@@ -166,20 +162,21 @@ impl<T: Transport> RdpSession<T> {
         }
 
         // Step 10: Confirm Active PDU
-        #[cfg(debug_assertions)]
-        eprintln!("[client] step10: send Confirm Active");
-        let caps = build_all_capabilities(width, height, kbd_layout);
+                log::debug!("[client] step10: send Confirm Active");
+        let (caps, num_caps) = build_all_capabilities(width, height, kbd_layout);
         let mut confirm_body = Vec::new();
         write_u32_le(&mut confirm_body, share_id);
         write_u16_le(&mut confirm_body, 0x03EA); // originatorId
         write_u16_le(&mut confirm_body, 4); // lengthSourceDescriptor
-        write_u16_le(&mut confirm_body, (4 + caps.len()) as u16); // lengthCombinedCapabilities (4 = numberCapabilities(2) + pad(2))
+        write_u16_le(&mut confirm_body, (4 + caps.len()) as u16); // lengthCombinedCapabilities
         confirm_body.extend_from_slice(b"RDP\0");
-        write_u16_le(&mut confirm_body, 11); // numberCapabilities
+        write_u16_le(&mut confirm_body, num_caps); // numberCapabilities
         write_u16_le(&mut confirm_body, 0); // pad2Octets
         confirm_body.extend_from_slice(&caps);
         let confirm_sch = ShareControlHeader::build(PDUTYPE_CONFIRMACTIVEPDU, user_channel, confirm_body.len());
         let confirm_pdu = [confirm_sch, confirm_body].concat();
+        log::debug!("[client] confirm_active hex ({} bytes): {}", confirm_pdu.len(),
+            confirm_pdu.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
         mcs.send_data(io_channel, &confirm_pdu).await?;
 
         // Step 11: Synchronize sequence
@@ -192,7 +189,7 @@ impl<T: Transport> RdpSession<T> {
 
         // Control Cooperate
         let mut ctrl_coop = Vec::new();
-        write_u16_le(&mut ctrl_coop, 14u16); // CTRLACTION_COOPERATE
+        write_u16_le(&mut ctrl_coop, 4u16); // CTRLACTION_COOPERATE
         write_u16_le(&mut ctrl_coop, 0u16);
         write_u32_le(&mut ctrl_coop, 0u32);
         let ctrl_coop_pdu = build_data_pdu(share_id, user_channel, PDUTYPE2_CONTROL, &ctrl_coop);
@@ -200,7 +197,7 @@ impl<T: Transport> RdpSession<T> {
 
         // Control Request
         let mut ctrl_req = Vec::new();
-        write_u16_le(&mut ctrl_req, 4u16); // CTRLACTION_REQUESTCONTROL
+        write_u16_le(&mut ctrl_req, 1u16); // CTRLACTION_REQUESTCONTROL
         write_u16_le(&mut ctrl_req, 0u16);
         write_u32_le(&mut ctrl_req, 0u32);
         let ctrl_req_pdu = build_data_pdu(share_id, user_channel, PDUTYPE2_CONTROL, &ctrl_req);
@@ -216,8 +213,7 @@ impl<T: Transport> RdpSession<T> {
         mcs.send_data(io_channel, &font_pdu).await?;
 
         // Step 12: Wait for FontMap (session is ready after this)
-        #[cfg(debug_assertions)]
-        eprintln!("[client] step12: waiting for FontMap");
+                log::debug!("[client] step12: waiting for FontMap");
         loop {
             let (ch, data) = mcs.recv_data().await?;
             if ch == 0xFFFF {
@@ -225,16 +221,40 @@ impl<T: Transport> RdpSession<T> {
             }
             let mut pos = 0;
             if let Ok(hdr) = ShareControlHeader::parse(&data, &mut pos) {
+                                log::debug!("[client] step12 recv: pdu_type=0x{:04x} data_len={}", hdr.pdu_type, data.len());
                 if hdr.pdu_type == PDUTYPE_DATAPDU {
                     if let Ok(dh) = ShareDataHeader::parse(&data, &mut pos) {
+                                                log::debug!("[client] step12 data pdu: pduType2={}", dh.pdu_type2);
                         if dh.pdu_type2 == PDUTYPE2_FONTMAP {
-                            #[cfg(debug_assertions)]
-                            eprintln!("[client] FontMap received: session ready");
+                                                        log::debug!("[client] FontMap received: session ready");
                             break;
                         }
+                        if dh.pdu_type2 == 0x2F && pos + 4 <= data.len() {
+                            let err_code = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+                            log::error!("[client] ERROR INFO PDU: error_code=0x{:08x}", err_code);
+                        }
                     }
+                } else if hdr.pdu_type == PDUTYPE_DEACTIVATEALLPDU {
+                    log::warn!("[client] DEACTIVATE_ALL received in step12");
                 }
+            } else {
+                                log::debug!("[client] step12 unparseable data: len={} hex={}", data.len(),
+                    data.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
             }
+        }
+
+        // Tell the server to start sending display updates (MS-RDPBCGR 2.2.11.3.1)
+        {
+            let mut body = Vec::with_capacity(12);
+            body.push(1u8);          // AllowDisplayUpdates = ALLOW_DISPLAY_UPDATES
+            body.extend_from_slice(&[0u8; 3]); // pad
+            write_u16_le(&mut body, 0);        // left
+            write_u16_le(&mut body, 0);        // top
+            write_u16_le(&mut body, width - 1); // right
+            write_u16_le(&mut body, height - 1); // bottom
+            let pdu = build_data_pdu(share_id, user_channel, PDUTYPE2_SUPPRESS_OUTPUT, &body);
+            log::debug!("[client] sending SuppressOutput (ALLOW_DISPLAY_UPDATES)");
+            mcs.send_data(io_channel, &pdu).await?;
         }
 
         Ok(RdpSession {
@@ -245,50 +265,77 @@ impl<T: Transport> RdpSession<T> {
             width,
             height,
             kbd_layout,
+            frag_buf: Vec::new(),
         })
     }
 
     /// Receive the next display event from the server.
     pub async fn recv_event(&mut self) -> Result<RdpEvent, RdpError> {
+        log::debug!("[recv_event] entering");
         loop {
-            let (ch, data) = self.mcs.recv_data().await?;
+            log::debug!("[recv_event] waiting for recv_data...");
+            let result = self.mcs.recv_data().await;
+            log::debug!("[recv_event] recv_data returned: {}", if result.is_ok() { "Ok" } else { "Err" });
+            let (ch, data) = result?;
 
             if ch == 0xFFFF {
                 // FastPath update
-                let bitmaps = parse_fastpath_updates(&data);
+                log::debug!("[recv_event] FastPath data_len={}", data.len());
+                let bitmaps = parse_fastpath_updates(&data, &mut self.frag_buf);
+                log::debug!("[recv_event] FastPath bitmaps={}", bitmaps.len());
                 if !bitmaps.is_empty() {
                     return Ok(RdpEvent::Bitmap(bitmaps));
                 }
                 continue;
             }
 
+            log::debug!("[recv_event] ch={} data_len={}", ch, data.len());
+
             let mut pos = 0;
             let hdr = match ShareControlHeader::parse(&data, &mut pos) {
                 Ok(h) => h,
-                Err(_) => continue,
+                Err(e) => {
+                    log::warn!("[recv_event] ShareControlHeader parse error: {:?}", e);
+                    continue;
+                }
             };
+
+            log::debug!("[recv_event] pdu_type=0x{:04x}", hdr.pdu_type);
 
             match hdr.pdu_type {
                 PDUTYPE_DEACTIVATEALLPDU => {
+                    log::debug!("[recv_event] DeactivateAll");
                     return Ok(RdpEvent::Deactivated);
                 }
                 PDUTYPE_DATAPDU => {
                     let dh = match ShareDataHeader::parse(&data, &mut pos) {
                         Ok(h) => h,
-                        Err(_) => continue,
+                        Err(e) => {
+                            log::warn!("[recv_event] ShareDataHeader parse error: {:?}", e);
+                            continue;
+                        }
                     };
+                    log::debug!("[recv_event] pduType2={}", dh.pdu_type2);
+                    if dh.pdu_type2 == 0x2F && pos + 4 <= data.len() {
+                        let err_code = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+                        log::error!("[recv_event] ERROR INFO PDU: error_code=0x{:08x}", err_code);
+                    }
                     if dh.pdu_type2 == PDUTYPE2_UPDATE && pos + 2 <= data.len() {
                         let update_type = u16::from_le_bytes([data[pos], data[pos + 1]]);
                         pos += 2;
+                        log::debug!("[recv_event] update_type=0x{:04x}", update_type);
                         if update_type == UPDATETYPE_BITMAP {
                             let bitmaps = parse_bitmap_update(&data, &mut pos);
+                            log::debug!("[recv_event] slow-path bitmaps={}", bitmaps.len());
                             if !bitmaps.is_empty() {
                                 return Ok(RdpEvent::Bitmap(bitmaps));
                             }
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    log::debug!("[recv_event] unhandled pdu_type=0x{:04x}", hdr.pdu_type);
+                }
             }
         }
     }
@@ -362,8 +409,9 @@ fn build_client_info(domain: &str, user: &str, password: &str) -> Vec<u8> {
     let user_utf16 = to_utf16_le(user);
     let pass_utf16 = to_utf16_le(password);
 
-    // INFO_MOUSE | INFO_DISABLECTRLALTDEL | INFO_AUTOLOGON | INFO_UNICODE | INFO_MAXIMIZESHELL | INFO_ENABLEWINDOWSKEY
-    let flags: u32 = 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0100;
+    // Match grdp flags: INFO_MOUSE | INFO_DISABLECTRLALTDEL | INFO_AUTOLOGON | INFO_UNICODE |
+    // INFO_MAXIMIZESHELL | INFO_ENABLEWINDOWSKEY | INFO_NOAUDIOPLAYBACK | INFO_VIDEO_DISABLE
+    let flags: u32 = 0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0100 | 0x4000 | 0x00020000;
 
     let mut info = Vec::new();
 
@@ -391,17 +439,17 @@ fn build_client_info(domain: &str, user: &str, password: &str) -> Vec<u8> {
 
     // TS_EXTENDED_INFO_PACKET
     write_u16_le(&mut info, 2); // clientAddressFamily (AF_INET)
-    let addr_utf16 = to_utf16_le("127.0.0.1");
-    write_u16_le(&mut info, (addr_utf16.len() + 2) as u16); // cbClientAddress (with null)
-    info.extend_from_slice(&addr_utf16);
-    info.extend_from_slice(&[0, 0]);
+    write_u16_le(&mut info, 2); // cbClientAddress: empty string (just null terminator)
+    info.extend_from_slice(&[0, 0]); // clientAddress: null
     write_u16_le(&mut info, 2); // cbClientDir (empty string, just null)
     info.extend_from_slice(&[0, 0]);
     info.extend_from_slice(&[0u8; 172]); // clientTimeZone
     write_u32_le(&mut info, 0); // clientSessionId
-    // performanceFlags: disable wallpaper, themes, cursor shadow
-    write_u32_le(&mut info, 0x0020 | 0x0080 | 0x0400);
-    write_u16_le(&mut info, 0); // cbAutoReconnectCookie
+    // performanceFlags: match grdp 0x00000187
+    // PERF_DISABLE_WALLPAPER(0x01) | PERF_DISABLE_FULLWINDOWDRAG(0x02) |
+    // PERF_DISABLE_MENUANIMATIONS(0x04) | PERF_DISABLE_THEMING(0x80) |
+    // PERF_DISABLE_CURSOR_SHADOW(0x100)
+    write_u32_le(&mut info, 0x00000187);
 
     info
 }
@@ -427,7 +475,14 @@ fn parse_bitmap_update(data: &[u8], pos: &mut usize) -> Vec<Bitmap> {
         let flags = read_u16_le(data, pos);
         let bitmap_len = read_u16_le(data, pos) as usize;
 
+        log::debug!(
+            "[bitmap] dest=({},{},{},{}) size={}x{} bpp={} flags=0x{:04x} len={}",
+            dest_left, dest_top, dest_right, dest_bottom,
+            width, height, bpp, flags, bitmap_len
+        );
+
         if *pos + bitmap_len > data.len() {
+            log::warn!("[bitmap] bitmap_len={} exceeds remaining data, breaking", bitmap_len);
             break;
         }
         let raw = &data[*pos..*pos + bitmap_len];
@@ -462,8 +517,12 @@ fn parse_bitmap_update(data: &[u8], pos: &mut usize) -> Vec<Bitmap> {
 
 fn flip_vertical(data: &[u8], width: usize, height: usize, bpp: usize) -> Vec<u8> {
     let bytes_per_pixel = (bpp + 7) / 8;
-    let stride = width * bytes_per_pixel;
-    let total = stride * height;
+    let stride = width.saturating_mul(bytes_per_pixel);
+    let total = stride.saturating_mul(height);
+    if total > 32 * 1024 * 1024 {
+        log::warn!("flip_vertical: suspiciously large total={}, skipping", total);
+        return vec![];
+    }
     let mut out = vec![0u8; total];
     for row in 0..height {
         let src_row = height - 1 - row;
@@ -477,7 +536,7 @@ fn flip_vertical(data: &[u8], width: usize, height: usize, bpp: usize) -> Vec<u8
     out
 }
 
-fn parse_fastpath_updates(data: &[u8]) -> Vec<Bitmap> {
+fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> Vec<Bitmap> {
     let mut bitmaps = Vec::new();
     let mut pos = 0;
 
@@ -485,9 +544,16 @@ fn parse_fastpath_updates(data: &[u8]) -> Vec<Bitmap> {
         let header = data[pos];
         pos += 1;
         let update_code = header & 0x0F;
+        let fragmentation = (header >> 4) & 0x03;
         let compression = (header >> 6) & 0x03;
 
-        if compression != 0 {
+        log::debug!(
+            "[fastpath] header=0x{:02x} update_code={} frag={} compression={}",
+            header, update_code, fragmentation, compression
+        );
+
+        // compressionFlags byte is present only when FASTPATH_OUTPUT_COMPRESSION_USED (0x2)
+        if compression == 0x02 {
             if pos >= data.len() {
                 break;
             }
@@ -506,11 +572,39 @@ fn parse_fastpath_updates(data: &[u8]) -> Vec<Bitmap> {
         let update_data = &data[pos..pos + size];
         pos += size;
 
-        if update_code == 0x01 {
-            // FASTPATH_UPDATETYPE_BITMAP
-            let mut p = 0;
-            let mut rects = parse_bitmap_update(update_data, &mut p);
-            bitmaps.append(&mut rects);
+        if update_code != 0x01 {
+            continue;
+        }
+
+        // Fragment reassembly (MS-RDPBCGR 2.2.9.1.2.1.2)
+        // frag: 0x00=SINGLE, 0x01=LAST, 0x02=FIRST, 0x03=NEXT
+        match fragmentation {
+            0x00 => {
+                // Non-fragmented: skip 2-byte updateType header, then parse rects
+                let mut p = 2;
+                let mut rects = parse_bitmap_update(update_data, &mut p);
+                bitmaps.append(&mut rects);
+            }
+            0x02 => {
+                // FIRST fragment: start accumulating
+                frag_buf.clear();
+                frag_buf.extend_from_slice(update_data);
+            }
+            0x03 => {
+                // NEXT fragment: append
+                frag_buf.extend_from_slice(update_data);
+            }
+            0x01 => {
+                // LAST fragment: append and process reassembled data
+                // Reassembled buffer starts with 2-byte updateType header (from FIRST)
+                frag_buf.extend_from_slice(update_data);
+                let reassembled = frag_buf.clone();
+                frag_buf.clear();
+                let mut p = 2;
+                let mut rects = parse_bitmap_update(&reassembled, &mut p);
+                bitmaps.append(&mut rects);
+            }
+            _ => {}
         }
     }
 

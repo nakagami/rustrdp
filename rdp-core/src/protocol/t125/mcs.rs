@@ -127,8 +127,9 @@ impl<T: Transport> McsClient<T> {
         if data.is_empty() || (data[0] >> 2) != MCS_ATTACH_USER_CONFIRM {
             return Err(RdpError::Protocol("Expected Attach User Confirm".into()));
         }
-        if data.len() >= 3 {
-            self.user_channel = u16::from_be_bytes([data[1], data[2]]) + 1001;
+        // Layout: [type=1B] [result=1B] [initiator=2B BE]
+        if data.len() >= 4 {
+            self.user_channel = u16::from_be_bytes([data[2], data[3]]) + 1001;
         }
         Ok(())
     }
@@ -155,8 +156,13 @@ impl<T: Transport> McsClient<T> {
         write_u16_be(&mut buf, self.user_channel - 1001);
         write_u16_be(&mut buf, channel_id);
         buf.push(0x70);
-        let data_len = data.len() as u16 | 0x8000;
-        write_u16_be(&mut buf, data_len);
+        // PER length: 1-byte for < 128, 2-byte (0x8000 | len) for >= 128
+        if data.len() < 128 {
+            buf.push(data.len() as u8);
+        } else {
+            let data_len = data.len() as u16 | 0x8000;
+            write_u16_be(&mut buf, data_len);
+        }
         buf.extend_from_slice(data);
         self.x224.send(&buf).await
     }
@@ -176,11 +182,16 @@ impl<T: Transport> McsClient<T> {
         if pdu_type != MCS_SEND_DATA_INDICATION {
             return Err(RdpError::Protocol(format!("MCS recv_data: unexpected type {}", pdu_type)));
         }
-        if data.len() < 8 {
+        if data.len() < 7 {
             return Err(RdpError::Protocol("MCS recv_data: too short".into()));
         }
         let channel_id = u16::from_be_bytes([data[3], data[4]]);
-        let payload = data[8..].to_vec();
+        // PER length field at byte 6: if high bit set, two-byte length (skip byte 7 too)
+        let payload_start = if data[6] & 0x80 != 0 { 8 } else { 7 };
+        if payload_start > data.len() {
+            return Err(RdpError::Protocol("MCS recv_data: payload_start out of range".into()));
+        }
+        let payload = data[payload_start..].to_vec();
         Ok((channel_id, payload))
     }
 }
@@ -192,12 +203,13 @@ fn parse_gcc_conference_response(data: &[u8]) -> Result<ServerData, RdpError> {
         server_random: Vec::new(),
         server_certificate: Vec::new(),
         channels: Vec::new(),
+        msg_channel: None,
     };
 
     let mut pos = 0;
     while pos + 4 <= data.len() {
         let block_type = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        if block_type == 0x0C01 || block_type == 0x0C02 || block_type == 0x0C03 {
+        if block_type == 0x0C01 || block_type == 0x0C02 || block_type == 0x0C03 || block_type == 0x0C04 {
             break;
         }
         pos += 1;
@@ -231,17 +243,21 @@ fn parse_gcc_conference_response(data: &[u8]) -> Result<ServerData, RdpError> {
                 }
             }
             0x0C03 => {
+                // TS_UD_SC_NET: MCSChannelId(2) + pad(2) + channelIdArray (remaining / 2 each)
                 if block.len() >= 4 {
                     let mut p = 0;
                     server_data.io_channel = read_u16_le(block, &mut p);
                     let _pad = read_u16_le(block, &mut p);
                     while p + 2 <= block.len() {
-                        let ch = read_u16_le(block, &mut p);
-                        if p + 2 <= block.len() {
-                            let _pad2 = read_u16_le(block, &mut p);
-                        }
-                        server_data.channels.push(ch);
+                        server_data.channels.push(read_u16_le(block, &mut p));
                     }
+                }
+            }
+            0x0C04 => {
+                // SC_MCS_MSGCHANNEL: server-assigned message channel id
+                if block.len() >= 2 {
+                    let ch = u16::from_le_bytes([block[0], block[1]]);
+                    server_data.msg_channel = Some(ch);
                 }
             }
             _ => {}

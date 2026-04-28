@@ -1,35 +1,43 @@
 pub fn read_u8(data: &[u8], pos: &mut usize) -> u8 {
-    let v = data[*pos];
+    let v = data.get(*pos).copied().unwrap_or(0);
     *pos += 1;
     v
 }
 
 pub fn read_u16_le(data: &[u8], pos: &mut usize) -> u16 {
-    let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+    let v = data.get(*pos..*pos + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .unwrap_or(0);
     *pos += 2;
     v
 }
 
 pub fn read_u32_le(data: &[u8], pos: &mut usize) -> u32 {
-    let v = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+    let v = data.get(*pos..*pos + 4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap_or(0);
     *pos += 4;
     v
 }
 
 pub fn read_u16_be(data: &[u8], pos: &mut usize) -> u16 {
-    let v = u16::from_be_bytes([data[*pos], data[*pos + 1]]);
+    let v = data.get(*pos..*pos + 2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        .unwrap_or(0);
     *pos += 2;
     v
 }
 
 pub fn read_u32_be(data: &[u8], pos: &mut usize) -> u32 {
-    let v = u32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+    let v = data.get(*pos..*pos + 4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap_or(0);
     *pos += 4;
     v
 }
 
 pub fn read_bytes(data: &[u8], pos: &mut usize, n: usize) -> Vec<u8> {
-    let v = data[*pos..*pos + n].to_vec();
+    let v = data.get(*pos..*pos + n).unwrap_or(&[]).to_vec();
     *pos += n;
     v
 }

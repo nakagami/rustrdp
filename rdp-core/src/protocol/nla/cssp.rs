@@ -25,49 +25,70 @@ impl<T: Transport> Cssp<T> {
 
     pub async fn authenticate(&mut self, pub_key: &[u8]) -> Result<(), RdpError> {
         let negotiate = self.ntlm.get_negotiate_message();
-        let token1 = build_ts_request(1, &negotiate, &[], &[]);
+        #[cfg(debug_assertions)]
+        eprintln!("[CredSSP] sending NTLM NEGOTIATE ({} bytes)", negotiate.len());
+        let token1 = build_ts_request(2, &negotiate, &[], &[]);
         self.transport.send(&token1).await?;
 
+        #[cfg(debug_assertions)]
+        eprintln!("[CredSSP] waiting for NTLM CHALLENGE...");
         let challenge_data = self.recv_ts_request().await?;
         let challenge = extract_token_from_ts_request(&challenge_data)?;
+        #[cfg(debug_assertions)]
+        eprintln!("[CredSSP] got NTLM CHALLENGE ({} bytes)", challenge.len());
 
-        let authenticate = self.ntlm.get_authenticate_message(&challenge)?;
-        let pub_key_auth = build_pub_key_auth(pub_key, &self.ntlm.exported_session_key);
-        let token3 = build_ts_request(1, &authenticate, &pub_key_auth, &[]);
+        let (authenticate, mut security) = self.ntlm.get_authenticate_message(&challenge)?;
+        let pub_key_auth = security.gss_encrypt(pub_key);
+        #[cfg(debug_assertions)]
+        eprintln!("[CredSSP] sending NTLM AUTHENTICATE ({} bytes), pubKeyAuth ({} bytes)",
+            authenticate.len(), pub_key_auth.len());
+        let token3 = build_ts_request(2, &authenticate, &pub_key_auth, &[]);
         self.transport.send(&token3).await?;
 
+        #[cfg(debug_assertions)]
+        eprintln!("[CredSSP] waiting for server pub key verify...");
         let _server_pub_key_data = self.recv_ts_request().await?;
+        #[cfg(debug_assertions)]
+        eprintln!("[CredSSP] server pub key verified, sending credentials");
 
         let credentials = build_ts_credentials(&self.ntlm.domain, &self.ntlm.user, &self.ntlm.password);
-        let token5 = build_ts_request(1, &[], &[], &credentials);
+        let auth_info = security.gss_encrypt(&credentials);
+        let token5 = build_ts_request(2, &[], &[], &auth_info);
         self.transport.send(&token5).await?;
+        #[cfg(debug_assertions)]
+        eprintln!("[CredSSP] authenticate complete");
 
         Ok(())
     }
 
     async fn recv_ts_request(&mut self) -> Result<Vec<u8>, RdpError> {
-        let header = self.transport.recv_exact(4).await?;
-        if header[0] != SEQ {
-            return Err(RdpError::Protocol("CredSSP: expected SEQUENCE".into()));
+        let tag = self.transport.recv_exact(1).await?[0];
+        if tag != SEQ {
+            return Err(RdpError::Protocol(
+                format!("CredSSP: expected SEQUENCE (0x30), got 0x{:02x}", tag),
+            ));
         }
-        let (total_len, header_len) = if header[1] & 0x80 != 0 {
-            let n = (header[1] & 0x7F) as usize;
-            let extra = self.transport.recv_exact(n - 2).await?;
-            let mut len = 0usize;
-            for &b in &header[2..4] {
-                len = (len << 8) | b as usize;
-            }
-            for &b in &extra {
-                len = (len << 8) | b as usize;
-            }
-            (len, 2 + n)
+        let b0 = self.transport.recv_exact(1).await?[0];
+        let (total_len, mut header) = if b0 & 0x80 == 0 {
+            (b0 as usize, vec![tag, b0])
         } else {
-            (header[1] as usize, 2)
+            let n = (b0 & 0x7F) as usize;
+            let len_bytes = self.transport.recv_exact(n).await?;
+            let mut len = 0usize;
+            for &b in &len_bytes {
+                len = (len << 8) | b as usize;
+            }
+            #[cfg(debug_assertions)]
+            eprintln!("[CredSSP] recv_ts_request: n={} len={}", n, len);
+            let mut hdr = vec![tag, b0];
+            hdr.extend_from_slice(&len_bytes);
+            (len, hdr)
         };
-        let remaining = self.transport.recv_exact(total_len).await?;
-        let mut full = header[..header_len].to_vec();
-        full.extend_from_slice(&remaining);
-        Ok(full)
+        let body = self.transport.recv_exact(total_len).await?;
+        #[cfg(debug_assertions)]
+        eprintln!("[CredSSP] recv_ts_request: total={} bytes", header.len() + body.len());
+        header.extend_from_slice(&body);
+        Ok(header)
     }
 
     pub fn into_transport(self) -> T {
@@ -176,15 +197,6 @@ fn decode_ber_length(data: &[u8], pos: &mut usize) -> Result<usize, RdpError> {
             *pos += 1;
         }
         Ok(len)
-    }
-}
-
-fn build_pub_key_auth(pub_key: &[u8], session_key: &[u8]) -> Vec<u8> {
-    use super::ntlm::rc4_crypt;
-    if session_key.is_empty() {
-        pub_key.to_vec()
-    } else {
-        rc4_crypt(session_key, pub_key)
     }
 }
 

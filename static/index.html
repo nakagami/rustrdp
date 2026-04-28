@@ -12,6 +12,9 @@
     input { padding: 6px 10px; border: 1px solid #555; background: #2d2d2d; color: #eee; border-radius: 4px; }
     button { padding: 6px 16px; background: #0066cc; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
     button:hover { background: #0055bb; }
+    #status { margin-bottom: 8px; font-size: 0.9em; color: #aaa; min-height: 1.2em; }
+    #status.error { color: #f88; }
+    #status.ok { color: #8f8; }
     canvas { border: 1px solid #444; background: #000; cursor: crosshair; }
   </style>
 </head>
@@ -26,6 +29,7 @@
     <button type="submit">Connect</button>
     <button type="button" id="disconnect-btn">Disconnect</button>
   </form>
+  <div id="status">Not connected</div>
   <canvas id="rdp-canvas" width="1280" height="720"></canvas>
 
   <script type="module">
@@ -64,6 +68,8 @@
       ctx.putImageData(imageData, x, y);
     }
 
+    const statusEl = document.getElementById('status');
+
     document.getElementById('connect-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const host   = document.getElementById('host').value;
@@ -76,12 +82,19 @@
       const width  = canvas.width;
       const height = canvas.height;
 
+      statusEl.textContent = 'Connecting…';
+      statusEl.className = '';
+
       try {
         controller = await connect(wsUrl, domain, user, pass, width, height, onBitmap);
+        statusEl.textContent = 'Connected';
+        statusEl.className = 'ok';
         console.log('RDP session started');
       } catch (err) {
+        const msg = 'Connection failed: ' + err;
+        statusEl.textContent = msg;
+        statusEl.className = 'error';
         console.error('RDP connect failed:', err);
-        alert('Connection failed: ' + err);
       }
     });
 

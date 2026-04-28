@@ -3,6 +3,7 @@ use crate::error::RdpError;
 const TAG_BOOLEAN: u8 = 0x01;
 const TAG_INTEGER: u8 = 0x02;
 const TAG_OCTET_STRING: u8 = 0x04;
+const TAG_ENUMERATED: u8 = 0x0A;
 const TAG_SEQUENCE: u8 = 0x30;
 
 pub fn encode_length(len: usize) -> Vec<u8> {
@@ -90,8 +91,9 @@ pub fn decode_bool(data: &[u8], pos: &mut usize) -> Result<bool, RdpError> {
 }
 
 pub fn decode_integer(data: &[u8], pos: &mut usize) -> Result<i32, RdpError> {
-    if data[*pos] != TAG_INTEGER {
-        return Err(RdpError::Protocol(format!("BER: expected INTEGER tag, got {:02x}", data[*pos])));
+    // Accept both INTEGER (0x02) and ENUMERATED (0x0A) — both encode the same way
+    if data[*pos] != TAG_INTEGER && data[*pos] != TAG_ENUMERATED {
+        return Err(RdpError::Protocol(format!("BER: expected INTERGER tag, got {:02x}", data[*pos])));
     }
     *pos += 1;
     let len = decode_length(data, pos)?;

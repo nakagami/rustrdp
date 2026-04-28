@@ -45,6 +45,16 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, target))
 }
 
+fn hex_head(data: &[u8], limit: usize) -> String {
+    let n = data.len().min(limit);
+    let hex: Vec<String> = data[..n].iter().map(|b| format!("{:02x}", b)).collect();
+    if data.len() > n {
+        format!("{}...", hex.join(" "))
+    } else {
+        hex.join(" ")
+    }
+}
+
 /// Read exactly one TPKT frame from `tcp`.
 async fn read_tpkt_frame(tcp: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     let mut header = [0u8; 4];
@@ -81,7 +91,11 @@ fn extract_selected_protocol(cc_frame: &[u8]) -> u32 {
 }
 
 /// Walk DER TBSCertificate to extract SubjectPublicKeyInfo SEQUENCE bytes.
-fn extract_spki(cert_der: &[u8]) -> Option<Vec<u8>> {
+/// Extract the RSAPublicKey (PKCS#1) from a DER-encoded X.509 certificate.
+/// Returns the SEQUENCE { INTEGER N, INTEGER E } bytes, which is the
+/// subjectPublicKey content from SubjectPublicKeyInfo.
+/// This matches grdp's TlsPubKey() which does asn1.Marshal(rsa.PublicKey).
+fn extract_rsa_pubkey(cert_der: &[u8]) -> Option<Vec<u8>> {
     // outer SEQUENCE (certificate)
     let mut pos = 0;
     der_expect_tag(cert_der, &mut pos, 0x30)?;
@@ -113,14 +127,30 @@ fn extract_spki(cert_der: &[u8]) -> Option<Vec<u8>> {
     if pos >= tbs_end || cert_der[pos] != 0x30 {
         return None;
     }
-    let spki_start = pos;
     pos += 1;
-    let spki_len = der_skip_length(cert_der, &mut pos)?;
-    let spki_end = pos + spki_len;
-    if spki_end > cert_der.len() {
+    der_skip_length(cert_der, &mut pos)?;
+
+    // skip AlgorithmIdentifier SEQUENCE
+    der_expect_tag(cert_der, &mut pos, 0x30)?;
+    let alg_len = der_skip_length(cert_der, &mut pos)?;
+    pos += alg_len;
+
+    // BIT STRING subjectPublicKey
+    der_expect_tag(cert_der, &mut pos, 0x03)?;
+    let bs_len = der_skip_length(cert_der, &mut pos)?;
+    if bs_len < 1 || pos >= cert_der.len() {
         return None;
     }
-    Some(cert_der[spki_start..spki_end].to_vec())
+    // first byte of BIT STRING is unused-bits count (always 0x00 for RSA)
+    pos += 1;
+
+    // remaining bytes are RSAPublicKey: SEQUENCE { INTEGER N, INTEGER E }
+    let rsa_start = pos;
+    let rsa_len = bs_len - 1;
+    if rsa_start + rsa_len > cert_der.len() {
+        return None;
+    }
+    Some(cert_der[rsa_start..rsa_start + rsa_len].to_vec())
 }
 
 fn der_expect_tag(data: &[u8], pos: &mut usize, expected: u8) -> Option<()> {
@@ -184,6 +214,11 @@ async fn handle_socket(mut socket: WebSocket, target: String) {
             return;
         }
     };
+    log::info!(
+        "Forwarding X.224 CR: {} bytes, hex={}",
+        cr_frame.len(),
+        hex_head(&cr_frame, 32)
+    );
     if tcp.write_all(&cr_frame).await.is_err() {
         return;
     }
@@ -192,13 +227,23 @@ async fn handle_socket(mut socket: WebSocket, target: String) {
     let cc_frame = match read_tpkt_frame(&mut tcp).await {
         Ok(f) => f,
         Err(e) => {
-            log::error!("Failed reading X.224 CC: {}", e);
+            log::error!(
+                "Failed reading X.224 CC: {} — CR was {} bytes, hex={}",
+                e,
+                cr_frame.len(),
+                hex_head(&cr_frame, 32)
+            );
             return;
         }
     };
 
     let selected_protocol = extract_selected_protocol(&cc_frame);
-    log::info!("selectedProtocol = {}", selected_protocol);
+    log::info!(
+        "X.224 CC received: {} bytes, selectedProtocol=0x{:08x}, hex={}",
+        cc_frame.len(),
+        selected_protocol,
+        hex_head(&cc_frame, 20)
+    );
 
     // --- TLS upgrade if needed ---
     const PROTOCOL_RDP: u32 = 0;
@@ -231,17 +276,17 @@ async fn handle_socket(mut socket: WebSocket, target: String) {
             }
         };
 
-        // Extract server certificate SPKI
+        // Extract server certificate RSA public key (PKCS#1 RSAPublicKey bytes)
         let spki = tls
             .get_ref()
             .peer_certificate()
             .ok()
             .flatten()
             .and_then(|cert| cert.to_der().ok())
-            .and_then(|der| extract_spki(&der))
+            .and_then(|der| extract_rsa_pubkey(&der))
             .unwrap_or_default();
 
-        log::info!("SPKI length: {}", spki.len());
+        log::info!("TLS handshake succeeded, RSA pubkey length: {}", spki.len());
 
         // Send control message: [0x00, 0x00, len_hi, len_lo, ...spki]
         let len = spki.len();
@@ -256,9 +301,12 @@ async fn handle_socket(mut socket: WebSocket, target: String) {
         let (mut ws_sink, mut ws_stream) = socket.split();
 
         let ws_to_tls = async move {
+            let mut total = 0usize;
             while let Some(Ok(msg)) = ws_stream.next().await {
                 match msg {
                     Message::Binary(data) => {
+                        total += data.len();
+                        log::info!("WS→TLS {} bytes (total {})", data.len(), total);
                         if tls_write.write_all(&data).await.is_err() {
                             break;
                         }
@@ -267,23 +315,40 @@ async fn handle_socket(mut socket: WebSocket, target: String) {
                     _ => {}
                 }
             }
+            log::info!("WS→TLS relay ended (total {} bytes)", total);
         };
 
         let tls_to_ws = async move {
             let mut buf = vec![0u8; 32768];
+            let mut total = 0usize;
+            let mut first = true;
             loop {
                 match tls_read.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        log::info!("TLS→WS EOF (total {} bytes)", total);
+                        break;
+                    }
                     Ok(n) => {
+                        total += n;
+                        if first {
+                            first = false;
+                            log::info!("TLS→WS first chunk {} bytes hex={}", n, hex_head(&buf[..n], 32));
+                        } else {
+                            log::info!("TLS→WS {} bytes (total {})", n, total);
+                        }
                         if ws_sink
                             .send(Message::Binary(buf[..n].to_vec()))
                             .await
                             .is_err()
                         {
+                            log::info!("TLS→WS ws_sink error after {} bytes", total);
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        log::info!("TLS→WS error after {} bytes: {}", total, e);
+                        break;
+                    }
                 }
             }
         };

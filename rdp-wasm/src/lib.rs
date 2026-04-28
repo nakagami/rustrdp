@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{WebSocket, MessageEvent, BinaryType, ErrorEvent};
+use web_sys::{WebSocket, MessageEvent, BinaryType};
 use js_sys::{Uint8Array, ArrayBuffer};
 use futures_channel::mpsc::{self, UnboundedSender, UnboundedReceiver};
 use futures_channel::oneshot;
@@ -24,6 +26,7 @@ struct WsTransport {
     buf: VecDeque<u8>,
     // kept alive for the lifetime of this struct
     _onmessage: Closure<dyn FnMut(MessageEvent)>,
+    _onclose: Closure<dyn FnMut(JsValue)>,
 }
 
 impl WsTransport {
@@ -32,7 +35,13 @@ impl WsTransport {
         let ws = WebSocket::new(url)?;
         ws.set_binary_type(BinaryType::Arraybuffer);
 
-        let (tx, rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) = mpsc::unbounded();
+        let (raw_tx, rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) =
+            mpsc::unbounded();
+        // Wrap in Rc<RefCell<Option>> so onclose can drop the sender,
+        // which causes rx.next() to return None and unblock recv().
+        let tx: Rc<RefCell<Option<UnboundedSender<Vec<u8>>>>> =
+            Rc::new(RefCell::new(Some(raw_tx)));
+
         let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
 
         // onopen
@@ -47,22 +56,32 @@ impl WsTransport {
 
         // onerror
         let ws2 = ws.clone();
-        let onerror = Closure::wrap(Box::new(move |_: ErrorEvent| {
+        let onerror = Closure::wrap(Box::new(move |_: JsValue| {
             log::error!("WebSocket error");
             let _ = ws2.close();
-        }) as Box<dyn FnMut(ErrorEvent)>);
+        }) as Box<dyn FnMut(JsValue)>);
         ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
         onerror.forget();
 
-        // onmessage
-        let tx_clone = tx.clone();
+        // onmessage — deliver data into the channel
+        let tx_msg = tx.clone();
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             if let Ok(ab) = e.data().dyn_into::<ArrayBuffer>() {
                 let data = Uint8Array::new(&ab).to_vec();
-                let _ = tx_clone.unbounded_send(data);
+                if let Some(ref sender) = *tx_msg.borrow() {
+                    let _ = sender.unbounded_send(data);
+                }
             }
         }) as Box<dyn FnMut(MessageEvent)>);
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+
+        // onclose — drop the sender so rx.next().await returns None
+        let tx_close = tx.clone();
+        let onclose = Closure::wrap(Box::new(move |_: JsValue| {
+            log::debug!("WebSocket closed by server");
+            tx_close.borrow_mut().take(); // drop sender → unblocks recv()
+        }) as Box<dyn FnMut(JsValue)>);
+        ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
 
         // wait for open
         open_rx.await.map_err(|e| JsValue::from_str(&e.to_string()))?
@@ -73,6 +92,7 @@ impl WsTransport {
             rx,
             buf: VecDeque::new(),
             _onmessage: onmessage,
+            _onclose: onclose,
         })
     }
 
@@ -166,15 +186,8 @@ impl RdpController {
 
 /// Connect to an RDP host through the proxy.
 ///
-/// - `proxy_url`:    WebSocket URL, e.g. `ws://localhost:8080/ws?target=host:port`
-/// - `domain`:       Windows domain (may be empty)
-/// - `user`:         Windows username
-/// - `password`:     Windows password
-/// - `width`/`height`: desired desktop dimensions
-/// - `on_bitmap`:    JS callback invoked for each bitmap update
-///                   Signature: `(x: number, y: number, w: number, h: number, bpp: number, data: Uint8Array)`
-///
-/// Returns an `RdpController` that lets you send keyboard/mouse input.
+/// Waits for the full login sequence to complete before resolving.
+/// On failure the returned Promise rejects with a descriptive error string.
 #[wasm_bindgen]
 pub async fn connect(
     proxy_url: String,
@@ -190,6 +203,10 @@ pub async fn connect(
     let (input_tx, mut input_rx): (UnboundedSender<InputEvent>, UnboundedReceiver<InputEvent>) =
         mpsc::unbounded();
 
+    // Use a oneshot channel so the login result is propagated back to the
+    // calling JavaScript Promise (visible as alert / catch block in HTML).
+    let (login_tx, login_rx) = oneshot::channel::<Result<(), String>>();
+
     spawn_local(async move {
         let mut session = match RdpSession::login(
             transport, &domain, &user, &password, width, height, 0x0409,
@@ -198,12 +215,15 @@ pub async fn connect(
         {
             Ok(s) => s,
             Err(e) => {
-                log::error!("RDP login failed: {:?}", e);
+                let msg = format!("{:?}", e);
+                log::error!("RDP login failed: {}", msg);
+                let _ = login_tx.send(Err(msg));
                 return;
             }
         };
 
         log::info!("RDP session ready");
+        let _ = login_tx.send(Ok(()));
 
         loop {
             // Drain pending input events (non-blocking)
@@ -227,7 +247,7 @@ pub async fn connect(
                             log::error!("Input send error: {:?}", e);
                         }
                     }
-                    Err(_) => break, // no pending items or sender dropped
+                    Err(_) => break,
                 }
             }
 
@@ -251,7 +271,12 @@ pub async fn connect(
         }
     });
 
-    Ok(RdpController { input_tx })
+    // Wait for login to succeed or fail, then propagate to JS.
+    match login_rx.await {
+        Ok(Ok(())) => Ok(RdpController { input_tx }),
+        Ok(Err(msg)) => Err(JsValue::from_str(&msg)),
+        Err(_) => Err(JsValue::from_str("Login task was cancelled")),
+    }
 }
 
 fn deliver_bitmap(callback: &js_sys::Function, bmp: &Bitmap) {
