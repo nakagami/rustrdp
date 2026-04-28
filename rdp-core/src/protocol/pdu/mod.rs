@@ -14,6 +14,7 @@ pub const PDUTYPE2_CONTROL: u8 = 0x14;
 pub const PDUTYPE2_SYNCHRONIZE: u8 = 0x1F;
 pub const PDUTYPE2_INPUT: u8 = 0x1C;
 pub const PDUTYPE2_FONTMAP: u8 = 0x28;
+pub const PDUTYPE2_FONTLIST: u8 = 0x27;
 pub const PDUTYPE2_SUPPRESS_OUTPUT: u8 = 0x23;
 pub const PDUTYPE2_SHUTDOWN_REQUEST: u8 = 0x24;
 

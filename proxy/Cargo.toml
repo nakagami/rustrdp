@@ -16,3 +16,5 @@ clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 log = "0.4"
 env_logger = "0.11"
+tokio-native-tls = "0.3"
+native-tls = { version = "0.2", features = ["vendored"] }

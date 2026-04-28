@@ -21,6 +21,7 @@ pub struct Ntlm {
     pub domain: String,
     pub user: String,
     pub password: String,
+    pub exported_session_key: Vec<u8>,
 }
 
 impl Ntlm {
@@ -29,6 +30,7 @@ impl Ntlm {
             domain: domain.to_string(),
             user: user.to_string(),
             password: password.to_string(),
+            exported_session_key: Vec::new(),
         }
     }
 
@@ -51,7 +53,7 @@ impl Ntlm {
         msg
     }
 
-    pub fn get_authenticate_message(&self, challenge: &[u8]) -> Result<Vec<u8>, RdpError> {
+    pub fn get_authenticate_message(&mut self, challenge: &[u8]) -> Result<Vec<u8>, RdpError> {
         if challenge.len() < 56 {
             return Err(RdpError::Auth("NTLM challenge too short".into()));
         }
@@ -93,6 +95,7 @@ impl Ntlm {
 
         let exported_session_key = generate_random_bytes(16);
         let encrypted_random_session_key = rc4_crypt(&session_base_key, &exported_session_key);
+        self.exported_session_key = exported_session_key;
 
         let domain_utf16 = to_utf16_le(&self.domain);
         let user_utf16 = to_utf16_le(&self.user);

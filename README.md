@@ -14,5 +14,15 @@ Browser (WASM) ──WebSocket──► proxy (Rust) ──TCP──► RDP Serv
 
 ## Build
 
+Install [wasm-pack](https://rustwasm.github.io/wasm-pack/) if not already available:
+
+```sh
+curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+```
+
+Then build and run:
+
+```sh
 make all
 make serve
+```

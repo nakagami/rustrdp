@@ -53,10 +53,11 @@ impl<T: Transport> X224<T> {
             return Err(RdpError::Protocol(format!("Expected CC, got {:02x}", tpdu_code)));
         }
         let li = data[0] as usize;
-        if li >= 7 && data.len() >= 12 {
+        if li >= 7 && data.len() >= 15 {
             let neg_type = data[7];
             if neg_type == TYPE_RDP_NEG_RSP {
-                let proto = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                // data[8]=flags, data[9..11]=length, data[11..15]=selectedProtocol
+                let proto = u32::from_le_bytes([data[11], data[12], data[13], data[14]]);
                 self.selected_protocol = proto;
                 return Ok(proto);
             } else if neg_type == TYPE_RDP_NEG_FAILURE {

@@ -32,7 +32,7 @@ impl<T: Transport> Cssp<T> {
         let challenge = extract_token_from_ts_request(&challenge_data)?;
 
         let authenticate = self.ntlm.get_authenticate_message(&challenge)?;
-        let pub_key_auth = build_pub_key_auth(pub_key);
+        let pub_key_auth = build_pub_key_auth(pub_key, &self.ntlm.exported_session_key);
         let token3 = build_ts_request(1, &authenticate, &pub_key_auth, &[]);
         self.transport.send(&token3).await?;
 
@@ -179,8 +179,13 @@ fn decode_ber_length(data: &[u8], pos: &mut usize) -> Result<usize, RdpError> {
     }
 }
 
-fn build_pub_key_auth(pub_key: &[u8]) -> Vec<u8> {
-    pub_key.to_vec()
+fn build_pub_key_auth(pub_key: &[u8], session_key: &[u8]) -> Vec<u8> {
+    use super::ntlm::rc4_crypt;
+    if session_key.is_empty() {
+        pub_key.to_vec()
+    } else {
+        rc4_crypt(session_key, pub_key)
+    }
 }
 
 fn build_ts_credentials(domain: &str, user: &str, password: &str) -> Vec<u8> {
