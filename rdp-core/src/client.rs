@@ -57,21 +57,34 @@ impl<T: Transport> RdpSession<T> {
         // Step 1: X.224 connection negotiation
         let tpkt = Tpkt::new(transport);
         let mut x224 = X224::new(tpkt);
+        #[cfg(debug_assertions)]
+        eprintln!("[client] step1: X.224 connect");
         x224.connect(user).await?;
         let selected_protocol = x224.recv_confirm().await?;
+        #[cfg(debug_assertions)]
+        eprintln!("[client] step1 done: selected_protocol=0x{:08x}", selected_protocol);
 
         // Step 2: TLS upgrade (proxy performs TLS and sends back the server public key)
         let pub_key = if selected_protocol == PROTOCOL_SSL || selected_protocol == PROTOCOL_HYBRID {
-            x224.tpkt_mut().transport_mut().start_tls().await?
+            #[cfg(debug_assertions)]
+            eprintln!("[client] step2: start_tls");
+            let pk = x224.tpkt_mut().transport_mut().start_tls().await?;
+            #[cfg(debug_assertions)]
+            eprintln!("[client] step2 done: pub_key len={}", pk.len());
+            pk
         } else {
             Vec::new()
         };
 
         // Step 3: CredSSP / NLA authentication
         let transport = if selected_protocol == PROTOCOL_HYBRID {
+            #[cfg(debug_assertions)]
+            eprintln!("[client] step3: CredSSP/NLA authenticate");
             let inner_transport = x224.into_tpkt().into_transport();
             let mut cssp = Cssp::new(inner_transport, domain, user, password);
             cssp.authenticate(&pub_key).await?;
+            #[cfg(debug_assertions)]
+            eprintln!("[client] step3 done: CredSSP complete");
             cssp.into_transport()
         } else {
             x224.into_tpkt().into_transport()
@@ -83,6 +96,8 @@ impl<T: Transport> RdpSession<T> {
         x224.selected_protocol = selected_protocol;
 
         // Step 5: MCS / GCC connection
+        #[cfg(debug_assertions)]
+        eprintln!("[client] step5: MCS connect");
         let client_data = ClientData {
             width,
             height,
@@ -96,9 +111,13 @@ impl<T: Transport> RdpSession<T> {
         mcs.connect(&gcc_data).await?;
         let server_data = mcs.recv_connect_response().await?;
         mcs.io_channel = server_data.io_channel;
+        #[cfg(debug_assertions)]
+        eprintln!("[client] step5 done: io_channel={} channels={:?}", mcs.io_channel, server_data.channels);
         mcs.erect_domain().await?;
         mcs.attach_user().await?;
         mcs.recv_attach_user_confirm().await?;
+        #[cfg(debug_assertions)]
+        eprintln!("[client] attach_user done: user_channel={}", mcs.user_channel);
 
         // Step 6: Join all channels
         let user_channel = mcs.user_channel;
@@ -113,6 +132,8 @@ impl<T: Transport> RdpSession<T> {
         }
 
         // Step 7: Send ClientInfo PDU (with 4-byte security header for enhanced security)
+        #[cfg(debug_assertions)]
+        eprintln!("[client] step7: send ClientInfo");
         let info_pdu = build_client_info(domain, user, password);
         mcs.send_data(io_channel, &info_pdu).await?;
 
@@ -136,6 +157,8 @@ impl<T: Transport> RdpSession<T> {
                 if let Ok(hdr) = ShareControlHeader::parse(&data, &mut pos) {
                     if hdr.pdu_type == PDUTYPE_DEMANDACTIVEPDU && pos + 4 <= data.len() {
                         share_id = read_u32_le(&data, &mut pos);
+                        #[cfg(debug_assertions)]
+                        eprintln!("[client] Demand Active received: share_id=0x{:08x}", share_id);
                         break;
                     }
                 }
@@ -143,6 +166,8 @@ impl<T: Transport> RdpSession<T> {
         }
 
         // Step 10: Confirm Active PDU
+        #[cfg(debug_assertions)]
+        eprintln!("[client] step10: send Confirm Active");
         let caps = build_all_capabilities(width, height, kbd_layout);
         let mut confirm_body = Vec::new();
         write_u32_le(&mut confirm_body, share_id);
@@ -191,6 +216,8 @@ impl<T: Transport> RdpSession<T> {
         mcs.send_data(io_channel, &font_pdu).await?;
 
         // Step 12: Wait for FontMap (session is ready after this)
+        #[cfg(debug_assertions)]
+        eprintln!("[client] step12: waiting for FontMap");
         loop {
             let (ch, data) = mcs.recv_data().await?;
             if ch == 0xFFFF {
@@ -201,6 +228,8 @@ impl<T: Transport> RdpSession<T> {
                 if hdr.pdu_type == PDUTYPE_DATAPDU {
                     if let Ok(dh) = ShareDataHeader::parse(&data, &mut pos) {
                         if dh.pdu_type2 == PDUTYPE2_FONTMAP {
+                            #[cfg(debug_assertions)]
+                            eprintln!("[client] FontMap received: session ready");
                             break;
                         }
                     }
