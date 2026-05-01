@@ -161,103 +161,7 @@ impl<T: Transport> RdpSession<T> {
             }
         }
 
-        // Step 10: Confirm Active PDU
-                log::debug!("[client] step10: send Confirm Active");
-        let (caps, num_caps) = build_all_capabilities(width, height, kbd_layout);
-        let mut confirm_body = Vec::new();
-        write_u32_le(&mut confirm_body, share_id);
-        write_u16_le(&mut confirm_body, 0x03EA); // originatorId
-        write_u16_le(&mut confirm_body, 4); // lengthSourceDescriptor
-        write_u16_le(&mut confirm_body, (4 + caps.len()) as u16); // lengthCombinedCapabilities
-        confirm_body.extend_from_slice(b"RDP\0");
-        write_u16_le(&mut confirm_body, num_caps); // numberCapabilities
-        write_u16_le(&mut confirm_body, 0); // pad2Octets
-        confirm_body.extend_from_slice(&caps);
-        let confirm_sch = ShareControlHeader::build(PDUTYPE_CONFIRMACTIVEPDU, user_channel, confirm_body.len());
-        let confirm_pdu = [confirm_sch, confirm_body].concat();
-        log::debug!("[client] confirm_active hex ({} bytes): {}", confirm_pdu.len(),
-            confirm_pdu.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
-        mcs.send_data(io_channel, &confirm_pdu).await?;
-
-        // Step 11: Synchronize sequence
-        // Synchronize PDU
-        let mut sync_body = Vec::new();
-        write_u16_le(&mut sync_body, 1u16); // SYNCMSGTYPE_SYNC
-        write_u16_le(&mut sync_body, 0x03EA);
-        let sync_pdu = build_data_pdu(share_id, user_channel, PDUTYPE2_SYNCHRONIZE, &sync_body);
-        mcs.send_data(io_channel, &sync_pdu).await?;
-
-        // Control Cooperate
-        let mut ctrl_coop = Vec::new();
-        write_u16_le(&mut ctrl_coop, 4u16); // CTRLACTION_COOPERATE
-        write_u16_le(&mut ctrl_coop, 0u16);
-        write_u32_le(&mut ctrl_coop, 0u32);
-        let ctrl_coop_pdu = build_data_pdu(share_id, user_channel, PDUTYPE2_CONTROL, &ctrl_coop);
-        mcs.send_data(io_channel, &ctrl_coop_pdu).await?;
-
-        // Control Request
-        let mut ctrl_req = Vec::new();
-        write_u16_le(&mut ctrl_req, 1u16); // CTRLACTION_REQUESTCONTROL
-        write_u16_le(&mut ctrl_req, 0u16);
-        write_u32_le(&mut ctrl_req, 0u32);
-        let ctrl_req_pdu = build_data_pdu(share_id, user_channel, PDUTYPE2_CONTROL, &ctrl_req);
-        mcs.send_data(io_channel, &ctrl_req_pdu).await?;
-
-        // FontList PDU
-        let mut font_body = Vec::new();
-        write_u16_le(&mut font_body, 0u16); // numberFonts
-        write_u16_le(&mut font_body, 0u16); // totalNumFonts
-        write_u16_le(&mut font_body, 0x0003u16); // listFlags
-        write_u16_le(&mut font_body, 0x0032u16); // entrySize
-        let font_pdu = build_data_pdu(share_id, user_channel, PDUTYPE2_FONTLIST, &font_body);
-        mcs.send_data(io_channel, &font_pdu).await?;
-
-        // Step 12: Wait for FontMap (session is ready after this)
-                log::debug!("[client] step12: waiting for FontMap");
-        loop {
-            let (ch, data) = mcs.recv_data().await?;
-            if ch == 0xFFFF {
-                continue; // FastPath — ignore during setup
-            }
-            let mut pos = 0;
-            if let Ok(hdr) = ShareControlHeader::parse(&data, &mut pos) {
-                                log::debug!("[client] step12 recv: pdu_type=0x{:04x} data_len={}", hdr.pdu_type, data.len());
-                if hdr.pdu_type == PDUTYPE_DATAPDU {
-                    if let Ok(dh) = ShareDataHeader::parse(&data, &mut pos) {
-                                                log::debug!("[client] step12 data pdu: pduType2={}", dh.pdu_type2);
-                        if dh.pdu_type2 == PDUTYPE2_FONTMAP {
-                                                        log::debug!("[client] FontMap received: session ready");
-                            break;
-                        }
-                        if dh.pdu_type2 == 0x2F && pos + 4 <= data.len() {
-                            let err_code = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
-                            log::error!("[client] ERROR INFO PDU: error_code=0x{:08x}", err_code);
-                        }
-                    }
-                } else if hdr.pdu_type == PDUTYPE_DEACTIVATEALLPDU {
-                    log::warn!("[client] DEACTIVATE_ALL received in step12");
-                }
-            } else {
-                                log::debug!("[client] step12 unparseable data: len={} hex={}", data.len(),
-                    data.iter().take(16).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "));
-            }
-        }
-
-        // Tell the server to start sending display updates (MS-RDPBCGR 2.2.11.3.1)
-        {
-            let mut body = Vec::with_capacity(12);
-            body.push(1u8);          // AllowDisplayUpdates = ALLOW_DISPLAY_UPDATES
-            body.extend_from_slice(&[0u8; 3]); // pad
-            write_u16_le(&mut body, 0);        // left
-            write_u16_le(&mut body, 0);        // top
-            write_u16_le(&mut body, width - 1); // right
-            write_u16_le(&mut body, height - 1); // bottom
-            let pdu = build_data_pdu(share_id, user_channel, PDUTYPE2_SUPPRESS_OUTPUT, &body);
-            log::debug!("[client] sending SuppressOutput (ALLOW_DISPLAY_UPDATES)");
-            mcs.send_data(io_channel, &pdu).await?;
-        }
-
-        Ok(RdpSession {
+        let mut session = RdpSession {
             mcs,
             share_id,
             io_channel,
@@ -266,7 +170,115 @@ impl<T: Transport> RdpSession<T> {
             height,
             kbd_layout,
             frag_buf: Vec::new(),
-        })
+        };
+
+        // Steps 10-12: Confirm Active, sync sequence, wait for FontMap
+        session.complete_activation().await?;
+
+        // Tell the server to start sending display updates (MS-RDPBCGR 2.2.11.3.1)
+        session.send_suppress_output().await?;
+
+        Ok(session)
+    }
+
+    /// Confirm Active PDU + synchronize sequence + wait for FontMap.
+    /// Called after login and after each Deactivate/Reactivate cycle.
+    async fn complete_activation(&mut self) -> Result<(), RdpError> {
+        log::debug!("[client] complete_activation: share_id=0x{:08x}", self.share_id);
+
+        // Confirm Active PDU
+        let (caps, num_caps) = build_all_capabilities(self.width, self.height, self.kbd_layout);
+        let mut confirm_body = Vec::new();
+        write_u32_le(&mut confirm_body, self.share_id);
+        write_u16_le(&mut confirm_body, 0x03EA); // originatorId
+        write_u16_le(&mut confirm_body, 4); // lengthSourceDescriptor
+        write_u16_le(&mut confirm_body, (4 + caps.len()) as u16); // lengthCombinedCapabilities
+        confirm_body.extend_from_slice(b"RDP\0");
+        write_u16_le(&mut confirm_body, num_caps);
+        write_u16_le(&mut confirm_body, 0); // pad2Octets
+        confirm_body.extend_from_slice(&caps);
+        let confirm_sch = ShareControlHeader::build(
+            PDUTYPE_CONFIRMACTIVEPDU, self.user_channel, confirm_body.len(),
+        );
+        let confirm_pdu = [confirm_sch, confirm_body].concat();
+        self.mcs.send_data(self.io_channel, &confirm_pdu).await?;
+
+        // Synchronize PDU
+        let mut sync_body = Vec::new();
+        write_u16_le(&mut sync_body, 1u16); // SYNCMSGTYPE_SYNC
+        write_u16_le(&mut sync_body, 0x03EA);
+        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_SYNCHRONIZE, &sync_body);
+        self.mcs.send_data(self.io_channel, &pdu).await?;
+
+        // Control Cooperate
+        let mut ctrl = Vec::new();
+        write_u16_le(&mut ctrl, 4u16); // CTRLACTION_COOPERATE
+        write_u16_le(&mut ctrl, 0u16);
+        write_u32_le(&mut ctrl, 0u32);
+        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_CONTROL, &ctrl);
+        self.mcs.send_data(self.io_channel, &pdu).await?;
+
+        // Control Request
+        let mut ctrl = Vec::new();
+        write_u16_le(&mut ctrl, 1u16); // CTRLACTION_REQUESTCONTROL
+        write_u16_le(&mut ctrl, 0u16);
+        write_u32_le(&mut ctrl, 0u32);
+        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_CONTROL, &ctrl);
+        self.mcs.send_data(self.io_channel, &pdu).await?;
+
+        // FontList PDU
+        let mut font = Vec::new();
+        write_u16_le(&mut font, 0u16); // numberFonts
+        write_u16_le(&mut font, 0u16); // totalNumFonts
+        write_u16_le(&mut font, 0x0003u16); // listFlags
+        write_u16_le(&mut font, 0x0032u16); // entrySize
+        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_FONTLIST, &font);
+        self.mcs.send_data(self.io_channel, &pdu).await?;
+
+        // Wait for FontMap
+        log::debug!("[client] complete_activation: waiting for FontMap");
+        loop {
+            let (ch, data) = self.mcs.recv_data().await?;
+            if ch == 0xFFFF {
+                continue;
+            }
+            let mut pos = 0;
+            if let Ok(hdr) = ShareControlHeader::parse(&data, &mut pos) {
+                log::debug!("[client] complete_activation recv: pdu_type=0x{:04x}", hdr.pdu_type);
+                if hdr.pdu_type == PDUTYPE_DATAPDU {
+                    if let Ok(dh) = ShareDataHeader::parse(&data, &mut pos) {
+                        if dh.pdu_type2 == PDUTYPE2_FONTMAP {
+                            log::debug!("[client] FontMap received: session ready");
+                            break;
+                        }
+                        if dh.pdu_type2 == 0x2F && pos + 4 <= data.len() {
+                            let err_code = u32::from_le_bytes([
+                                data[pos], data[pos+1], data[pos+2], data[pos+3],
+                            ]);
+                            log::error!("[client] ERROR INFO PDU: error_code=0x{:08x}", err_code);
+                        }
+                    }
+                } else if hdr.pdu_type == PDUTYPE_DEACTIVATEALLPDU {
+                    log::warn!("[client] DEACTIVATE_ALL received during activation, ignoring");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Tell the server to resume sending display updates.
+    async fn send_suppress_output(&mut self) -> Result<(), RdpError> {
+        let mut body = Vec::with_capacity(12);
+        body.push(1u8); // ALLOW_DISPLAY_UPDATES
+        body.extend_from_slice(&[0u8; 3]);
+        write_u16_le(&mut body, 0);
+        write_u16_le(&mut body, 0);
+        write_u16_le(&mut body, self.width - 1);
+        write_u16_le(&mut body, self.height - 1);
+        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_SUPPRESS_OUTPUT, &body);
+        log::debug!("[client] sending SuppressOutput (ALLOW_DISPLAY_UPDATES)");
+        self.mcs.send_data(self.io_channel, &pdu).await
     }
 
     /// Receive the next display event from the server.
@@ -304,8 +316,24 @@ impl<T: Transport> RdpSession<T> {
 
             match hdr.pdu_type {
                 PDUTYPE_DEACTIVATEALLPDU => {
-                    log::debug!("[recv_event] DeactivateAll");
-                    return Ok(RdpEvent::Deactivated);
+                    log::info!("[recv_event] DeactivateAll — waiting for new Demand Active");
+                    // Re-run the activation sequence instead of dropping the connection.
+                    // The server will immediately follow with a new Demand Active.
+                    loop {
+                        let (ch2, data2) = self.mcs.recv_data().await?;
+                        if ch2 == 0xFFFF { continue; }
+                        let mut pos2 = 0;
+                        if let Ok(hdr2) = ShareControlHeader::parse(&data2, &mut pos2) {
+                            if hdr2.pdu_type == PDUTYPE_DEMANDACTIVEPDU && pos2 + 4 <= data2.len() {
+                                self.share_id = read_u32_le(&data2, &mut pos2);
+                                log::info!("[recv_event] new Demand Active: share_id=0x{:08x}", self.share_id);
+                                break;
+                            }
+                        }
+                    }
+                    self.complete_activation().await?;
+                    self.send_suppress_output().await?;
+                    // Continue receiving normal display events
                 }
                 PDUTYPE_DATAPDU => {
                     let dh = match ShareDataHeader::parse(&data, &mut pos) {
@@ -489,8 +517,12 @@ fn parse_bitmap_update(data: &[u8], pos: &mut usize) -> Vec<Bitmap> {
         *pos += bitmap_len;
 
         let pixel_data = if flags & BITMAP_COMPRESSION != 0 {
-            let compressed = if flags & NO_BITMAP_COMPRESSION_HDR == 0 && raw.len() > 8 {
-                &raw[8..] // skip 8-byte compression header
+            let compressed = if flags & NO_BITMAP_COMPRESSION_HDR == 0 && raw.len() >= 8 {
+                // Parse TS_CD_HEADER: cbCompFirstRowSize(2) + cbCompMainBodySize(2) +
+                //                     cbScanWidth(2) + cbUncompressedSize(2)
+                let cb_main = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+                let end = 8 + cb_main.min(raw.len() - 8);
+                &raw[8..end]
             } else {
                 raw
             };
