@@ -74,6 +74,8 @@ enum Stream {
 pub struct SimpleTransport {
     stream: Option<Stream>,
     host: String,
+    // Persistent read buffer — survives future cancellation so partial reads are not lost.
+    read_buf: Vec<u8>,
 }
 
 #[async_trait(?Send)]
@@ -87,13 +89,25 @@ impl Transport for SimpleTransport {
     }
 
     async fn recv_exact(&mut self, n: usize) -> Result<Vec<u8>, RdpError> {
-        let mut buffer = vec![0u8; n];
-        match self.stream.as_mut() {
-            Some(Stream::Plain(s)) => { s.read_exact(&mut buffer).await.map_err(RdpError::from)?; }
-            Some(Stream::Tls(s)) => { s.read_exact(&mut buffer).await.map_err(RdpError::from)?; }
-            None => return Err(RdpError::Closed),
+        // Use a persistent read buffer so that if this future is cancelled mid-read (e.g. by
+        // tokio::time::timeout), already-consumed bytes are not lost.  tokio::AsyncReadExt::read()
+        // is cancel-safe (reads 0 or more bytes atomically), while read_exact() is not.
+        let mut tmp = [0u8; 8192];
+        while self.read_buf.len() < n {
+            let want = (n - self.read_buf.len()).min(tmp.len());
+            let got = match self.stream.as_mut() {
+                Some(Stream::Plain(s)) => s.read(&mut tmp[..want]).await.map_err(RdpError::from)?,
+                Some(Stream::Tls(s)) => s.read(&mut tmp[..want]).await.map_err(RdpError::from)?,
+                None => return Err(RdpError::Closed),
+            };
+            if got == 0 {
+                return Err(RdpError::Closed);
+            }
+            self.read_buf.extend_from_slice(&tmp[..got]);
         }
-        Ok(buffer)
+        let result = self.read_buf[..n].to_vec();
+        self.read_buf.drain(..n);
+        Ok(result)
     }
 
     async fn close(&mut self) {
@@ -224,6 +238,7 @@ impl RdpConnection {
         let transport = SimpleTransport {
             stream: Some(Stream::Plain(stream)),
             host: config.host.clone(),
+            read_buf: Vec::new(),
         };
 
         let session = RdpSession::login(
