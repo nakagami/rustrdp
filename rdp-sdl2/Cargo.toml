@@ -17,6 +17,7 @@ log = "0.4"
 thiserror = "1"
 async-trait = "0.1"
 rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
 
 [build-dependencies]
 pkg-config = "0.3"

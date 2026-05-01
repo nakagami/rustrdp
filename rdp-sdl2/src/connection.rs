@@ -2,13 +2,16 @@ use rdp_core::client::RdpSession;
 use rdp_core::protocol::Transport;
 use rdp_core::error::RdpError;
 use async_trait::async_trait;
-use rustls::{ClientConfig, ClientConnection, StreamOwned};
+use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::client::danger::{ServerCertVerifier, HandshakeSignatureValid, ServerCertVerified};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use std::error::Error;
-use std::net::{IpAddr, TcpStream};
-use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::config::RdpConfig;
@@ -65,7 +68,7 @@ impl ServerCertVerifier for NoCertVerifier {
 
 enum Stream {
     Plain(TcpStream),
-    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 pub struct SimpleTransport {
@@ -77,8 +80,8 @@ pub struct SimpleTransport {
 impl Transport for SimpleTransport {
     async fn send(&mut self, data: &[u8]) -> Result<(), RdpError> {
         match self.stream.as_mut() {
-            Some(Stream::Plain(s)) => s.write_all(data).map_err(RdpError::from),
-            Some(Stream::Tls(s)) => s.write_all(data).map_err(RdpError::from),
+            Some(Stream::Plain(s)) => s.write_all(data).await.map_err(RdpError::from),
+            Some(Stream::Tls(s)) => s.write_all(data).await.map_err(RdpError::from),
             None => Err(RdpError::Closed),
         }
     }
@@ -86,8 +89,8 @@ impl Transport for SimpleTransport {
     async fn recv_exact(&mut self, n: usize) -> Result<Vec<u8>, RdpError> {
         let mut buffer = vec![0u8; n];
         match self.stream.as_mut() {
-            Some(Stream::Plain(s)) => s.read_exact(&mut buffer).map_err(RdpError::from)?,
-            Some(Stream::Tls(s)) => s.read_exact(&mut buffer).map_err(RdpError::from)?,
+            Some(Stream::Plain(s)) => { s.read_exact(&mut buffer).await.map_err(RdpError::from)?; }
+            Some(Stream::Tls(s)) => { s.read_exact(&mut buffer).await.map_err(RdpError::from)?; }
             None => return Err(RdpError::Closed),
         }
         Ok(buffer)
@@ -95,12 +98,8 @@ impl Transport for SimpleTransport {
 
     async fn close(&mut self) {
         match self.stream.take() {
-            Some(Stream::Plain(s)) => { let _ = s.shutdown(std::net::Shutdown::Both); }
-            Some(Stream::Tls(mut s)) => {
-                s.conn.send_close_notify();
-                let _ = s.conn.complete_io(&mut s.sock);
-                let _ = s.sock.shutdown(std::net::Shutdown::Both);
-            }
+            Some(Stream::Plain(mut s)) => { let _ = s.shutdown().await; }
+            Some(Stream::Tls(mut s)) => { let _ = s.shutdown().await; }
             None => {}
         }
     }
@@ -120,28 +119,18 @@ impl Transport for SimpleTransport {
         .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
         .with_no_client_auth();
 
-        // For IP addresses, no SNI; for hostnames, use DNS SNI
         let server_name: ServerName<'static> = match self.host.parse::<IpAddr>() {
             Ok(ip) => ServerName::IpAddress(ip.into()),
             Err(_) => ServerName::try_from(self.host.clone())
                 .map_err(|_| RdpError::Io(format!("Invalid hostname: {}", self.host)))?,
         };
 
-        let conn = ClientConnection::new(Arc::new(config), server_name)
-            .map_err(|e| RdpError::Io(e.to_string()))?;
-
-        let mut stream = Box::new(StreamOwned::new(conn, plain));
-
-        // Drive the TLS handshake to completion (blocking)
-        {
-            let conn = &mut stream.conn;
-            let sock = &mut stream.sock;
-            conn.complete_io(sock)
-                .map_err(|e| RdpError::Io(format!("TLS handshake failed: {}", e)))?;
-        }
+        let connector = TlsConnector::from(Arc::new(config));
+        let tls_stream = connector.connect(server_name, plain).await
+            .map_err(|e| RdpError::Io(format!("TLS handshake failed: {}", e)))?;
 
         // Extract server certificate RSA public key for NLA/CredSSP
-        let cert_der: Option<Vec<u8>> = stream.conn
+        let cert_der: Option<Vec<u8>> = tls_stream.get_ref().1
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|cert| cert.as_ref().to_vec());
@@ -152,7 +141,7 @@ impl Transport for SimpleTransport {
 
         log::debug!("TLS handshake complete, RSA pubkey len={}", spki.len());
 
-        self.stream = Some(Stream::Tls(stream));
+        self.stream = Some(Stream::Tls(Box::new(tls_stream)));
         Ok(spki)
     }
 }
@@ -229,11 +218,8 @@ impl RdpConnection {
             config.username
         );
 
-        let stream = TcpStream::connect((config.host.as_str(), config.port))?;
-        // No read timeout: the server may be idle for extended periods (between audio tracks,
-        // idle desktop) and we must not disconnect. A real connection failure manifests as
-        // ECONNRESET / Broken pipe, not a timeout.
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+        let stream = TcpStream::connect((config.host.as_str(), config.port)).await?;
+        stream.set_nodelay(true)?;
 
         let transport = SimpleTransport {
             stream: Some(Stream::Plain(stream)),
