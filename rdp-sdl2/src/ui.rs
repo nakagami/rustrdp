@@ -5,12 +5,13 @@ use std::error::Error;
 
 use rdp_core::bitmap::Bitmap;
 
+// Fields are declared in drop order (first declared → first dropped).
+// Texture must be destroyed before the renderer (canvas), so it is declared first.
 pub struct RdpUI {
-    canvas: Canvas<Window>,
-    texture_creator: TextureCreator<WindowContext>,
-    /// Persistent RGBA back-buffer: compositing target for incremental bitmap tiles.
-    /// Uploading the whole buffer on each update avoids canvas.clear() which would
-    /// wipe previously rendered tiles.
+    texture: Texture,                                // dropped 1st: SDL_DestroyTexture
+    texture_creator: TextureCreator<WindowContext>,  // dropped 2nd
+    canvas: Canvas<Window>,                          // dropped 3rd: SDL_DestroyRenderer
+    /// CPU-side RGBA back-buffer: compositing target for incremental bitmap tiles.
     back_buf: Vec<u8>,
     width: u16,
     height: u16,
@@ -26,11 +27,18 @@ impl RdpUI {
 
         let canvas = window.into_canvas().build()?;
         let texture_creator = canvas.texture_creator();
+        // Create one streaming texture and reuse it every frame.
+        let texture = texture_creator.create_texture_streaming(
+            PixelFormatEnum::RGBA32,
+            width as u32,
+            height as u32,
+        )?;
         let back_buf = vec![0u8; width as usize * height as usize * 4];
 
         Ok(RdpUI {
-            canvas,
+            texture,
             texture_creator,
+            canvas,
             back_buf,
             width,
             height,
@@ -45,16 +53,17 @@ impl RdpUI {
         self.present()
     }
 
-    /// Upload the back-buffer to the GPU and flip.
+    /// Re-present the current back-buffer without modifying it.
+    /// Call this on SDL Exposed / Restored events so the window redraws itself.
+    pub fn repaint(&mut self) -> Result<(), Box<dyn Error>> {
+        self.present()
+    }
+
+    /// Upload the back-buffer to the persistent streaming texture and flip.
     fn present(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut tex: Texture = self.texture_creator.create_texture_streaming(
-            PixelFormatEnum::ABGR8888,
-            self.width as u32,
-            self.height as u32,
-        )?;
         let row_bytes = self.width as usize * 4;
-        tex.update(None, &self.back_buf, row_bytes)?;
-        self.canvas.copy(&tex, None, None)?;
+        self.texture.update(None, &self.back_buf, row_bytes)?;
+        self.canvas.copy(&self.texture, None, None)?;
         self.canvas.present();
         Ok(())
     }
