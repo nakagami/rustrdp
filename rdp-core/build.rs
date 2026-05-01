@@ -12,5 +12,7 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=avcodec");
         println!("cargo:rustc-link-lib=dylib=avutil");
         println!("cargo:rustc-link-lib=dylib=swscale");
+        println!("cargo:rerun-if-changed=src/h264_helper.c");
+        println!("cargo:rerun-if-changed=build.rs");
     }
 }

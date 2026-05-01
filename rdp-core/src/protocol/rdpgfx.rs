@@ -89,6 +89,16 @@ pub struct RdpgfxHandler {
 
 impl RdpgfxHandler {
     pub fn new() -> Self {
+        #[cfg(feature = "h264")]
+        let h264_dec = {
+            let dec = crate::h264::H264Decoder::new();
+            if dec.is_none() {
+                log::warn!("[rdpgfx] H264Decoder::new() returned None — H.264 decode unavailable");
+            } else {
+                log::info!("[rdpgfx] H264Decoder initialized successfully");
+            }
+            dec
+        };
         RdpgfxHandler {
             surfaces: HashMap::new(),
             cache: HashMap::new(),
@@ -97,7 +107,7 @@ impl RdpgfxHandler {
             needs_force_refresh: false,
             consecutive_h264_none: 0,
             #[cfg(feature = "h264")]
-            h264_dec: crate::h264::H264Decoder::new(),
+            h264_dec,
         }
     }
 
@@ -242,7 +252,7 @@ impl RdpgfxHandler {
         let id     = u16::from_le_bytes([data[0], data[1]]);
         let width  = u16::from_le_bytes([data[2], data[3]]);
         let height = u16::from_le_bytes([data[4], data[5]]);
-        log::debug!("[rdpgfx] CREATE_SURFACE id={} w={} h={}", id, width, height);
+        log::info!("[rdpgfx] CREATE_SURFACE id={} w={} h={}", id, width, height);
         self.surfaces.insert(id, Surface {
             width,
             height,
@@ -265,7 +275,7 @@ impl RdpgfxHandler {
         // data[2..4] = reserved
         let ox = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let oy = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        log::debug!("[rdpgfx] MAP_SURFACE id={} ox={} oy={}", id, ox, oy);
+        log::info!("[rdpgfx] MAP_SURFACE id={} ox={} oy={}", id, ox, oy);
         if let Some(s) = self.surfaces.get_mut(&id) {
             s.output_x = ox;
             s.output_y = oy;
@@ -298,12 +308,16 @@ impl RdpgfxHandler {
         if data.len() < 8 { return; }
         let w = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let h = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        log::debug!("[rdpgfx] RESET_GRAPHICS {}x{}", w, h);
+        log::info!("[rdpgfx] RESET_GRAPHICS {}x{}", w, h);
         self.surfaces.clear();
         self.frames_decoded = 0;
         #[cfg(feature = "h264")]
         {
-            self.h264_dec = crate::h264::H264Decoder::new();
+            let dec = crate::h264::H264Decoder::new();
+            if dec.is_none() {
+                log::warn!("[rdpgfx] RESET_GRAPHICS: H264Decoder::new() failed");
+            }
+            self.h264_dec = dec;
         }
     }
 
@@ -566,16 +580,19 @@ impl RdpgfxHandler {
             if let Some(ref mut dec) = self.h264_dec {
                 let result = dec.decode(h264_data);
                 if result.is_none() {
-                    // Case 1: decoder explicitly waiting for IDR (after codec reset)
-                    if dec.needs_keyframe() && self.frames_decoded > 0 {
-                        log::debug!("[rdpgfx] H264 decoder waiting for IDR — requesting force refresh");
+                    // Case 1: decoder explicitly waiting for IDR (after codec reset due to
+                    // avcodec_send_packet failure — genuine stream discontinuity)
+                    if dec.needs_keyframe() {
+                        log::warn!("[rdpgfx] H264 decoder waiting for IDR — requesting force refresh");
                         self.needs_force_refresh = true;
                         self.consecutive_h264_none = 0;
                     } else {
-                        // Case 2: P-frame stall — decoder silently discarded the packet
+                        // Case 2: no output yet — normal for B-frame / GOP start delay.
+                        // Count anyway; only act after a very large number to catch
+                        // genuine silent-discard after a stream discontinuity.
                         self.consecutive_h264_none += 1;
-                        if self.consecutive_h264_none >= 2 && self.frames_decoded > 0 {
-                            log::debug!("[rdpgfx] H264 stall ({} consecutive nones) — requesting force refresh",
+                        if self.consecutive_h264_none >= 20 {
+                            log::warn!("[rdpgfx] H264 stall ({} consecutive nones) — requesting force refresh",
                                 self.consecutive_h264_none);
                             self.needs_force_refresh = true;
                         }
@@ -588,7 +605,7 @@ impl RdpgfxHandler {
                     if result.is_some() { "frame" } else { "none" });
                 return result;
             } else {
-                log::debug!("[rdpgfx] H264 decoder is None (init failed)");
+                log::warn!("[rdpgfx] H264 decoder is None (init failed) — frame dropped");
             }
         }
         #[cfg(not(feature = "h264"))]
@@ -666,20 +683,21 @@ struct Avc420Stream {
 
 fn parse_avc420(data: &[u8]) -> Option<Avc420Stream> {
     if data.len() < 4 {
-        log::debug!("[rdpgfx] parse_avc420: data too short ({})", data.len());
+        log::warn!("[rdpgfx] parse_avc420: data too short ({})", data.len());
         return None;
     }
     let num_regions = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     if num_regions > 65536 {
-        log::debug!("[rdpgfx] parse_avc420: num_regions={} too large", num_regions);
+        log::warn!("[rdpgfx] parse_avc420: num_regions={} too large", num_regions);
         return None;
     }
     // 4 header + 8 bytes rect + 2 bytes quant per region
     let meta_size = 4 + num_regions * 10;
     if meta_size > data.len() {
-        log::debug!("[rdpgfx] parse_avc420: meta_size={} > data.len()={}", meta_size, data.len());
+        log::warn!("[rdpgfx] parse_avc420: meta_size={} > data.len()={}", meta_size, data.len());
         return None;
     }
+    log::debug!("[rdpgfx] parse_avc420: num_regions={} meta_size={} h264_data_len={}", num_regions, meta_size, data.len() - meta_size);
 
     let mut regions = Vec::with_capacity(num_regions);
     let mut off = 4usize;
@@ -706,11 +724,25 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
     log::debug!("[rdpgfx] parse_avc444: data={} lc={} cb_stream1={} rest={}",
         data.len(), lc, cb_stream1, rest.len());
     match lc {
-        0 | 1 | 2 => {
+        0 | 1 => {
             // lc=0: YUV 4:2:0 only (stream1 = H264 base layer)
             // lc=1: YUV 4:4:4 only (stream1 = H264 with full chroma)
-            // lc=2: both YUV 4:2:0 + 4:4:4 (stream1 = H264 base, stream2 = chroma aux)
-            // In all cases stream1 carries decodable H264 data.
+            if cb_stream1 > rest.len() {
+                log::debug!("[rdpgfx] parse_avc444: cb_stream1={} > rest={} → None", cb_stream1, rest.len());
+                return None;
+            }
+            let s = parse_avc420(&rest[..cb_stream1])?;
+            Some((s, lc))
+        }
+        2 => {
+            // lc=2: both YUV 4:2:0 base (stream1) + 4:4:4 chroma aux (stream2).
+            // Only stream1 is a standalone H264 stream we can decode.
+            // If stream1 is empty (cb_stream1=0), there is no primary video data
+            // for this frame — skip it without touching the decoder.
+            if cb_stream1 == 0 {
+                log::debug!("[rdpgfx] parse_avc444: lc=2 cb_stream1=0 (chroma-only frame) → skip");
+                return None;
+            }
             if cb_stream1 > rest.len() {
                 log::debug!("[rdpgfx] parse_avc444: cb_stream1={} > rest={} → None", cb_stream1, rest.len());
                 return None;

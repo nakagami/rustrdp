@@ -209,7 +209,12 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     }
 
     if (ret < 0) {
-        if (!has_idr(data, len)) {
+        char errbuf[128];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        int pkt_idr = has_idr(data, len);
+        fprintf(stderr, "[h264] avcodec_send_packet failed: %s (len=%d idr=%d)\n",
+                errbuf, len, pkt_idr);
+        if (!pkt_idr) {
             /* P-frame failure: do NOT flush — that would destroy the reference
              * frame buffer, causing SKIP macroblocks to decode as black.
              * Just wait for the server to send the next IDR naturally. */
@@ -235,13 +240,11 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     }
 
     /* Drain all frames produced by this packet, keep the last one */
-    int post_drain_count = 0;
     for (;;) {
         ret = avcodec_receive_frame(d->ctx, d->frame);
         if (ret == AVERROR(EAGAIN)) break;
         if (ret == AVERROR_EOF) break;
         if (ret < 0) break;
-        post_drain_count++;
         CONVERT_FRAME(d->frame, &result, &rw, &rh);
     }
 
@@ -251,12 +254,12 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
         *width = rw; *height = rh;
         d->stall_count = 0;
     } else {
-        /* Decoder accepted the packet but produced no frame.  This usually
-         * means it silently discarded a packet after an internal stream
-         * discontinuity.  Count consecutive stalls and after a threshold
-         * flush and request a fresh IDR so recovery is not open-ended. */
+        /* Decoder accepted the packet but produced no frame.  This is NORMAL
+         * for H.264 streams using B-frames: the decoder may buffer 1–4 frames
+         * before producing output.  Only flush after a very large number of
+         * consecutive stalls, which indicates a genuine stream discontinuity. */
         d->stall_count++;
-        if (d->stall_count >= 3) {
+        if (d->stall_count >= 30) {
             avcodec_flush_buffers(d->ctx);
             d->needs_keyframe = 1;
             d->stall_count = 0;
