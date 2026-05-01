@@ -122,6 +122,9 @@ impl DrdynvcHandler {
         let name = read_cstring(&data[name_start..]);
         log::debug!("[drdynvc] CREATE_REQ ch={} name={}", ch_id, name);
 
+        // Always send CREATE_RESPONSE (status=0 = S_OK) before any data.
+        out.push(build_create_rsp(ch_id, cb_ch_id, 0));
+
         if name == GFX_CHANNEL_NAME {
             let mut gfx = RdpgfxHandler::new();
             // Build CAPS_ADVERTISE and wrap it in a DATA PDU
@@ -277,4 +280,15 @@ fn wrap_data_pdu(ch_id: u32, cb_ch_id: u8, payload: &[u8]) -> Vec<u8> {
 fn build_soft_sync_response() -> Vec<u8> {
     // Cmd=9, Sp=0, CbChId=0
     vec![0x90, 0x00, 0x00, 0x00, 0x00]
+}
+
+/// Build DYNVC_CREATE_RSP PDU.
+/// Header Cmd=1 (same as CREATE_REQ), direction implies it's the response.
+fn build_create_rsp(ch_id: u32, cb_ch_id: u8, status: u32) -> Vec<u8> {
+    let mut pdu = Vec::with_capacity(1 + ch_id_len(cb_ch_id) + 4);
+    let header = (0x01u8 << 4) | (cb_ch_id & 0x03);
+    pdu.push(header);
+    write_ch_id(&mut pdu, ch_id, cb_ch_id);
+    pdu.extend_from_slice(&status.to_le_bytes());
+    pdu
 }

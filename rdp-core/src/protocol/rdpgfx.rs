@@ -143,6 +143,7 @@ impl RdpgfxHandler {
         bitmaps: &mut Vec<Bitmap>,
         outgoing: &mut Vec<Vec<u8>>,
     ) {
+        log::debug!("[rdpgfx] cmd 0x{:04X} len={}", cmd_id, data.len());
         match cmd_id {
             CMDID_CAPS_CONFIRM => {
                 self.on_caps_confirm(data);
@@ -165,8 +166,11 @@ impl RdpgfxHandler {
             CMDID_MAP_SURFACE_SCALED_V2 => {
                 self.on_map_surface_to_scaled_output(data);
             }
-            CMDID_START_FRAME => { /* nothing */ }
+            CMDID_START_FRAME => {
+                log::debug!("[rdpgfx] START_FRAME");
+            }
             CMDID_END_FRAME => {
+                log::debug!("[rdpgfx] END_FRAME");
                 if let Some(ack) = self.on_end_frame(data) {
                     outgoing.push(ack);
                 }
@@ -190,6 +194,7 @@ impl RdpgfxHandler {
                 self.on_reset_graphics(data);
             }
             CMDID_CACHE_IMPORT_OFFER => {
+                log::debug!("[rdpgfx] CACHE_IMPORT_OFFER → replying");
                 outgoing.push(build_cache_import_reply());
             }
             _ => {
@@ -268,7 +273,9 @@ impl RdpgfxHandler {
         if data.len() < 4 { return None; }
         let frame_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         self.frames_decoded += 1;
-        Some(build_frame_ack(frame_id, self.frames_decoded))
+        // queue_depth=0: no pending frames in decode queue.
+        // totalFramesDecoded: cumulative count of decoded frames.
+        Some(build_frame_ack(frame_id, 0, self.frames_decoded))
     }
 
     fn on_reset_graphics(&mut self, data: &[u8]) {
@@ -285,30 +292,36 @@ impl RdpgfxHandler {
     }
 
     fn on_wire_to_surface_1(&mut self, data: &[u8], bitmaps: &mut Vec<Bitmap>) {
-        // Fixed header: surfaceId(2) + codecId(2) + pixelFormat(1) +
-        //               reserved(3) + destLeft(2)+destTop(2)+destRight(2)+destBottom(2) +
-        //               bitmapDataLength(4) = 20 bytes min
-        if data.len() < 20 { return; }
+        // MS-RDPEGFX §2.2.2.1: surfaceId(2)+codecId(2)+pixelFormat(1)+destRect(8)+bitmapDataLength(4) = 17 bytes
+        if data.len() < 17 { return; }
         let surf_id   = u16::from_le_bytes([data[0], data[1]]);
         let codec_id  = u16::from_le_bytes([data[2], data[3]]);
         let _pix_fmt  = data[4];
-        // data[5..8] = reserved
-        let dest_left   = u16::from_le_bytes([data[8],  data[9]]);
-        let dest_top    = u16::from_le_bytes([data[10], data[11]]);
-        let dest_right  = u16::from_le_bytes([data[12], data[13]]);
-        let dest_bottom = u16::from_le_bytes([data[14], data[15]]);
-        let bmp_len  = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as usize;
-        if data.len() < 20 + bmp_len { return; }
-        let bmp_data = &data[20..20 + bmp_len];
+        let dest_left   = u16::from_le_bytes([data[5],  data[6]]);
+        let dest_top    = u16::from_le_bytes([data[7],  data[8]]);
+        let dest_right  = u16::from_le_bytes([data[9],  data[10]]);
+        let dest_bottom = u16::from_le_bytes([data[11], data[12]]);
+        let bmp_len  = u32::from_le_bytes([data[13], data[14], data[15], data[16]]) as usize;
+        if data.len() < 17 + bmp_len { return; }
+        let bmp_data = &data[17..17 + bmp_len];
 
         let w = dest_right.saturating_sub(dest_left) as i32;
         let h = dest_bottom.saturating_sub(dest_top) as i32;
         if w <= 0 || h <= 0 { return; }
 
+        log::debug!("[rdpgfx] WTS1: surf={} codec=0x{:04X} {}x{} at ({},{}) data_len={}",
+            surf_id, codec_id, w, h, dest_left, dest_top, bmp_len);
+
         let (output_x, output_y) = match self.surfaces.get(&surf_id) {
             Some(s) if s.mapped => (s.output_x, s.output_y),
-            Some(_) => return,
-            None => return,
+            Some(_) => {
+                log::debug!("[rdpgfx] WTS1: surface {} not yet mapped, skipping", surf_id);
+                return;
+            }
+            None => {
+                log::debug!("[rdpgfx] WTS1: surface {} not found", surf_id);
+                return;
+            }
         };
 
         let abs_x = output_x as i32 + dest_left as i32;
@@ -446,6 +459,7 @@ impl RdpgfxHandler {
 
     fn decode_avc444(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         let (stream, lc) = parse_avc444(data)?;
+        log::debug!("[rdpgfx] AVC444 lc={} h264_data_len={}", lc, stream.h264_data.len());
         match lc {
             2 => None,  // auxiliary-only, skip
             _ => self.decode_h264(&stream.h264_data),
@@ -457,9 +471,16 @@ impl RdpgfxHandler {
         #[cfg(feature = "h264")]
         {
             if let Some(ref mut dec) = self.h264_dec {
-                return dec.decode(h264_data);
+                let result = dec.decode(h264_data);
+                log::debug!("[rdpgfx] H264 decode {} bytes → {}",
+                    h264_data.len(),
+                    if result.is_some() { "frame" } else { "none" });
+                return result;
+            } else {
+                log::debug!("[rdpgfx] H264 decoder is None (init failed)");
             }
         }
+        #[cfg(not(feature = "h264"))]
         log::debug!("[rdpgfx] H.264 data received but h264 feature not enabled");
         None
     }
@@ -615,14 +636,16 @@ pub fn build_caps_advertise() -> Vec<u8> {
 }
 
 /// Build RDPGFX_FRAME_ACKNOWLEDGE_PDU (client→server).
-fn build_frame_ack(frame_id: u32, queue_depth: u32) -> Vec<u8> {
+/// queue_depth: number of frames still queued in client decode pipeline.
+/// total_decoded: cumulative number of frames decoded since connection start.
+fn build_frame_ack(frame_id: u32, queue_depth: u32, total_decoded: u32) -> Vec<u8> {
     let mut pdu = vec![0u8; 20];
     pdu[0..2].copy_from_slice(&CMDID_FRAME_ACKNOWLEDGE.to_le_bytes());
     // pdu[2..4] = flags = 0
     pdu[4..8].copy_from_slice(&20u32.to_le_bytes());   // pduLength
     pdu[8..12].copy_from_slice(&queue_depth.to_le_bytes());
     pdu[12..16].copy_from_slice(&frame_id.to_le_bytes());
-    // pdu[16..20] = timestamp = 0
+    pdu[16..20].copy_from_slice(&total_decoded.to_le_bytes()); // totalFramesDecoded
     pdu
 }
 

@@ -129,8 +129,9 @@ impl<'a> BitReader<'a> {
             idx += 1;
         }
         let val = if avail >= 9 {
+            let v = (bits >> (avail as u32 - 9)) & 0x1FF;
             avail = 9;
-            (bits >> (avail as u32 - 9)) & 0x1FF
+            v
         } else if avail > 0 {
             bits << (9 - avail)
         } else {
@@ -143,7 +144,7 @@ impl<'a> BitReader<'a> {
     }
 
     fn consume_bits(&mut self, n: u8) {
-        let n = n.min(self.bits_remaining as u8);
+        let n = (n as u32).min(self.bits_remaining) as u8;
         self.bits_remaining -= n as u32;
         let mut n = n;
         while n >= self.bit_pos {
@@ -401,5 +402,19 @@ impl ZgfxContext {
                 data.to_vec()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_caps_confirm_decompress() {
+        let input = [0xE0u8, 0x24, 0x09, 0xE3, 0x18, 0x0A, 0x44, 0x8C,
+                     0xF1, 0xE9, 0x8D, 0xD1, 0x43, 0x4C, 0x63, 0x00, 0x05];
+        let mut ctx = ZgfxContext::new();
+        let result = ctx.decompress(&input);
+        assert_eq!(result[0], 0x13);
+        assert_eq!(result[1], 0x00);
     }
 }
