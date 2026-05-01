@@ -63,6 +63,8 @@ pub struct RdpSession<T: Transport> {
     drdynvc_frag: Vec<u8>,
     /// Total byte length of the current drdynvc fragment chain
     drdynvc_frag_total: usize,
+    /// Pending audio events from DVC that haven't been delivered yet
+    pending_audio: std::collections::VecDeque<crate::protocol::rdpsnd::AudioEvent>,
 }
 
 impl<T: Transport> RdpSession<T> {
@@ -206,6 +208,7 @@ impl<T: Transport> RdpSession<T> {
             drdynvc_handler: DrdynvcHandler::new(),
             drdynvc_frag: Vec::new(),
             drdynvc_frag_total: 0,
+            pending_audio: std::collections::VecDeque::new(),
         };
 
         // Steps 10-12: Confirm Active, sync sequence, wait for FontMap
@@ -321,6 +324,11 @@ impl<T: Transport> RdpSession<T> {
     pub async fn recv_event(&mut self) -> Result<RdpEvent, RdpError> {
         log::debug!("[recv_event] entering");
         loop {
+            // Deliver any pending audio events before waiting for more data
+            if let Some(ev) = self.pending_audio.pop_front() {
+                return Ok(RdpEvent::Audio { format: ev.format, data: ev.data });
+            }
+
             log::debug!("[recv_event] waiting for recv_data...");
             let result = self.mcs.recv_data().await;
             log::debug!("[recv_event] recv_data returned: {}", if result.is_ok() { "Ok" } else { "Err" });
@@ -347,7 +355,10 @@ impl<T: Transport> RdpSession<T> {
 
             // Dispatch drdynvc static virtual channel data
             if Some(ch) == self.drdynvc_channel {
-                let bitmaps = self.handle_drdynvc_data(&data).await;
+                let (bitmaps, audio_events) = self.handle_drdynvc_data(&data).await;
+                for ev in audio_events {
+                    self.pending_audio.push_back(ev);
+                }
                 if !bitmaps.is_empty() {
                     return Ok(RdpEvent::Bitmap(bitmaps));
                 }
@@ -471,14 +482,14 @@ impl<T: Transport> RdpSession<T> {
 
     /// Handle data arriving on the drdynvc virtual channel.
     /// Reassembles fragmented channel PDUs then passes the complete payload
-    /// to the DrdynvcHandler, returns any decoded bitmaps.
-    async fn handle_drdynvc_data(&mut self, data: &[u8]) -> Vec<Bitmap> {
+    /// to the DrdynvcHandler, returns any decoded bitmaps and audio events.
+    async fn handle_drdynvc_data(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<crate::protocol::rdpsnd::AudioEvent>) {
         const CHANNEL_FLAG_FIRST: u32 = 0x01;
         const CHANNEL_FLAG_LAST:  u32 = 0x02;
 
         if data.len() < 8 {
             log::warn!("[drdynvc] channel data too short: {} bytes", data.len());
-            return vec![];
+            return (vec![], vec![]);
         }
         let total_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let flags     = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
@@ -491,13 +502,13 @@ impl<T: Transport> RdpSession<T> {
         self.drdynvc_frag.extend_from_slice(payload);
 
         if flags & CHANNEL_FLAG_LAST == 0 {
-            return vec![];
+            return (vec![], vec![]);
         }
 
         let assembled = std::mem::take(&mut self.drdynvc_frag);
-        let (bitmaps, responses) = self.drdynvc_handler.process(&assembled);
+        let (bitmaps, responses, audio_events) = self.drdynvc_handler.process(&assembled);
 
-        // Send any outgoing DRDYNVC PDUs (CAPS response, FRAME_ACK, etc.)
+        // Send any outgoing DRDYNVC PDUs (CAPS response, FRAME_ACK, audio replies, etc.)
         for resp in responses {
             let mut vchan_pdu = Vec::with_capacity(8 + resp.len());
             vchan_pdu.extend_from_slice(&(resp.len() as u32).to_le_bytes());
@@ -511,7 +522,7 @@ impl<T: Transport> RdpSession<T> {
             }
         }
 
-        bitmaps
+        (bitmaps, audio_events)
     }
 
     pub async fn send_key_down(&mut self, flags: u16, scancode: u8) -> Result<(), RdpError> {

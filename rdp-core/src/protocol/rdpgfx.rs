@@ -336,19 +336,23 @@ impl RdpgfxHandler {
                 bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
             }
             CODEC_AVC420 => {
-                if let Some((pixels, fw, fh)) = self.decode_avc420(bmp_data) {
+                if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
-                    self.blit_to_surface(surf_id, dest_left as i32, dest_top as i32, ew, eh, &pixels);
-                    bitmaps.push(make_bitmap(abs_x, abs_y, ew, eh, crop_bgra(&pixels, fw, fh, ew, eh)));
+                    blit_avc_frame(surf_id, &mut self.surfaces, bitmaps,
+                        &pixels, fw, fh, ew, eh,
+                        dest_left as i32, dest_top as i32, abs_x, abs_y, &regions);
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
-                if let Some((pixels, fw, fh)) = self.decode_avc444(bmp_data) {
+                if let Some((pixels, fw, fh, regions)) = self.decode_avc444(bmp_data) {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
-                    self.blit_to_surface(surf_id, dest_left as i32, dest_top as i32, ew, eh, &pixels);
-                    bitmaps.push(make_bitmap(abs_x, abs_y, ew, eh, crop_bgra(&pixels, fw, fh, ew, eh)));
+                    log::debug!("[rdpgfx] AVC444 decoded {}x{} → blit {}x{} regions={} at ({},{}) abs=({},{})",
+                        fw, fh, ew, eh, regions.len(), dest_left, dest_top, abs_x, abs_y);
+                    blit_avc_frame(surf_id, &mut self.surfaces, bitmaps,
+                        &pixels, fw, fh, ew, eh,
+                        dest_left as i32, dest_top as i32, abs_x, abs_y, &regions);
                 }
             }
             _ => {
@@ -452,17 +456,21 @@ impl RdpgfxHandler {
 
     // ── H.264 / AVC decode helpers ─────────────────────────────────────────────
 
-    fn decode_avc420(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    fn decode_avc420(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>)> {
         let stream = parse_avc420(data)?;
+        let regions = stream.regions;
         self.decode_h264(&stream.h264_data)
+            .map(|(pixels, w, h)| (pixels, w, h, regions))
     }
 
-    fn decode_avc444(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    fn decode_avc444(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>)> {
         let (stream, lc) = parse_avc444(data)?;
         log::debug!("[rdpgfx] AVC444 lc={} h264_data_len={}", lc, stream.h264_data.len());
+        let regions = stream.regions;
         match lc {
             2 => None,  // auxiliary-only, skip
-            _ => self.decode_h264(&stream.h264_data),
+            _ => self.decode_h264(&stream.h264_data)
+                .map(|(pixels, w, h)| (pixels, w, h, regions)),
         }
     }
 
@@ -506,9 +514,92 @@ impl RdpgfxHandler {
     }
 }
 
-// ── AVC stream parsing ────────────────────────────────────────────────────────
+// ── AVC region-aware frame blit ───────────────────────────────────────────────
+
+/// Blit a decoded AVC frame into the surface and emit bitmap update(s).
+/// When the dirty regions cover < 60 % of the frame, only those rectangles
+/// are copied so that unchanged desktop areas are not overwritten with the
+/// black fill the encoder uses for skipped macroblocks outside the dirty area.
+#[allow(clippy::too_many_arguments)]
+fn blit_avc_frame(
+    surf_id:  u16,
+    surfaces: &mut std::collections::HashMap<u16, Surface>,
+    bitmaps:  &mut Vec<Bitmap>,
+    pixels:   &[u8],
+    fw: i32, fh: i32,   // decoded frame dimensions (may be larger than dest due to macroblock padding)
+    ew: i32, eh: i32,   // effective (clipped to dest rect) dimensions
+    dx: i32, dy: i32,   // destination offset on surface
+    ax: i32, ay: i32,   // absolute screen position
+    regions: &[AvcRect],
+) {
+    let frame_stride = fw * 4;
+
+    if should_use_avc_regions(regions, ew, eh) {
+        log::debug!("[rdpgfx] AVC partial blit: {} regions", regions.len());
+        // Partial update: blit only the dirty rectangles
+        let s = match surfaces.get_mut(&surf_id) { Some(s) => s, None => return };
+        let surf_stride = s.width as i32 * 4;
+        for r in regions {
+            if r.right <= r.left || r.bottom <= r.top { continue; }
+            let mut rx = r.left as i32;
+            let mut ry = r.top  as i32;
+            let mut rw = (r.right  - r.left) as i32;
+            let mut rh = (r.bottom - r.top)  as i32;
+            // Clamp to effective frame size
+            if rx + rw > ew { rw = ew - rx; }
+            if ry + rh > eh { rh = eh - ry; }
+            if rw <= 0 || rh <= 0 { continue; }
+            let row_bytes = rw as usize * 4;
+            let mut region_data = vec![0u8; rw as usize * rh as usize * 4];
+            for row in 0..rh {
+                let src_off = ((ry + row) * frame_stride + rx * 4) as usize;
+                if src_off + row_bytes > pixels.len() { break; }
+                // copy into region buf
+                let dst_off_r = (row * rw * 4) as usize;
+                region_data[dst_off_r..dst_off_r + row_bytes]
+                    .copy_from_slice(&pixels[src_off..src_off + row_bytes]);
+                // also copy into persistent surface
+                let sy = dy + ry + row;
+                if sy < 0 || sy >= s.height as i32 { continue; }
+                let surf_off = (sy * surf_stride + (dx + rx) * 4) as usize;
+                if surf_off + row_bytes <= s.data.len() {
+                    s.data[surf_off..surf_off + row_bytes]
+                        .copy_from_slice(&pixels[src_off..src_off + row_bytes]);
+                }
+            }
+            bitmaps.push(make_bitmap(ax + rx, ay + ry, rw, rh, region_data));
+        }
+    } else {
+        // Full-frame update
+        let cropped = crop_bgra(pixels, fw, fh, ew, eh);
+        if let Some(s) = surfaces.get_mut(&surf_id) {
+            let stride = s.width as i32 * 4;
+            for row in 0..eh {
+                let sy = dy + row;
+                if sy < 0 || sy >= s.height as i32 { continue; }
+                let src_off = (row * ew * 4) as usize;
+                let dst_off = (sy * stride + dx * 4) as usize;
+                let n = (ew * 4) as usize;
+                if src_off + n <= cropped.len() && dst_off + n <= s.data.len() {
+                    s.data[dst_off..dst_off + n].copy_from_slice(&cropped[src_off..src_off + n]);
+                }
+            }
+        }
+        bitmaps.push(make_bitmap(ax, ay, ew, eh, cropped));
+    }
+}
+
+
+#[derive(Clone)]
+struct AvcRect {
+    left:   u16,
+    top:    u16,
+    right:  u16,
+    bottom: u16,
+}
 
 struct Avc420Stream {
+    regions:  Vec<AvcRect>,
     h264_data: Vec<u8>,
 }
 
@@ -519,7 +610,36 @@ fn parse_avc420(data: &[u8]) -> Option<Avc420Stream> {
     // 4 header + 8 bytes rect + 2 bytes quant per region
     let meta_size = 4 + num_regions * 10;
     if meta_size > data.len() { return None; }
-    Some(Avc420Stream { h264_data: data[meta_size..].to_vec() })
+
+    let mut regions = Vec::with_capacity(num_regions);
+    let mut off = 4usize;
+    // Region rects come first (8 bytes each), then quant/quality (2 bytes each)
+    for _ in 0..num_regions {
+        let left   = u16::from_le_bytes([data[off],   data[off+1]]);
+        let top    = u16::from_le_bytes([data[off+2], data[off+3]]);
+        let right  = u16::from_le_bytes([data[off+4], data[off+5]]);
+        let bottom = u16::from_le_bytes([data[off+6], data[off+7]]);
+        regions.push(AvcRect { left, top, right, bottom });
+        off += 8;
+    }
+    // skip quant/quality bytes (2 per region)
+    Some(Avc420Stream { regions, h264_data: data[meta_size..].to_vec() })
+}
+
+/// Returns true when only the dirty rectangles should be blitted
+/// (total dirty area < 60% of the frame), which avoids overwriting
+/// unchanged desktop areas with the black fill the encoder uses for
+/// SKIP macroblocks outside the dirty region.
+fn should_use_avc_regions(regions: &[AvcRect], frame_w: i32, frame_h: i32) -> bool {
+    let total = frame_w * frame_h;
+    if total <= 0 || regions.is_empty() { return false; }
+    let mut sum = 0i64;
+    for r in regions {
+        if r.right <= r.left || r.bottom <= r.top { continue; }
+        sum += (r.right - r.left) as i64 * (r.bottom - r.top) as i64;
+        if sum * 100 >= total as i64 * 60 { return false; }
+    }
+    sum > 0
 }
 
 fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
@@ -540,7 +660,7 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
         }
         2 => {
             // Auxiliary only — no main stream
-            Some((Avc420Stream { h264_data: vec![] }, lc))
+            Some((Avc420Stream { regions: vec![], h264_data: vec![] }, lc))
         }
         _ => None,
     }

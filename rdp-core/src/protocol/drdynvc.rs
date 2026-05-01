@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use crate::bitmap::Bitmap;
 use crate::protocol::rdpgfx::RdpgfxHandler;
+use crate::protocol::rdpsnd::{RdpsndHandler, AudioEvent};
 
 // ── DYNVC message commands ────────────────────────────────────────────────────
 const CMD_CREATE_REQ:        u8 = 0x01;
@@ -16,7 +17,9 @@ const CMD_CLOSE:             u8 = 0x04;
 const CMD_CAPABILITIES:      u8 = 0x05;
 const CMD_SOFT_SYNC_REQUEST: u8 = 0x08;
 
-const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
+const GFX_CHANNEL_NAME:         &str = "Microsoft::Windows::RDS::Graphics";
+const AUDIO_DVC_CHANNEL_NAME:   &str = "AUDIO_PLAYBACK_DVC";
+const AUDIO_LOSSY_CHANNEL_NAME: &str = "AUDIO_PLAYBACK_LOSSY_DVC";
 
 /// In-progress reassembly for a fragmented DVC message.
 struct Fragment {
@@ -26,6 +29,7 @@ struct Fragment {
 
 enum DvcChannel {
     Gfx(RdpgfxHandler),
+    Audio(RdpsndHandler),
     Unknown,
 }
 
@@ -45,10 +49,10 @@ impl DrdynvcHandler {
     }
 
     /// Process one DVC PDU.
-    /// Returns (bitmaps produced, raw DRDYNVC PDUs to send back to server).
-    pub fn process(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>) {
+    /// Returns (bitmaps produced, raw DRDYNVC PDUs to send back to server, audio events).
+    pub fn process(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>, Vec<AudioEvent>) {
         if data.is_empty() {
-            return (vec![], vec![]);
+            return (vec![], vec![], vec![]);
         }
         let header   = data[0];
         let cmd      = (header >> 4) & 0x0F;
@@ -57,6 +61,7 @@ impl DrdynvcHandler {
 
         let mut bitmaps  = Vec::new();
         let mut outgoing = Vec::new();
+        let mut audio    = Vec::new();
 
         match cmd {
             CMD_CAPABILITIES => {
@@ -66,10 +71,10 @@ impl DrdynvcHandler {
                 self.handle_create(data, cb_ch_id, &mut outgoing);
             }
             CMD_DATA_FIRST => {
-                self.handle_data_first(data, cb_ch_id, sp, &mut bitmaps, &mut outgoing);
+                self.handle_data_first(data, cb_ch_id, sp, &mut bitmaps, &mut outgoing, &mut audio);
             }
             CMD_DATA => {
-                self.handle_data(data, cb_ch_id, &mut bitmaps, &mut outgoing);
+                self.handle_data(data, cb_ch_id, &mut bitmaps, &mut outgoing, &mut audio);
             }
             CMD_CLOSE => {
                 let ch_id = read_ch_id(data, 1, cb_ch_id);
@@ -85,7 +90,7 @@ impl DrdynvcHandler {
             }
         }
 
-        (bitmaps, outgoing)
+        (bitmaps, outgoing, audio)
     }
 
     // ── CAPABILITIES ──────────────────────────────────────────────────────────
@@ -133,6 +138,9 @@ impl DrdynvcHandler {
             for pdu in caps_pdus {
                 out.push(wrap_data_pdu(ch_id, cb_ch_id, &pdu));
             }
+        } else if name == AUDIO_DVC_CHANNEL_NAME || name == AUDIO_LOSSY_CHANNEL_NAME {
+            log::debug!("[drdynvc] registering audio DVC channel: {}", name);
+            self.channels.insert(ch_id, DvcChannel::Audio(RdpsndHandler::new()));
         } else {
             self.channels.insert(ch_id, DvcChannel::Unknown);
         }
@@ -142,7 +150,7 @@ impl DrdynvcHandler {
 
     fn handle_data_first(
         &mut self, data: &[u8], cb_ch_id: u8, sp: u8,
-        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>,
+        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>, audio: &mut Vec<AudioEvent>,
     ) {
         let id_bytes  = ch_id_len(cb_ch_id);
         let len_bytes = len_field_len(sp);
@@ -155,7 +163,7 @@ impl DrdynvcHandler {
 
         if total == payload.len() {
             // Single-packet message (total matches first chunk)
-            self.dispatch_channel_data(ch_id, payload, bitmaps, out);
+            self.dispatch_channel_data(ch_id, payload, bitmaps, out, audio);
         } else {
             let mut frag = Fragment { buf: Vec::with_capacity(total), expected: total };
             frag.buf.extend_from_slice(payload);
@@ -167,7 +175,7 @@ impl DrdynvcHandler {
 
     fn handle_data(
         &mut self, data: &[u8], cb_ch_id: u8,
-        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>,
+        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>, audio: &mut Vec<AudioEvent>,
     ) {
         let id_bytes = ch_id_len(cb_ch_id);
         if data.len() < 1 + id_bytes { return; }
@@ -180,13 +188,13 @@ impl DrdynvcHandler {
             frag.buf.len() >= frag.expected
         } else {
             // No fragment in progress → single-shot data
-            self.dispatch_channel_data(ch_id, payload, bitmaps, out);
+            self.dispatch_channel_data(ch_id, payload, bitmaps, out, audio);
             return;
         };
 
         if complete {
             let buf = self.fragments.remove(&ch_id).unwrap().buf;
-            self.dispatch_channel_data(ch_id, &buf, bitmaps, out);
+            self.dispatch_channel_data(ch_id, &buf, bitmaps, out, audio);
         }
     }
 
@@ -194,7 +202,7 @@ impl DrdynvcHandler {
 
     fn dispatch_channel_data(
         &mut self, ch_id: u32, data: &[u8],
-        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>,
+        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>, audio: &mut Vec<AudioEvent>,
     ) {
         let cb_ch_id = ch_id_size(ch_id);
         match self.channels.get_mut(&ch_id) {
@@ -203,6 +211,15 @@ impl DrdynvcHandler {
                 bitmaps.extend(new_bitmaps);
                 for r in replies {
                     out.push(wrap_data_pdu(ch_id, cb_ch_id, &r));
+                }
+            }
+            Some(DvcChannel::Audio(rdpsnd)) => {
+                let (response, event) = rdpsnd.process_data(data);
+                if !response.is_empty() {
+                    out.push(wrap_data_pdu(ch_id, cb_ch_id, &response));
+                }
+                if let Some(ev) = event {
+                    audio.push(ev);
                 }
             }
             Some(DvcChannel::Unknown) | None => {}
