@@ -230,7 +230,9 @@ impl RdpConnection {
         );
 
         let stream = TcpStream::connect((config.host.as_str(), config.port))?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+        // No read timeout: the server may be idle for extended periods (between audio tracks,
+        // idle desktop) and we must not disconnect. A real connection failure manifests as
+        // ECONNRESET / Broken pipe, not a timeout.
         stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
 
         let transport = SimpleTransport {
