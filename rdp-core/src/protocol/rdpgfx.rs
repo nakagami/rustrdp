@@ -25,10 +25,10 @@ const CMDID_CACHE_IMPORT_OFFER: u16 = 0x0010;
 const CMDID_CACHE_IMPORT_REPLY: u16 = 0x0011;
 const CMDID_CAPS_ADVERTISE: u16 = 0x0012;
 const CMDID_CAPS_CONFIRM: u16 = 0x0013;
-const CMDID_MAP_SURFACE_TO_WINDOW: u16 = 0x0015;
-const CMDID_QOE_FRAME_ACKNOWLEDGE: u16 = 0x0016;
-const CMDID_MAP_SURFACE_TO_SCALED_OUTPUT: u16 = 0x0017;
-const CMDID_MAP_SURFACE_TO_SCALED_WINDOW: u16 = 0x0018;
+const CMDID_MAP_SURFACE_TO_SCALED_OUTPUT: u16 = 0x0015;
+const CMDID_MAP_SURFACE_TO_SCALED_WINDOW: u16 = 0x0016;
+const CMDID_MAP_SURFACE_TO_SCALED_OUTPUT_V2: u16 = 0x0017;
+const CMDID_MAP_SURFACE_TO_WINDOW: u16 = 0x0018;
 
 // ── Codec IDs ─────────────────────────────────────────────────────────────────
 const CODEC_UNCOMPRESSED: u16 = 0x0000;
@@ -79,6 +79,7 @@ pub struct RdpgfxHandler {
     cache: HashMap<u16, CacheEntry>,
     zgfx: ZgfxContext,
     frames_decoded: u32,
+    last_reset_size: Option<(u16, u16)>,
     /// Set when the H264 decoder is waiting for a keyframe (IDR) after failures.
     /// Signals to the caller that a force-refresh (suppress→allow) should be sent.
     needs_force_refresh: bool,
@@ -103,6 +104,7 @@ impl RdpgfxHandler {
             cache: HashMap::new(),
             zgfx: ZgfxContext::new(),
             frames_decoded: 0,
+            last_reset_size: None,
             needs_force_refresh: false,
             #[cfg(feature = "h264")]
             h264_dec,
@@ -113,16 +115,18 @@ impl RdpgfxHandler {
     /// Returns (decoded bitmaps, outgoing PDUs to send back via DVC, needs_force_refresh).
     /// `needs_force_refresh` is true when the H264 decoder is waiting for an IDR keyframe;
     /// the caller should send a SuppressOutput (suppress→allow) PDU to request one.
-    pub fn process(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>, bool) {
+    pub fn process(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>, bool, Option<(u16, u16)>) {
         // ZGFX decompress
         let decompressed = self.zgfx.decompress(data);
         if decompressed.is_empty() {
-            return (vec![], vec![], false);
+            return (vec![], vec![], false, None);
         }
+        self.last_reset_size = None;
         let (bitmaps, responses) = self.dispatch_pdus(&decompressed);
         let force_refresh = self.needs_force_refresh;
         self.needs_force_refresh = false;
-        (bitmaps, responses, force_refresh)
+        let reset_size = self.last_reset_size.take();
+        (bitmaps, responses, force_refresh, reset_size)
     }
 
     /// Called when the DVC channel was just created.
@@ -167,6 +171,8 @@ impl RdpgfxHandler {
         outgoing: &mut Vec<Vec<u8>>,
     ) {
         log::info!("[rdpgfx] cmd 0x{:04X} len={}", cmd_id, data.len());
+        #[cfg(debug_assertions)]
+        eprintln!("[rdpgfx] cmd=0x{:04X} len={}", cmd_id, data.len());
         match cmd_id {
             CMDID_CAPS_CONFIRM => {
                 self.on_caps_confirm(data);
@@ -184,21 +190,11 @@ impl RdpgfxHandler {
             CMDID_MAP_SURFACE_TO_OUTPUT => {
                 self.on_map_surface_to_output(data);
             }
-            CMDID_MAP_SURFACE_TO_SCALED_OUTPUT => {
+            CMDID_MAP_SURFACE_TO_SCALED_OUTPUT | CMDID_MAP_SURFACE_TO_SCALED_OUTPUT_V2 => {
                 self.on_map_surface_to_scaled_output(data);
             }
-            CMDID_MAP_SURFACE_TO_WINDOW => {
-                if data.len() >= 20 && data[2] == 0 && data[3] == 0 {
-                    self.on_map_surface_to_scaled_output(data);
-                } else {
-                    self.on_map_surface_to_window(data);
-                }
-            }
-            CMDID_MAP_SURFACE_TO_SCALED_WINDOW => {
+            CMDID_MAP_SURFACE_TO_WINDOW | CMDID_MAP_SURFACE_TO_SCALED_WINDOW => {
                 self.on_map_surface_to_window(data);
-            }
-            CMDID_QOE_FRAME_ACKNOWLEDGE => {
-                log::debug!("[rdpgfx] QOE_FRAME_ACKNOWLEDGE ignored");
             }
             CMDID_START_FRAME => {
                 log::info!("[rdpgfx] START_FRAME");
@@ -316,6 +312,15 @@ impl RdpgfxHandler {
         let ox = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let oy = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
         log::info!("[rdpgfx] MAP_SURFACE_SCALED id={} ox={} oy={}", id, ox, oy);
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[rdpgfx] MAP_SURFACE_SCALED id={} ox={} oy={} target={}x{}",
+            id,
+            ox,
+            oy,
+            u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+            u32::from_le_bytes([data[16], data[17], data[18], data[19]])
+        );
         if let Some(s) = self.surfaces.get_mut(&id) {
             s.output_x = ox;
             s.output_y = oy;
@@ -329,9 +334,8 @@ impl RdpgfxHandler {
         }
         let id = u16::from_le_bytes([data[0], data[1]]);
         log::info!("[rdpgfx] MAP_SURFACE_TO_WINDOW id={} ignored", id);
-        if let Some(s) = self.surfaces.get_mut(&id) {
-            s.mapped = false;
-        }
+        #[cfg(debug_assertions)]
+        eprintln!("[rdpgfx] MAP_SURFACE_TO_WINDOW id={} ignored", id);
     }
 
     fn on_end_frame(&mut self, data: &[u8]) -> Option<Vec<u8>> {
@@ -352,6 +356,11 @@ impl RdpgfxHandler {
         let w = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let h = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         log::info!("[rdpgfx] RESET_GRAPHICS {}x{}", w, h);
+        #[cfg(debug_assertions)]
+        eprintln!("[rdpgfx] RESET_GRAPHICS {}x{}", w, h);
+        if let (Ok(w16), Ok(h16)) = (u16::try_from(w), u16::try_from(h)) {
+            self.last_reset_size = Some((w16, h16));
+        }
         self.surfaces.clear();
         self.frames_decoded = 0;
         #[cfg(feature = "h264")]
@@ -419,16 +428,20 @@ impl RdpgfxHandler {
 
         match codec_id {
             CODEC_UNCOMPRESSED => {
-                if !mapped {
-                    return;
-                }
                 let expected = w as usize * h as usize * 4;
                 if bmp_data.len() < expected {
                     return;
                 }
                 let pixels = bmp_data[..expected].to_vec();
                 self.blit_to_surface(surf_id, dest_left as i32, dest_top as i32, w, h, &pixels);
-                bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                if mapped {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[rdpgfx] emit WTS1 uncompressed surf={} rect=({},{} {}x{}) abs=({},{})",
+                        surf_id, dest_left, dest_top, w, h, abs_x, abs_y
+                    );
+                    bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                }
             }
             CODEC_AVC420 => {
                 if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
@@ -538,16 +551,20 @@ impl RdpgfxHandler {
 
         match codec_id {
             CODEC_UNCOMPRESSED => {
-                if !mapped {
-                    return;
-                }
                 let expected = w as usize * h as usize * 4;
                 if bmp_data.len() < expected {
                     return;
                 }
                 let pixels = bmp_data[..expected].to_vec();
                 self.blit_to_surface(surf_id, 0, 0, w, h, &pixels);
-                bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                if mapped {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[rdpgfx] emit WTS2 uncompressed surf={} rect=(0,0 {}x{}) abs=({},{})",
+                        surf_id, w, h, abs_x, abs_y
+                    );
+                    bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                }
             }
             CODEC_AVC420 => {
                 if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
@@ -899,6 +916,19 @@ fn should_use_avc_regions(regions: &[AvcRect], frame_w: i32, frame_h: i32) -> bo
     sum > 0
 }
 
+fn avc_regions_area(regions: &[AvcRect]) -> i32 {
+    let mut sum = 0i32;
+    for rc in regions {
+        if rc.right <= rc.left || rc.bottom <= rc.top {
+            continue;
+        }
+        let w = (rc.right - rc.left) as i32;
+        let h = (rc.bottom - rc.top) as i32;
+        sum = sum.saturating_add(w.saturating_mul(h));
+    }
+    sum
+}
+
 /// Blit a decoded AVC frame into the surface and emit bitmap updates.
 /// For small AVC dirty regions, only copy those regions. Full-frame blits can
 /// overwrite unchanged desktop areas when the decoder output only contains the
@@ -940,6 +970,22 @@ fn blit_avc_frame(
             }
         }
     }
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[rdpgfx] emit AVC full surf={} surface=({},{} {}x{}) abs=({},{}) frame={}x{} regions={} region_area={} frame_area={}",
+        surf_id,
+        dx,
+        dy,
+        ew,
+        eh,
+        ax,
+        ay,
+        fw,
+        fh,
+        regions.len(),
+        avc_regions_area(regions),
+        ew.saturating_mul(eh)
+    );
     bitmaps.push(make_bitmap(ax, ay, ew, eh, cropped));
 }
 
@@ -1008,6 +1054,17 @@ fn blit_avc_regions(
             }
         }
 
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[rdpgfx] emit AVC region surf={} surface=({},{} {}x{}) abs=({},{})",
+            surf_id,
+            dx + rx,
+            dy + ry,
+            rw,
+            rh,
+            ax + rx,
+            ay + ry
+        );
         bitmaps.push(make_bitmap(ax + rx, ay + ry, rw, rh, region));
     }
 }
@@ -1095,8 +1152,8 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
     );
     match lc {
         0 | 1 => {
-            // lc=0: YUV 4:2:0 only (stream1 = H264 base layer)
-            // lc=1: YUV 4:4:4 only (stream1 = H264 with full chroma)
+            // lc=0: Both streams; stream1 = H264 YUV420 base layer, stream2 = aux chroma
+            // lc=1: Main stream only; stream1 = H264 YUV420
             if cb_stream1 > rest.len() {
                 log::debug!(
                     "[rdpgfx] parse_avc444: cb_stream1={} > rest={} → None",
@@ -1109,24 +1166,13 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
             Some((s, lc))
         }
         2 => {
-            // lc=2: both YUV 4:2:0 base (stream1) + 4:4:4 chroma aux (stream2).
-            // Only stream1 is a standalone H264 stream we can decode.
-            // If stream1 is empty (cb_stream1=0), there is no primary video data
-            // for this frame — skip it without touching the decoder.
-            if cb_stream1 == 0 {
-                log::debug!("[rdpgfx] parse_avc444: lc=2 cb_stream1=0 (chroma-only frame) → skip");
-                return None;
-            }
-            if cb_stream1 > rest.len() {
-                log::debug!(
-                    "[rdpgfx] parse_avc444: cb_stream1={} > rest={} → None",
-                    cb_stream1,
-                    rest.len()
-                );
-                return None;
-            }
-            let s = parse_avc420(&rest[..cb_stream1])?;
-            Some((s, lc))
+            // lc=2: auxiliary only (chroma upgrade for the previously decoded
+            // YUV420 frame).  The stream1 payload is chroma upgrade data, NOT a
+            // standalone YUV420 H.264 bitstream.  Feeding it to the H.264 decoder
+            // would corrupt the decoder's reference-frame state.
+            // Skip entirely — same behaviour as grdp v0.7.6.
+            log::debug!("[rdpgfx] parse_avc444: lc=2 chroma-upgrade frame → skip");
+            return None;
         }
         _ => {
             log::debug!("[rdpgfx] parse_avc444: unknown lc={} → None", lc);
