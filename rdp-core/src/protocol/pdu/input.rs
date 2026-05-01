@@ -19,25 +19,27 @@ pub const PTRFLAGS_WHEEL_NEGATIVE: u16 = 0x0100;
 
 pub fn build_keyboard_event(flags: u16, scancode: u8) -> Vec<u8> {
     let mut buf = Vec::new();
-    write_u16_le(&mut buf, 0);
+    write_u32_le(&mut buf, 0); // eventTime (4 bytes, ignored by server)
     write_u16_le(&mut buf, INPUT_EVENT_SCANCODE);
     write_u16_le(&mut buf, flags);
     write_u16_le(&mut buf, scancode as u16);
+    write_u16_le(&mut buf, 0); // pad2Octets
     buf
 }
 
 pub fn build_unicode_keyboard_event(flags: u16, code_point: u16) -> Vec<u8> {
     let mut buf = Vec::new();
-    write_u16_le(&mut buf, 0);
+    write_u32_le(&mut buf, 0); // eventTime (4 bytes, ignored by server)
     write_u16_le(&mut buf, INPUT_EVENT_UNICODE);
     write_u16_le(&mut buf, flags);
     write_u16_le(&mut buf, code_point);
+    write_u16_le(&mut buf, 0); // pad2Octets
     buf
 }
 
 pub fn build_mouse_event(flags: u16, x: u16, y: u16) -> Vec<u8> {
     let mut buf = Vec::new();
-    write_u16_le(&mut buf, 0);
+    write_u32_le(&mut buf, 0); // eventTime (4 bytes, ignored by server)
     write_u16_le(&mut buf, INPUT_EVENT_MOUSE);
     write_u16_le(&mut buf, flags);
     write_u16_le(&mut buf, x);
@@ -47,9 +49,10 @@ pub fn build_mouse_event(flags: u16, x: u16, y: u16) -> Vec<u8> {
 
 pub fn build_sync_event(flags: u32) -> Vec<u8> {
     let mut buf = Vec::new();
-    write_u16_le(&mut buf, 0);
+    write_u32_le(&mut buf, 0); // eventTime (4 bytes, ignored by server)
     write_u16_le(&mut buf, INPUT_EVENT_SYNC);
-    write_u32_le(&mut buf, flags);
+    write_u16_le(&mut buf, 0); // pad2Octets
+    write_u32_le(&mut buf, flags); // toggleFlags
     buf
 }
 
