@@ -820,17 +820,15 @@ impl RdpgfxHandler {
 
     fn decode_avc444(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>)> {
         let (stream, lc) = parse_avc444(data)?;
-        log::info!(
-            "[rdpgfx] AVC444 lc={} h264_data_len={}",
+        eprintln!(
+            "[rdpgfx] decode_avc444: lc={} h264_len={}",
             lc,
             stream.h264_data.len()
         );
         let regions = stream.regions;
         let result = self.decode_h264(&stream.h264_data);
-        if let Some((_pixels, w, h)) = result.as_ref() {
-            log::info!("[rdpgfx] AVC444 decoded {}x{}", w, h);
-        } else {
-            log::info!("[rdpgfx] AVC444 decode_h264 returned None");
+        if result.is_none() {
+            eprintln!("[rdpgfx] decode_avc444: decode_h264 returned None (h264_len={})", stream.h264_data.len());
         }
         result.map(|(pixels, w, h)| (pixels, w, h, regions))
     }
@@ -1137,32 +1135,38 @@ fn parse_avc420(data: &[u8]) -> Option<Avc420Stream> {
 
 fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
     if data.len() < 4 {
+        eprintln!("[rdpgfx] parse_avc444: data too short ({})", data.len());
         return None;
     }
     let cb_field = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
     let lc = ((cb_field >> 30) & 0x03) as u8;
     let cb_stream1 = (cb_field & 0x3FFF_FFFF) as usize;
     let rest = &data[4..];
-    log::debug!(
+    eprintln!(
         "[rdpgfx] parse_avc444: data={} lc={} cb_stream1={} rest={}",
-        data.len(),
-        lc,
-        cb_stream1,
-        rest.len()
+        data.len(), lc, cb_stream1, rest.len()
     );
     match lc {
-        0 | 1 => {
-            // lc=0: Both streams; stream1 = H264 YUV420 base layer, stream2 = aux chroma
-            // lc=1: Main stream only; stream1 = H264 YUV420
+        0 => {
+            // lc=0: Both streams present; stream1 = H264 YUV420 base layer, stream2 = aux chroma.
             if cb_stream1 > rest.len() {
-                log::debug!(
-                    "[rdpgfx] parse_avc444: cb_stream1={} > rest={} → None",
-                    cb_stream1,
-                    rest.len()
+                eprintln!(
+                    "[rdpgfx] parse_avc444: lc=0 cb_stream1={} > rest={} → None",
+                    cb_stream1, rest.len()
                 );
                 return None;
             }
             let s = parse_avc420(&rest[..cb_stream1])?;
+            Some((s, lc))
+        }
+        1 => {
+            // lc=1: Main stream only.  cb_stream1==0 means "all of rest" (grdp behaviour).
+            let stream_data = if cb_stream1 == 0 || cb_stream1 > rest.len() {
+                rest
+            } else {
+                &rest[..cb_stream1]
+            };
+            let s = parse_avc420(stream_data)?;
             Some((s, lc))
         }
         2 => {
@@ -1171,11 +1175,10 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
             // standalone YUV420 H.264 bitstream.  Feeding it to the H.264 decoder
             // would corrupt the decoder's reference-frame state.
             // Skip entirely — same behaviour as grdp v0.7.6.
-            log::debug!("[rdpgfx] parse_avc444: lc=2 chroma-upgrade frame → skip");
-            return None;
+            None
         }
         _ => {
-            log::debug!("[rdpgfx] parse_avc444: unknown lc={} → None", lc);
+            eprintln!("[rdpgfx] parse_avc444: unknown lc={} → None", lc);
             None
         }
     }
