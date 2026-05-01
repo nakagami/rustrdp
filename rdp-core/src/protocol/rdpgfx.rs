@@ -166,7 +166,7 @@ impl RdpgfxHandler {
         bitmaps: &mut Vec<Bitmap>,
         outgoing: &mut Vec<Vec<u8>>,
     ) {
-        log::debug!("[rdpgfx] cmd 0x{:04X} len={}", cmd_id, data.len());
+        log::info!("[rdpgfx] cmd 0x{:04X} len={}", cmd_id, data.len());
         match cmd_id {
             CMDID_CAPS_CONFIRM => {
                 self.on_caps_confirm(data);
@@ -185,16 +185,24 @@ impl RdpgfxHandler {
                 self.on_map_surface_to_output(data);
             }
             CMDID_MAP_SURFACE_SCALED |
-            CMDID_MAP_SURFACE_SCALED_W |
             CMDID_MAP_SURFACE_SCALED_V2 => {
                 self.on_map_surface_to_scaled_output(data);
             }
+            CMDID_MAP_SURFACE_SCALED_W => {
+                // MAP_SURFACE_TO_SCALED_WINDOW (0x0016): per-window RemoteApp mapping.
+                // PDU layout differs (has 8-byte windowId instead of 4-byte x/y),
+                // and we don't support per-window surfaces — ignore like grdp does.
+                if data.len() >= 2 {
+                    let id = u16::from_le_bytes([data[0], data[1]]);
+                    log::info!("[rdpgfx] MAP_SURFACE_TO_SCALED_WINDOW id={} ignored", id);
+                }
+            }
             CMDID_START_FRAME => {
-                log::debug!("[rdpgfx] START_FRAME");
+                log::info!("[rdpgfx] START_FRAME");
             }
             CMDID_END_FRAME => {
-                log::debug!("[rdpgfx] END_FRAME");
                 if let Some(ack) = self.on_end_frame(data) {
+                    log::info!("[rdpgfx] END_FRAME → ack sent");
                     outgoing.push(ack);
                 }
             }
@@ -266,6 +274,7 @@ impl RdpgfxHandler {
     fn on_delete_surface(&mut self, data: &[u8]) {
         if data.len() < 2 { return; }
         let id = u16::from_le_bytes([data[0], data[1]]);
+        log::info!("[rdpgfx] DELETE_SURFACE id={}", id);
         self.surfaces.remove(&id);
     }
 
@@ -288,6 +297,7 @@ impl RdpgfxHandler {
         let id = u16::from_le_bytes([data[0], data[1]]);
         let ox = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let oy = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        log::info!("[rdpgfx] MAP_SURFACE_SCALED id={} ox={} oy={}", id, ox, oy);
         if let Some(s) = self.surfaces.get_mut(&id) {
             s.output_x = ox;
             s.output_y = oy;
@@ -339,7 +349,7 @@ impl RdpgfxHandler {
         let h = dest_bottom.saturating_sub(dest_top) as i32;
         if w <= 0 || h <= 0 { return; }
 
-        log::debug!("[rdpgfx] WTS1: surf={} codec=0x{:04X} {}x{} at ({},{}) data_len={}",
+        log::info!("[rdpgfx] WTS1: surf={} codec=0x{:04X} {}x{} at ({},{}) data_len={}",
             surf_id, codec_id, w, h, dest_left, dest_top, bmp_len);
 
         let (mapped, output_x, output_y) = match self.surfaces.get(&surf_id) {
@@ -352,6 +362,7 @@ impl RdpgfxHandler {
 
         let abs_x = output_x as i32 + dest_left as i32;
         let abs_y = output_y as i32 + dest_top as i32;
+        log::info!("[rdpgfx] WTS1: surf={} mapped={} abs=({},{})", surf_id, mapped, abs_x, abs_y);
 
         match codec_id {
             CODEC_UNCOMPRESSED => {
@@ -416,12 +427,11 @@ impl RdpgfxHandler {
 
         let w = sw;
         let h = sh;
-
-        log::debug!("[rdpgfx] WTS2: surf={} codec=0x{:04X} {}x{} data_len={} mapped={}",
-            surf_id, codec_id, w, h, bmp_len, mapped);
-
         let abs_x = output_x as i32;
         let abs_y = output_y as i32;
+
+        log::info!("[rdpgfx] WTS2: surf={} codec=0x{:04X} {}x{} data_len={} mapped={} abs=({},{})",
+            surf_id, codec_id, w, h, bmp_len, mapped, abs_x, abs_y);
 
         match codec_id {
             CODEC_UNCOMPRESSED => {
@@ -496,6 +506,8 @@ impl RdpgfxHandler {
                 if s.mapped {
                     let ax = s.output_x as i32 + left;
                     let ay = s.output_y as i32 + top;
+                    log::info!("[rdpgfx] SOLID_FILL surf={} abs=({},{}) {}x{} rgb=({},{},{})",
+                        surf_id, ax, ay, w, h, r, g, b);
                     bitmaps.push(make_bitmap(ax, ay, w, h, fill_data));
                 }
             }
@@ -567,10 +579,15 @@ impl RdpgfxHandler {
 
     fn decode_avc444(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>)> {
         let (stream, lc) = parse_avc444(data)?;
-        log::debug!("[rdpgfx] AVC444 lc={} h264_data_len={}", lc, stream.h264_data.len());
+        log::info!("[rdpgfx] AVC444 lc={} h264_data_len={}", lc, stream.h264_data.len());
         let regions = stream.regions;
-        self.decode_h264(&stream.h264_data)
-            .map(|(pixels, w, h)| (pixels, w, h, regions))
+        let result = self.decode_h264(&stream.h264_data);
+        if let Some((ref pixels, w, h)) = result {
+            log::info!("[rdpgfx] AVC444 decoded {}x{}", w, h);
+        } else {
+            log::info!("[rdpgfx] AVC444 decode_h264 returned None");
+        }
+        result.map(|(pixels, w, h)| (pixels, w, h, regions))
     }
 
     #[allow(unused_variables)]
@@ -588,10 +605,10 @@ impl RdpgfxHandler {
                         self.consecutive_h264_none = 0;
                     } else {
                         // Case 2: no output yet — normal for B-frame / GOP start delay.
-                        // Count anyway; only act after a very large number to catch
+                        // Count anyway; only act after several consecutive nones to catch
                         // genuine silent-discard after a stream discontinuity.
                         self.consecutive_h264_none += 1;
-                        if self.consecutive_h264_none >= 20 {
+                        if self.consecutive_h264_none >= 5 {
                             log::warn!("[rdpgfx] H264 stall ({} consecutive nones) — requesting force refresh",
                                 self.consecutive_h264_none);
                             self.needs_force_refresh = true;
@@ -600,7 +617,7 @@ impl RdpgfxHandler {
                 } else {
                     self.consecutive_h264_none = 0;
                 }
-                log::debug!("[rdpgfx] H264 decode {} bytes → {}",
+                log::info!("[rdpgfx] H264 decode {} bytes → {}",
                     h264_data.len(),
                     if result.is_some() { "frame" } else { "none" });
                 return result;

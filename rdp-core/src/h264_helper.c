@@ -261,7 +261,7 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
          * before producing output.  Only flush after a very large number of
          * consecutive stalls, which indicates a genuine stream discontinuity. */
         d->stall_count++;
-        if (d->stall_count >= 30) {
+        if (d->stall_count >= 10) {
             avcodec_flush_buffers(d->ctx);
             d->needs_keyframe = 1;
             d->stall_count = 0;

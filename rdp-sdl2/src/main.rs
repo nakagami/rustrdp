@@ -100,14 +100,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         log::error!("Failed to send mouse move: {}", e);
                     }
                 }
-                Event::MouseButtonDown { mouse_btn, .. } => {
+                Event::MouseButtonDown { mouse_btn, x, y, .. } => {
+                    mouse_x = x as u16;
+                    mouse_y = y as u16;
                     if let Some((btn, _)) = input_handler.handle_mouse_button(mouse_btn, true) {
                         if let Err(e) = rdp_session.send_mouse_button(btn, true, mouse_x, mouse_y).await {
                             log::error!("Failed to send mouse button down: {}", e);
                         }
                     }
                 }
-                Event::MouseButtonUp { mouse_btn, .. } => {
+                Event::MouseButtonUp { mouse_btn, x, y, .. } => {
+                    mouse_x = x as u16;
+                    mouse_y = y as u16;
                     if let Some((btn, _)) = input_handler.handle_mouse_button(mouse_btn, false) {
                         if let Err(e) = rdp_session.send_mouse_button(btn, false, mouse_x, mouse_y).await {
                             log::error!("Failed to send mouse button up: {}", e);

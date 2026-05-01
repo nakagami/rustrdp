@@ -547,12 +547,12 @@ impl<T: Transport> RdpSession<T> {
         }
 
         // Request a fresh IDR keyframe if the H264 decoder has lost sync.
-        // Rate-limited to once every 2 seconds to avoid flooding the server.
+        // Rate-limited to once every 500 ms to avoid flooding the server.
         if needs_force_refresh {
             let now = std::time::Instant::now();
             let should_send = match self.last_force_refresh {
                 None => true,
-                Some(t) => now.duration_since(t).as_secs() >= 2,
+                Some(t) => now.duration_since(t).as_millis() >= 500,
             };
             if should_send {
                 log::debug!("[client] sending force refresh (suppress→allow) to request IDR");
