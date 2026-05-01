@@ -12,9 +12,7 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+    env_logger::init();
 
     // Load configuration from environment
     let config = RdpConfig::from_env().map_err(|e| {
@@ -58,8 +56,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut running = true;
     let mut mouse_x: u16 = 0;
     let mut mouse_y: u16 = 0;
-    // Audio queue — opened lazily on first audio event
-    let mut audio_queue: Option<AudioQueue<u8>> = None;
+    // Audio queue — opened lazily on first audio event (16-bit signed PCM)
+    let mut audio_queue: Option<AudioQueue<i16>> = None;
     let mut audio_fmt: Option<AudioFormat> = None;
 
     log::info!("RDP client ready");
@@ -153,7 +151,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             channels: Some(format.channels as u8),
                             samples: None,
                         };
-                        match audio_subsystem.open_queue::<u8, _>(None, &desired) {
+                        match audio_subsystem.open_queue::<i16, _>(None, &desired) {
                             Ok(q) => {
                                 q.resume();
                                 log::info!(
@@ -161,7 +159,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     format.sample_rate, format.channels, format.bits_per_sample
                                 );
                                 audio_queue = Some(q);
-                                audio_fmt = Some(format);
+                                audio_fmt = Some(format.clone());
                             }
                             Err(e) => {
                                 log::error!("[audio] failed to open audio queue: {}", e);
@@ -169,7 +167,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     if let Some(q) = &audio_queue {
-                        if let Err(e) = q.queue_audio(&data) {
+                        // Convert raw bytes to signed 16-bit samples (little-endian PCM)
+                        let samples: Vec<i16> = data.chunks_exact(2)
+                            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                            .collect();
+                        if let Err(e) = q.queue_audio(&samples) {
                             log::warn!("[audio] queue_audio error: {}", e);
                         }
                     }
