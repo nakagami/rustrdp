@@ -5,6 +5,7 @@ pub mod nla;
 pub mod sec;
 pub mod lic;
 pub mod pdu;
+pub mod rdpsnd;
 
 use crate::error::RdpError;
 use async_trait::async_trait;

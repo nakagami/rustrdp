@@ -3,6 +3,8 @@ use rdp_sdl2::connection::RdpConnection;
 use rdp_sdl2::input::InputHandler;
 use rdp_sdl2::ui::RdpUI;
 use rdp_core::client::RdpEvent;
+use rdp_core::protocol::rdpsnd::AudioFormat;
+use sdl2::audio::{AudioQueue, AudioSpecDesired};
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use std::error::Error;
@@ -40,6 +42,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Initialize SDL2
     let sdl_context = sdl2::init()?;
+    let audio_subsystem = sdl_context.audio()?;
     let mut rdp_ui = RdpUI::new(
         &sdl_context,
         config.width,
@@ -55,6 +58,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut running = true;
     let mut mouse_x: u16 = 0;
     let mut mouse_y: u16 = 0;
+    // Audio queue — opened lazily on first audio event
+    let mut audio_queue: Option<AudioQueue<u8>> = None;
+    let mut audio_fmt: Option<AudioFormat> = None;
 
     log::info!("RDP client ready");
 
@@ -133,6 +139,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Ok(RdpEvent::Deactivated) => {
                     log::info!("RDP session deactivated");
                     running = false;
+                }
+                Ok(RdpEvent::Audio { format, data }) => {
+                    // (Re-)open the audio queue when the format changes
+                    let needs_open = audio_fmt.as_ref().map_or(true, |f| {
+                        f.channels != format.channels
+                            || f.sample_rate != format.sample_rate
+                            || f.bits_per_sample != format.bits_per_sample
+                    });
+                    if needs_open {
+                        let desired = AudioSpecDesired {
+                            freq: Some(format.sample_rate as i32),
+                            channels: Some(format.channels as u8),
+                            samples: None,
+                        };
+                        match audio_subsystem.open_queue::<u8, _>(None, &desired) {
+                            Ok(q) => {
+                                q.resume();
+                                log::info!(
+                                    "[audio] opened queue: {}Hz {}ch {}bit",
+                                    format.sample_rate, format.channels, format.bits_per_sample
+                                );
+                                audio_queue = Some(q);
+                                audio_fmt = Some(format);
+                            }
+                            Err(e) => {
+                                log::error!("[audio] failed to open audio queue: {}", e);
+                            }
+                        }
+                    }
+                    if let Some(q) = &audio_queue {
+                        if let Err(e) = q.queue_audio(&data) {
+                            log::warn!("[audio] queue_audio error: {}", e);
+                        }
+                    }
                 }
                 Err(e) => {
                     log::error!("RDP error: {}", e);
