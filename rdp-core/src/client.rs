@@ -25,6 +25,7 @@ use crate::core::io::*;
 use crate::core::rle;
 use crate::protocol::nla::ntlm::to_utf16_le;
 use crate::protocol::rdpsnd::{RdpsndHandler, AudioFormat};
+use crate::protocol::drdynvc::DrdynvcHandler;
 
 const BITMAP_COMPRESSION: u16 = 0x0001;
 const NO_BITMAP_COMPRESSION_HDR: u16 = 0x0400;
@@ -54,6 +55,14 @@ pub struct RdpSession<T: Transport> {
     rdpsnd_frag: Vec<u8>,
     /// Total byte length of the current rdpsnd fragment chain
     rdpsnd_frag_total: usize,
+    /// Channel ID assigned to the "drdynvc" static virtual channel
+    drdynvc_channel: Option<u16>,
+    /// DRDYNVC protocol handler
+    drdynvc_handler: DrdynvcHandler,
+    /// Fragment reassembly buffer for drdynvc channel PDUs
+    drdynvc_frag: Vec<u8>,
+    /// Total byte length of the current drdynvc fragment chain
+    drdynvc_frag_total: usize,
 }
 
 impl<T: Transport> RdpSession<T> {
@@ -173,10 +182,12 @@ impl<T: Transport> RdpSession<T> {
         }
 
         // Determine the rdpsnd channel ID.
-        // ClientData::default() lists channels as [rdpdr, rdpsnd, cliprdr], so rdpsnd
-        // is at index 1 in the server's channel ID array.
+        // ClientData::default() lists channels as [rdpdr, rdpsnd, drdynvc, cliprdr], so rdpsnd
+        // is at index 1 and drdynvc is at index 2 in the server's channel ID array.
         let rdpsnd_channel = server_data.channels.get(1).copied();
         log::debug!("[client] rdpsnd_channel={:?}", rdpsnd_channel);
+        let drdynvc_channel = server_data.channels.get(2).copied();
+        log::debug!("[client] drdynvc_channel={:?}", drdynvc_channel);
 
         let mut session = RdpSession {
             mcs,
@@ -191,6 +202,10 @@ impl<T: Transport> RdpSession<T> {
             rdpsnd_handler: RdpsndHandler::new(),
             rdpsnd_frag: Vec::new(),
             rdpsnd_frag_total: 0,
+            drdynvc_channel,
+            drdynvc_handler: DrdynvcHandler::new(),
+            drdynvc_frag: Vec::new(),
+            drdynvc_frag_total: 0,
         };
 
         // Steps 10-12: Confirm Active, sync sequence, wait for FontMap
@@ -330,6 +345,15 @@ impl<T: Transport> RdpSession<T> {
                 continue;
             }
 
+            // Dispatch drdynvc static virtual channel data
+            if Some(ch) == self.drdynvc_channel {
+                let bitmaps = self.handle_drdynvc_data(&data).await;
+                if !bitmaps.is_empty() {
+                    return Ok(RdpEvent::Bitmap(bitmaps));
+                }
+                continue;
+            }
+
             log::debug!("[recv_event] ch={} data_len={}", ch, data.len());
 
             let mut pos = 0;
@@ -443,6 +467,51 @@ impl<T: Transport> RdpSession<T> {
         }
 
         event
+    }
+
+    /// Handle data arriving on the drdynvc virtual channel.
+    /// Reassembles fragmented channel PDUs then passes the complete payload
+    /// to the DrdynvcHandler, returns any decoded bitmaps.
+    async fn handle_drdynvc_data(&mut self, data: &[u8]) -> Vec<Bitmap> {
+        const CHANNEL_FLAG_FIRST: u32 = 0x01;
+        const CHANNEL_FLAG_LAST:  u32 = 0x02;
+
+        if data.len() < 8 {
+            log::warn!("[drdynvc] channel data too short: {} bytes", data.len());
+            return vec![];
+        }
+        let total_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let flags     = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let payload   = &data[8..];
+
+        if flags & CHANNEL_FLAG_FIRST != 0 {
+            self.drdynvc_frag.clear();
+            self.drdynvc_frag_total = total_len;
+        }
+        self.drdynvc_frag.extend_from_slice(payload);
+
+        if flags & CHANNEL_FLAG_LAST == 0 {
+            return vec![];
+        }
+
+        let assembled = std::mem::take(&mut self.drdynvc_frag);
+        let (bitmaps, responses) = self.drdynvc_handler.process(&assembled);
+
+        // Send any outgoing DRDYNVC PDUs (CAPS response, FRAME_ACK, etc.)
+        for resp in responses {
+            let mut vchan_pdu = Vec::with_capacity(8 + resp.len());
+            vchan_pdu.extend_from_slice(&(resp.len() as u32).to_le_bytes());
+            let send_flags: u32 = CHANNEL_FLAG_FIRST | CHANNEL_FLAG_LAST;
+            vchan_pdu.extend_from_slice(&send_flags.to_le_bytes());
+            vchan_pdu.extend_from_slice(&resp);
+            if let Some(ch) = self.drdynvc_channel {
+                if let Err(e) = self.mcs.send_data(ch, &vchan_pdu).await {
+                    log::warn!("[drdynvc] failed to send response: {:?}", e);
+                }
+            }
+        }
+
+        bitmaps
     }
 
     pub async fn send_key_down(&mut self, flags: u16, scancode: u8) -> Result<(), RdpError> {

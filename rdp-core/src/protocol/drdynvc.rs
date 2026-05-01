@@ -1,0 +1,280 @@
+/// DRDYNVC (MS-RDPEDYC) dynamic virtual channel handler.
+///
+/// Receives raw PDU bytes from the static "drdynvc" channel,
+/// multiplexes dynamic channels, routes RDPGFX messages, and
+/// returns decoded bitmaps plus outgoing PDUs to send back.
+
+use std::collections::HashMap;
+use crate::bitmap::Bitmap;
+use crate::protocol::rdpgfx::RdpgfxHandler;
+
+// ── DYNVC message commands ────────────────────────────────────────────────────
+const CMD_CREATE_REQ:        u8 = 0x01;
+const CMD_DATA_FIRST:        u8 = 0x02;
+const CMD_DATA:              u8 = 0x03;
+const CMD_CLOSE:             u8 = 0x04;
+const CMD_CAPABILITIES:      u8 = 0x05;
+const CMD_SOFT_SYNC_REQUEST: u8 = 0x08;
+
+const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
+
+/// In-progress reassembly for a fragmented DVC message.
+struct Fragment {
+    buf:      Vec<u8>,
+    expected: usize,
+}
+
+enum DvcChannel {
+    Gfx(RdpgfxHandler),
+    Unknown,
+}
+
+pub struct DrdynvcHandler {
+    channels:   HashMap<u32, DvcChannel>,
+    fragments:  HashMap<u32, Fragment>,
+    server_version: u16,
+}
+
+impl DrdynvcHandler {
+    pub fn new() -> Self {
+        DrdynvcHandler {
+            channels:  HashMap::new(),
+            fragments: HashMap::new(),
+            server_version: 1,
+        }
+    }
+
+    /// Process one DVC PDU.
+    /// Returns (bitmaps produced, raw DRDYNVC PDUs to send back to server).
+    pub fn process(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>) {
+        if data.is_empty() {
+            return (vec![], vec![]);
+        }
+        let header   = data[0];
+        let cmd      = (header >> 4) & 0x0F;
+        let sp       = (header >> 2) & 0x03;
+        let cb_ch_id = header & 0x03;
+
+        let mut bitmaps  = Vec::new();
+        let mut outgoing = Vec::new();
+
+        match cmd {
+            CMD_CAPABILITIES => {
+                self.handle_capabilities(data, &mut outgoing);
+            }
+            CMD_CREATE_REQ => {
+                self.handle_create(data, cb_ch_id, &mut outgoing);
+            }
+            CMD_DATA_FIRST => {
+                self.handle_data_first(data, cb_ch_id, sp, &mut bitmaps, &mut outgoing);
+            }
+            CMD_DATA => {
+                self.handle_data(data, cb_ch_id, &mut bitmaps, &mut outgoing);
+            }
+            CMD_CLOSE => {
+                let ch_id = read_ch_id(data, 1, cb_ch_id);
+                self.channels.remove(&ch_id);
+                self.fragments.remove(&ch_id);
+                log::debug!("[drdynvc] CLOSE ch={}", ch_id);
+            }
+            CMD_SOFT_SYNC_REQUEST => {
+                outgoing.push(build_soft_sync_response());
+            }
+            _ => {
+                log::debug!("[drdynvc] unhandled cmd={}", cmd);
+            }
+        }
+
+        (bitmaps, outgoing)
+    }
+
+    // ── CAPABILITIES ──────────────────────────────────────────────────────────
+
+    fn handle_capabilities(&mut self, data: &[u8], out: &mut Vec<Vec<u8>>) {
+        // Header(1) + Pad(1) + Version(2)
+        if data.len() < 4 { return; }
+        self.server_version = u16::from_le_bytes([data[2], data[3]]);
+        log::debug!("[drdynvc] CAPABILITIES server_version={}", self.server_version);
+        let version = self.server_version.min(3);
+        let mut pdu = vec![
+            0x50u8,       // Cmd=5 (CAPABILITIES) | Sp=0 | CbChId=0
+            0x00,         // pad
+            (version & 0xFF) as u8,
+            ((version >> 8) & 0xFF) as u8,
+        ];
+        // Add padding to match standard 4-byte body
+        drop(pdu.drain(..)); // clear and rebuild to be explicit
+        pdu.push(0x50);
+        pdu.push(0x00);
+        pdu.extend_from_slice(&version.to_le_bytes());
+        out.push(pdu);
+    }
+
+    // ── CREATE_REQ ────────────────────────────────────────────────────────────
+
+    fn handle_create(&mut self, data: &[u8], cb_ch_id: u8, out: &mut Vec<Vec<u8>>) {
+        let id_bytes = ch_id_len(cb_ch_id);
+        if data.len() < 1 + id_bytes { return; }
+        let ch_id = read_ch_id(data, 1, cb_ch_id);
+
+        // Channel name is null-terminated UTF-8 after the channel ID
+        let name_start = 1 + id_bytes;
+        let name = read_cstring(&data[name_start..]);
+        log::debug!("[drdynvc] CREATE_REQ ch={} name={}", ch_id, name);
+
+        if name == GFX_CHANNEL_NAME {
+            let mut gfx = RdpgfxHandler::new();
+            // Build CAPS_ADVERTISE and wrap it in a DATA PDU
+            let caps_pdus = gfx.on_channel_created();
+            self.channels.insert(ch_id, DvcChannel::Gfx(gfx));
+            for pdu in caps_pdus {
+                out.push(wrap_data_pdu(ch_id, cb_ch_id, &pdu));
+            }
+        } else {
+            self.channels.insert(ch_id, DvcChannel::Unknown);
+        }
+    }
+
+    // ── DATA_FIRST ────────────────────────────────────────────────────────────
+
+    fn handle_data_first(
+        &mut self, data: &[u8], cb_ch_id: u8, sp: u8,
+        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>,
+    ) {
+        let id_bytes  = ch_id_len(cb_ch_id);
+        let len_bytes = len_field_len(sp);
+        let header_sz = 1 + id_bytes + len_bytes;
+        if data.len() < header_sz { return; }
+
+        let ch_id = read_ch_id(data, 1, cb_ch_id);
+        let total = read_len(&data[1 + id_bytes..], sp) as usize;
+        let payload = &data[header_sz..];
+
+        if total == payload.len() {
+            // Single-packet message (total matches first chunk)
+            self.dispatch_channel_data(ch_id, payload, bitmaps, out);
+        } else {
+            let mut frag = Fragment { buf: Vec::with_capacity(total), expected: total };
+            frag.buf.extend_from_slice(payload);
+            self.fragments.insert(ch_id, frag);
+        }
+    }
+
+    // ── DATA ──────────────────────────────────────────────────────────────────
+
+    fn handle_data(
+        &mut self, data: &[u8], cb_ch_id: u8,
+        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>,
+    ) {
+        let id_bytes = ch_id_len(cb_ch_id);
+        if data.len() < 1 + id_bytes { return; }
+        let ch_id  = read_ch_id(data, 1, cb_ch_id);
+        let payload = &data[1 + id_bytes..];
+
+        // Reassemble or dispatch directly
+        let complete = if let Some(frag) = self.fragments.get_mut(&ch_id) {
+            frag.buf.extend_from_slice(payload);
+            frag.buf.len() >= frag.expected
+        } else {
+            // No fragment in progress → single-shot data
+            self.dispatch_channel_data(ch_id, payload, bitmaps, out);
+            return;
+        };
+
+        if complete {
+            let buf = self.fragments.remove(&ch_id).unwrap().buf;
+            self.dispatch_channel_data(ch_id, &buf, bitmaps, out);
+        }
+    }
+
+    // ── Channel dispatch ──────────────────────────────────────────────────────
+
+    fn dispatch_channel_data(
+        &mut self, ch_id: u32, data: &[u8],
+        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>,
+    ) {
+        let cb_ch_id = ch_id_size(ch_id);
+        match self.channels.get_mut(&ch_id) {
+            Some(DvcChannel::Gfx(gfx)) => {
+                let (new_bitmaps, replies) = gfx.process(data);
+                bitmaps.extend(new_bitmaps);
+                for r in replies {
+                    out.push(wrap_data_pdu(ch_id, cb_ch_id, &r));
+                }
+            }
+            Some(DvcChannel::Unknown) | None => {}
+        }
+    }
+}
+
+// ── Encoding helpers ──────────────────────────────────────────────────────────
+
+/// Number of bytes used for the channel ID field.
+fn ch_id_len(cb_ch_id: u8) -> usize {
+    match cb_ch_id { 0 => 1, 1 => 2, _ => 4 }
+}
+
+/// Number of bytes used for the length field (DATA_FIRST only).
+fn len_field_len(sp: u8) -> usize {
+    match sp { 0 => 1, 1 => 2, _ => 4 }
+}
+
+/// Read a channel ID from `data[offset..]` based on `cb_ch_id`.
+fn read_ch_id(data: &[u8], offset: usize, cb_ch_id: u8) -> u32 {
+    let len = ch_id_len(cb_ch_id);
+    if offset + len > data.len() { return 0; }
+    match len {
+        1 => data[offset] as u32,
+        2 => u16::from_le_bytes([data[offset], data[offset + 1]]) as u32,
+        _ => u32::from_le_bytes([
+            data[offset], data[offset + 1],
+            data[offset + 2], data[offset + 3],
+        ]),
+    }
+}
+
+/// Read a length field from `data[0..]` based on `sp`.
+fn read_len(data: &[u8], sp: u8) -> u32 {
+    match sp {
+        0 if !data.is_empty() => data[0] as u32,
+        1 if data.len() >= 2  => u16::from_le_bytes([data[0], data[1]]) as u32,
+        2 if data.len() >= 4  => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        _ => 0,
+    }
+}
+
+/// Read a null-terminated UTF-8 string.
+fn read_cstring(data: &[u8]) -> String {
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    String::from_utf8_lossy(&data[..end]).into_owned()
+}
+
+/// Determine cb_ch_id encoding for a given channel ID.
+fn ch_id_size(ch_id: u32) -> u8 {
+    if ch_id <= 0xFF { 0 } else if ch_id <= 0xFFFF { 1 } else { 2 }
+}
+
+/// Write a channel ID into a buffer, returning the number of bytes written.
+fn write_ch_id(buf: &mut Vec<u8>, ch_id: u32, cb_ch_id: u8) {
+    match ch_id_len(cb_ch_id) {
+        1 => buf.push(ch_id as u8),
+        2 => buf.extend_from_slice(&(ch_id as u16).to_le_bytes()),
+        _ => buf.extend_from_slice(&ch_id.to_le_bytes()),
+    }
+}
+
+/// Wrap an RDPGFX PDU as a DYNVC_DATA PDU.
+fn wrap_data_pdu(ch_id: u32, cb_ch_id: u8, payload: &[u8]) -> Vec<u8> {
+    let mut pdu = Vec::with_capacity(1 + ch_id_len(cb_ch_id) + payload.len());
+    let header = (CMD_DATA << 4) | (cb_ch_id & 0x03);
+    pdu.push(header);
+    write_ch_id(&mut pdu, ch_id, cb_ch_id);
+    pdu.extend_from_slice(payload);
+    pdu
+}
+
+/// Build SOFT_SYNC_RESPONSE PDU.
+fn build_soft_sync_response() -> Vec<u8> {
+    // Cmd=9, Sp=0, CbChId=0
+    vec![0x90, 0x00, 0x00, 0x00, 0x00]
+}

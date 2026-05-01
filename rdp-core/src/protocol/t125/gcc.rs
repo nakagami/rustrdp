@@ -34,6 +34,7 @@ impl Default for ClientData {
             channels: vec![
                 Channel { name: "rdpdr".into(),   options: 0xC0800000 },
                 Channel { name: "rdpsnd".into(),  options: 0xC0000000 },
+                Channel { name: "drdynvc".into(), options: 0xC0800000 },
                 Channel { name: "cliprdr".into(), options: 0xC0800000 },
             ],
             server_selected_protocol: 0,
