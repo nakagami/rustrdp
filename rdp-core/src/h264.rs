@@ -20,6 +20,7 @@ mod ffi {
             height: *mut c_int,
         ) -> *mut c_uchar;
         pub fn rdp_h264_free_buf(buf: *mut c_uchar);
+        pub fn rdp_h264_needs_keyframe(d: *mut RdpH264Dec) -> c_int;
     }
 }
 
@@ -61,6 +62,11 @@ impl H264Decoder {
         let pixels = unsafe { std::slice::from_raw_parts(bgra, size).to_vec() };
         unsafe { ffi::rdp_h264_free_buf(bgra) };
         Some((pixels, w as u32, h as u32))
+    }
+    /// Returns true if the decoder is currently waiting for an IDR keyframe.
+    /// This happens after P-frame decode failures or codec reset.
+    pub fn needs_keyframe(&self) -> bool {
+        unsafe { ffi::rdp_h264_needs_keyframe(self.ptr) != 0 }
     }
 }
 

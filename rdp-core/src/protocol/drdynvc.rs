@@ -49,10 +49,11 @@ impl DrdynvcHandler {
     }
 
     /// Process one DVC PDU.
-    /// Returns (bitmaps produced, raw DRDYNVC PDUs to send back to server, audio events).
-    pub fn process(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>, Vec<AudioEvent>) {
+    /// Returns (bitmaps produced, raw DRDYNVC PDUs to send back to server, audio events, needs_force_refresh).
+    /// `needs_force_refresh` is true when the H264 decoder needs an IDR keyframe.
+    pub fn process(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>, Vec<AudioEvent>, bool) {
         if data.is_empty() {
-            return (vec![], vec![], vec![]);
+            return (vec![], vec![], vec![], false);
         }
         let header   = data[0];
         let cmd      = (header >> 4) & 0x0F;
@@ -62,6 +63,7 @@ impl DrdynvcHandler {
         let mut bitmaps  = Vec::new();
         let mut outgoing = Vec::new();
         let mut audio    = Vec::new();
+        let mut force_refresh = false;
 
         match cmd {
             CMD_CAPABILITIES => {
@@ -71,10 +73,10 @@ impl DrdynvcHandler {
                 self.handle_create(data, cb_ch_id, &mut outgoing);
             }
             CMD_DATA_FIRST => {
-                self.handle_data_first(data, cb_ch_id, sp, &mut bitmaps, &mut outgoing, &mut audio);
+                self.handle_data_first(data, cb_ch_id, sp, &mut bitmaps, &mut outgoing, &mut audio, &mut force_refresh);
             }
             CMD_DATA => {
-                self.handle_data(data, cb_ch_id, &mut bitmaps, &mut outgoing, &mut audio);
+                self.handle_data(data, cb_ch_id, &mut bitmaps, &mut outgoing, &mut audio, &mut force_refresh);
             }
             CMD_CLOSE => {
                 let ch_id = read_ch_id(data, 1, cb_ch_id);
@@ -90,7 +92,7 @@ impl DrdynvcHandler {
             }
         }
 
-        (bitmaps, outgoing, audio)
+        (bitmaps, outgoing, audio, force_refresh)
     }
 
     // ── CAPABILITIES ──────────────────────────────────────────────────────────
@@ -151,6 +153,7 @@ impl DrdynvcHandler {
     fn handle_data_first(
         &mut self, data: &[u8], cb_ch_id: u8, sp: u8,
         bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>, audio: &mut Vec<AudioEvent>,
+        force_refresh: &mut bool,
     ) {
         let id_bytes  = ch_id_len(cb_ch_id);
         let len_bytes = len_field_len(sp);
@@ -163,7 +166,7 @@ impl DrdynvcHandler {
 
         if total == payload.len() {
             // Single-packet message (total matches first chunk)
-            self.dispatch_channel_data(ch_id, payload, bitmaps, out, audio);
+            self.dispatch_channel_data(ch_id, payload, bitmaps, out, audio, force_refresh);
         } else {
             let mut frag = Fragment { buf: Vec::with_capacity(total), expected: total };
             frag.buf.extend_from_slice(payload);
@@ -176,6 +179,7 @@ impl DrdynvcHandler {
     fn handle_data(
         &mut self, data: &[u8], cb_ch_id: u8,
         bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>, audio: &mut Vec<AudioEvent>,
+        force_refresh: &mut bool,
     ) {
         let id_bytes = ch_id_len(cb_ch_id);
         if data.len() < 1 + id_bytes { return; }
@@ -188,13 +192,13 @@ impl DrdynvcHandler {
             frag.buf.len() >= frag.expected
         } else {
             // No fragment in progress → single-shot data
-            self.dispatch_channel_data(ch_id, payload, bitmaps, out, audio);
+            self.dispatch_channel_data(ch_id, payload, bitmaps, out, audio, force_refresh);
             return;
         };
 
         if complete {
             let buf = self.fragments.remove(&ch_id).unwrap().buf;
-            self.dispatch_channel_data(ch_id, &buf, bitmaps, out, audio);
+            self.dispatch_channel_data(ch_id, &buf, bitmaps, out, audio, force_refresh);
         }
     }
 
@@ -203,12 +207,14 @@ impl DrdynvcHandler {
     fn dispatch_channel_data(
         &mut self, ch_id: u32, data: &[u8],
         bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>, audio: &mut Vec<AudioEvent>,
+        force_refresh: &mut bool,
     ) {
         let cb_ch_id = ch_id_size(ch_id);
         match self.channels.get_mut(&ch_id) {
             Some(DvcChannel::Gfx(gfx)) => {
-                let (new_bitmaps, replies) = gfx.process(data);
+                let (new_bitmaps, replies, fr) = gfx.process(data);
                 bitmaps.extend(new_bitmaps);
+                if fr { *force_refresh = true; }
                 for r in replies {
                     out.push(wrap_data_pdu(ch_id, cb_ch_id, &r));
                 }

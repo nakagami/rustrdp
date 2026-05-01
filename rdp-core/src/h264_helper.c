@@ -147,20 +147,36 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     d->pkt->size = len;
 
     int ret = avcodec_send_packet(d->ctx, d->pkt);
+
+    /* AVERROR(EAGAIN): decoder output is full; drain frames until send succeeds. */
+    for (int eagain_retries = 0;
+         ret == AVERROR(EAGAIN) && eagain_retries < 16;
+         eagain_retries++) {
+        int rv = avcodec_receive_frame(d->ctx, d->frame);
+        if (rv == 0) {
+            av_frame_unref(d->frame);
+        } else {
+            break; /* no frame available to drain */
+        }
+        ret = avcodec_send_packet(d->ctx, d->pkt);
+    }
+
     if (ret < 0) {
-        /* Flush stale state then retry if this packet has an IDR — a keyframe
-         * arriving after a resolution change or initial open can fail on the
-         * first attempt because the decoder still holds undrained reference
-         * frames.  After flush the same IDR almost always succeeds. */
+        if (!has_idr(data, len)) {
+            /* P-frame failure: do NOT flush — that would destroy the reference
+             * frame buffer, causing SKIP macroblocks to decode as black.
+             * Just wait for the server to send the next IDR naturally. */
+            d->needs_keyframe = 1;
+            return NULL;
+        }
+        /* IDR failure: flush stale state then retry. An IDR is self-contained
+         * so flushing and re-sending it is always safe. */
         avcodec_flush_buffers(d->ctx);
-        if (has_idr(data, len)) {
-            ret = avcodec_send_packet(d->ctx, d->pkt);
-            if (ret < 0) {
-                /* Flush wasn't enough — a resolution/parameter change in the
-                 * new SPS requires a full codec reset (free + realloc + open). */
-                if (codec_hard_reset(d) >= 0) {
-                    ret = avcodec_send_packet(d->ctx, d->pkt);
-                }
+        ret = avcodec_send_packet(d->ctx, d->pkt);
+        if (ret < 0) {
+            /* Flush wasn't enough — full codec reset for resolution/param change. */
+            if (codec_hard_reset(d) >= 0) {
+                ret = avcodec_send_packet(d->ctx, d->pkt);
             }
         }
         if (ret < 0) {
@@ -214,4 +230,9 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
 
 void rdp_h264_free_buf(uint8_t *buf) {
     free(buf);
+}
+
+/* Returns 1 if the decoder is waiting for an IDR keyframe, 0 otherwise. */
+int rdp_h264_needs_keyframe(RdpH264Dec *d) {
+    return d ? d->needs_keyframe : 1;
 }

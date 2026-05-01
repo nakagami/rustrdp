@@ -65,6 +65,9 @@ pub struct RdpSession<T: Transport> {
     drdynvc_frag_total: usize,
     /// Pending audio events from DVC that haven't been delivered yet
     pending_audio: std::collections::VecDeque<crate::protocol::rdpsnd::AudioEvent>,
+    /// Timestamp of the last force-refresh (suppress→allow) sent to the server.
+    /// Used to rate-limit keyframe requests to at most once every 2 seconds.
+    last_force_refresh: Option<std::time::Instant>,
 }
 
 impl<T: Transport> RdpSession<T> {
@@ -209,6 +212,7 @@ impl<T: Transport> RdpSession<T> {
             drdynvc_frag: Vec::new(),
             drdynvc_frag_total: 0,
             pending_audio: std::collections::VecDeque::new(),
+            last_force_refresh: None,
         };
 
         // Steps 10-12: Confirm Active, sync sequence, wait for FontMap
@@ -317,6 +321,27 @@ impl<T: Transport> RdpSession<T> {
         write_u16_le(&mut body, self.height - 1);
         let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_SUPPRESS_OUTPUT, &body);
         log::debug!("[client] sending SuppressOutput (ALLOW_DISPLAY_UPDATES)");
+        self.mcs.send_data(self.io_channel, &pdu).await
+    }
+
+    /// Send a suppress→allow SuppressOutput PDU pair to request a fresh IDR keyframe.
+    /// The suppress PDU (0x00) has no desktop rectangle (4 bytes total).
+    /// The allow PDU (0x01) includes the full desktop rectangle (12 bytes total).
+    async fn send_force_refresh(&mut self) -> Result<(), RdpError> {
+        // SUPPRESS: AllowDisplayUpdates=0x00 + 3 bytes padding (no rect)
+        let suppress_body = [0x00u8, 0x00, 0x00, 0x00];
+        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_SUPPRESS_OUTPUT, &suppress_body);
+        self.mcs.send_data(self.io_channel, &pdu).await?;
+
+        // ALLOW: AllowDisplayUpdates=0x01 + 3 bytes padding + desktop rect
+        let mut allow_body = Vec::with_capacity(12);
+        allow_body.push(0x01u8); // ALLOW_DISPLAY_UPDATES
+        allow_body.extend_from_slice(&[0u8; 3]);
+        write_u16_le(&mut allow_body, 0);
+        write_u16_le(&mut allow_body, 0);
+        write_u16_le(&mut allow_body, self.width - 1);
+        write_u16_le(&mut allow_body, self.height - 1);
+        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_SUPPRESS_OUTPUT, &allow_body);
         self.mcs.send_data(self.io_channel, &pdu).await
     }
 
@@ -483,8 +508,7 @@ impl<T: Transport> RdpSession<T> {
     /// Handle data arriving on the drdynvc virtual channel.
     /// Reassembles fragmented channel PDUs then passes the complete payload
     /// to the DrdynvcHandler, returns any decoded bitmaps and audio events.
-    async fn handle_drdynvc_data(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<crate::protocol::rdpsnd::AudioEvent>) {
-        const CHANNEL_FLAG_FIRST: u32 = 0x01;
+    async fn handle_drdynvc_data(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<crate::protocol::rdpsnd::AudioEvent>) {        const CHANNEL_FLAG_FIRST: u32 = 0x01;
         const CHANNEL_FLAG_LAST:  u32 = 0x02;
 
         if data.len() < 8 {
@@ -506,7 +530,7 @@ impl<T: Transport> RdpSession<T> {
         }
 
         let assembled = std::mem::take(&mut self.drdynvc_frag);
-        let (bitmaps, responses, audio_events) = self.drdynvc_handler.process(&assembled);
+        let (bitmaps, responses, audio_events, needs_force_refresh) = self.drdynvc_handler.process(&assembled);
 
         // Send any outgoing DRDYNVC PDUs (CAPS response, FRAME_ACK, audio replies, etc.)
         for resp in responses {
@@ -518,6 +542,24 @@ impl<T: Transport> RdpSession<T> {
             if let Some(ch) = self.drdynvc_channel {
                 if let Err(e) = self.mcs.send_data(ch, &vchan_pdu).await {
                     log::warn!("[drdynvc] failed to send response: {:?}", e);
+                }
+            }
+        }
+
+        // Request a fresh IDR keyframe if the H264 decoder has lost sync.
+        // Rate-limited to once every 2 seconds to avoid flooding the server.
+        if needs_force_refresh {
+            let now = std::time::Instant::now();
+            let should_send = match self.last_force_refresh {
+                None => true,
+                Some(t) => now.duration_since(t).as_secs() >= 2,
+            };
+            if should_send {
+                log::debug!("[client] sending force refresh (suppress→allow) to request IDR");
+                if let Err(e) = self.send_force_refresh().await {
+                    log::warn!("[client] force refresh failed: {:?}", e);
+                } else {
+                    self.last_force_refresh = Some(now);
                 }
             }
         }
