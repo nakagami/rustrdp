@@ -1,13 +1,132 @@
+/// Process one colour plane for the 32-bpp plane-encoded decompressor.
+/// Matches grdp's `processPlane` exactly.
+/// `j` is the byte offset within each BGRA pixel (0=B, 1=G, 2=R, 3=A).
+fn process_plane(input: &mut &[u8], width: usize, height: usize, output: &mut [u8], j: usize) {
+    let total = width * height * 4;
+    let mut lastline: usize = 0; // 0 = sentinel "no previous row"
+
+    for indexh in 0..height {
+        let thisline = j + total - (indexh + 1) * width * 4;
+        let mut color: u8 = 0; // delta (non-first rows) or absolute value (first row)
+        let mut indexw: usize = 0;
+        let mut i = thisline;
+
+        while indexw < width {
+            if input.is_empty() {
+                return;
+            }
+            let code = input[0] as usize;
+            *input = &input[1..];
+
+            let mut replen = code & 0xf;
+            let mut collen = (code >> 4) & 0xf;
+            let revcode = (replen << 4) | collen;
+            if revcode >= 16 && revcode <= 47 {
+                replen = revcode;
+                collen = 0;
+            }
+
+            if lastline == 0 {
+                // First row: absolute pixel values
+                while collen > 0 && indexw < width {
+                    if input.is_empty() {
+                        return;
+                    }
+                    color = input[0];
+                    *input = &input[1..];
+                    output[i] = color;
+                    i += 4;
+                    indexw += 1;
+                    collen -= 1;
+                }
+                while replen > 0 && indexw < width {
+                    output[i] = color;
+                    i += 4;
+                    indexw += 1;
+                    replen -= 1;
+                }
+            } else {
+                // Subsequent rows: delta from previous row
+                while collen > 0 && indexw < width {
+                    if input.is_empty() {
+                        return;
+                    }
+                    let x = input[0];
+                    *input = &input[1..];
+                    // Signed delta encoded as: if odd → -(x>>1)-1; if even → x>>1
+                    color = if x & 1 != 0 {
+                        0u8.wrapping_sub((x >> 1).wrapping_add(1))
+                    } else {
+                        x >> 1
+                    };
+                    output[i] = output[indexw * 4 + lastline].wrapping_add(color);
+                    i += 4;
+                    indexw += 1;
+                    collen -= 1;
+                }
+                while replen > 0 && indexw < width {
+                    // Repeat the same delta for consecutive previous-row pixels
+                    output[i] = output[indexw * 4 + lastline].wrapping_add(color);
+                    i += 4;
+                    indexw += 1;
+                    replen -= 1;
+                }
+            }
+        }
+
+        lastline = thisline;
+    }
+}
+
+/// Decompress a 32-bpp RDP plane-encoded bitmap (MS-RDPBCGR §3.1.9.1.4).
+/// Matches grdp's `decompress4`.
+fn decompress_32bpp(input: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let total = width * height * 4;
+    if total == 0 || input.is_empty() {
+        return vec![0u8; total];
+    }
+
+    let flags = input[0];
+    let rle = flags & 0x10 != 0;
+    let no_alpha = flags & 0x20 != 0;
+
+    if !rle {
+        // Not RLE-encoded; return zeroed buffer
+        return vec![0u8; total];
+    }
+
+    let mut out = vec![0u8; total];
+    let mut data = &input[1..];
+
+    if no_alpha {
+        // No alpha plane in stream; fill alpha channel with 0xFF
+        for i in (3..total).step_by(4) {
+            out[i] = 0xFF;
+        }
+    } else {
+        process_plane(&mut data, width, height, &mut out, 3); // Alpha
+    }
+    process_plane(&mut data, width, height, &mut out, 2); // Red
+    process_plane(&mut data, width, height, &mut out, 1); // Green
+    process_plane(&mut data, width, height, &mut out, 0); // Blue
+
+    out
+}
+
 /// Decompress an RDP RLE-compressed bitmap tile.
 ///
-/// Implements the scanline-based algorithm from MS-RDPBCGR §3.1.9.2.
+/// For bpp=32 uses plane-encoded decompression (MS-RDPBCGR §3.1.9.1.4).
+/// For bpp=8/15/16/24 uses the scanline-based RLE algorithm (§3.1.9.2).
 /// Output is in top-down, left-to-right order (first byte = top-left pixel).
 pub fn decompress(input: &[u8], width: usize, height: usize, bpp: usize) -> Vec<u8> {
+    if bpp == 32 {
+        return decompress_32bpp(input, width, height);
+    }
+
     let bpp_bytes: usize = match bpp {
         8 => 1,
         15 | 16 => 2,
         24 => 3,
-        32 => 4,
         _ => return vec![],
     };
     let stride = width * bpp_bytes;

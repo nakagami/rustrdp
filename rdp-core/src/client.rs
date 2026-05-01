@@ -503,18 +503,20 @@ fn parse_bitmap_update(data: &[u8], pos: &mut usize) -> Vec<Bitmap> {
         let flags = read_u16_le(data, pos);
         let bitmap_len = read_u16_le(data, pos) as usize;
 
-        log::debug!(
-            "[bitmap] dest=({},{},{},{}) size={}x{} bpp={} flags=0x{:04x} len={}",
-            dest_left, dest_top, dest_right, dest_bottom,
-            width, height, bpp, flags, bitmap_len
-        );
-
         if *pos + bitmap_len > data.len() {
             log::warn!("[bitmap] bitmap_len={} exceeds remaining data, breaking", bitmap_len);
             break;
         }
         let raw = &data[*pos..*pos + bitmap_len];
         *pos += bitmap_len;
+
+        let cb_main_log = if flags & NO_BITMAP_COMPRESSION_HDR == 0 && raw.len() >= 8 {
+            u16::from_le_bytes([raw[2], raw[3]]) as usize
+        } else { 0 };
+        log::info!(
+            "[bitmap] dest=({},{}) size={}x{} bpp={} flags=0x{:04x} raw_len={} cb_main={}",
+            dest_left, dest_top, width, height, bpp, flags, bitmap_len, cb_main_log
+        );
 
         let pixel_data = if flags & BITMAP_COMPRESSION != 0 {
             let compressed = if flags & NO_BITMAP_COMPRESSION_HDR == 0 && raw.len() >= 8 {
@@ -526,7 +528,12 @@ fn parse_bitmap_update(data: &[u8], pos: &mut usize) -> Vec<Bitmap> {
             } else {
                 raw
             };
-            rle::decompress(compressed, width as usize, height as usize, bpp as usize)
+            log::info!("[bitmap] compressed_first8={:02x?}", &compressed[..compressed.len().min(8)]);
+            let out = rle::decompress(compressed, width as usize, height as usize, bpp as usize);
+            log::info!("[bitmap] compressed→decompressed: in={} out={} expected={} first8={:02x?}",
+                compressed.len(), out.len(), width as usize * height as usize * ((bpp as usize + 7)/8),
+                &out[..out.len().min(8)]);
+            out
         } else {
             // Uncompressed bitmaps are stored bottom-up; flip for display
             flip_vertical(raw, width as usize, height as usize, bpp as usize)
@@ -579,11 +586,6 @@ fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> Vec<Bitmap> {
         let fragmentation = (header >> 4) & 0x03;
         let compression = (header >> 6) & 0x03;
 
-        log::debug!(
-            "[fastpath] header=0x{:02x} update_code={} frag={} compression={}",
-            header, update_code, fragmentation, compression
-        );
-
         // compressionFlags byte is present only when FASTPATH_OUTPUT_COMPRESSION_USED (0x2)
         if compression == 0x02 {
             if pos >= data.len() {
@@ -599,10 +601,13 @@ fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> Vec<Bitmap> {
         pos += 2;
 
         if pos + size > data.len() {
+            log::warn!("[fastpath] update_code={} frag={} size={} exceeds remaining={}", update_code, fragmentation, size, data.len() - pos);
             break;
         }
         let update_data = &data[pos..pos + size];
         pos += size;
+
+        log::info!("[fastpath] update_code=0x{:02x} frag={} size={}", update_code, fragmentation, size);
 
         if update_code != 0x01 {
             continue;
