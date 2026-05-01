@@ -114,8 +114,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
-                Event::Window { win_event: WindowEvent::Exposed, .. }
-                | Event::Window { win_event: WindowEvent::Restored, .. } => {
+                Event::Window {
+                    win_event: WindowEvent::Exposed
+                        | WindowEvent::Restored
+                        | WindowEvent::FocusGained,
+                    ..
+                } => {
                     if let Err(e) = rdp_ui.repaint() {
                         log::error!("Failed to repaint: {}", e);
                     }

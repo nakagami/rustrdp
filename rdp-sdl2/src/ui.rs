@@ -71,19 +71,24 @@ impl RdpUI {
     /// Blit one bitmap tile (already RGBA) into the CPU back-buffer at its destination.
     fn blit_bitmap_to_buf(&mut self, bitmap: &Bitmap) {
         let rgba = bitmap.to_rgba();
-        let bw = bitmap.width as usize;
+        let bw = bitmap.width as usize;   // source row stride
         let bh = bitmap.height as usize;
+        // Clamp to dest rect: bitmap Width may be padded wider than
+        // DestRight-DestLeft+1 (RDP bitmaps on Linux), or conversely
+        // DestRight-DestLeft+1 may exceed Width (surface-bits on Windows).
+        let clip_w = bw.min((bitmap.dest_right - bitmap.dest_left + 1).max(0) as usize);
+        let clip_h = bh.min((bitmap.dest_bottom - bitmap.dest_top + 1).max(0) as usize);
         let dest_x = bitmap.dest_left.max(0) as usize;
         let dest_y = bitmap.dest_top.max(0) as usize;
         let scr_w = self.width as usize;
         let scr_h = self.height as usize;
 
-        for row in 0..bh {
+        for row in 0..clip_h {
             let dy = dest_y + row;
             if dy >= scr_h { break; }
-            let src_start = row * bw * 4;
+            let src_start = row * bw * 4;  // use stride (bw), not clip_w
             let dst_start = (dy * scr_w + dest_x) * 4;
-            let copy_pixels = bw.min(scr_w.saturating_sub(dest_x));
+            let copy_pixels = clip_w.min(scr_w.saturating_sub(dest_x));
             let src_end = src_start + copy_pixels * 4;
             let dst_end = dst_start + copy_pixels * 4;
             if src_end <= rgba.len() && dst_end <= self.back_buf.len() {
