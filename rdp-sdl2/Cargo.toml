@@ -16,4 +16,8 @@ env_logger = "0.11"
 log = "0.4"
 thiserror = "1"
 async-trait = "0.1"
+rustls = { version = "0.23", features = ["ring"] }
+
+[build-dependencies]
+pkg-config = "0.3"
 
