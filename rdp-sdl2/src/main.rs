@@ -1,0 +1,149 @@
+use rdp_sdl2::config::RdpConfig;
+use rdp_sdl2::connection::RdpConnection;
+use rdp_sdl2::input::InputHandler;
+use rdp_sdl2::ui::RdpUI;
+use rdp_core::client::RdpEvent;
+use sdl2::event::Event;
+use sdl2::keyboard::Keycode;
+use std::error::Error;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+
+    // Load configuration from environment
+    let config = RdpConfig::from_env().map_err(|e| {
+        eprintln!(
+            "Configuration error: {}. Please set the following environment variables:",
+            e
+        );
+        eprintln!("  GRDP_HOST     - RDP server hostname");
+        eprintln!("  GRDP_PORT     - RDP server port");
+        eprintln!("  GRDP_USER     - Username");
+        eprintln!("  GRDP_PASSWORD - Password");
+        eprintln!("  GRDP_DOMAIN   - Domain (optional)");
+        eprintln!("  GRDP_WINDOW_SIZE - Window size (default: 1280x800)");
+        e
+    })?;
+
+    log::info!(
+        "Starting RDP client {}x{}",
+        config.width,
+        config.height
+    );
+
+    // Connect to RDP server
+    let mut rdp_session = RdpConnection::connect(&config).await?;
+
+    // Initialize SDL2
+    let sdl_context = sdl2::init()?;
+    let mut rdp_ui = RdpUI::new(
+        &sdl_context,
+        config.width,
+        config.height,
+        "RDP Client",
+    )?;
+
+    // Initialize input handler
+    let input_handler = InputHandler::new(config.swap_alt_meta);
+
+    // Get event pump
+    let mut event_pump = sdl_context.event_pump()?;
+    let mut running = true;
+    let mut mouse_x: u16 = 0;
+    let mut mouse_y: u16 = 0;
+
+    log::info!("RDP client ready");
+
+    // Main loop
+    while running {
+        // Handle SDL2 events
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. } => {
+                    running = false;
+                    break;
+                }
+                Event::KeyDown {
+                    keycode: Some(keycode),
+                    ..
+                } => {
+                    if keycode == Keycode::Escape {
+                        running = false;
+                    } else if let Some((scancode, _)) = input_handler.handle_keyboard_event(keycode, true) {
+                        if let Err(e) = rdp_session.send_key_down(0, scancode).await {
+                            log::error!("Failed to send key down: {}", e);
+                        }
+                    }
+                }
+                Event::KeyUp {
+                    keycode: Some(keycode),
+                    ..
+                } => {
+                    if let Some((scancode, _)) = input_handler.handle_keyboard_event(keycode, false) {
+                        if let Err(e) = rdp_session.send_key_up(scancode).await {
+                            log::error!("Failed to send key up: {}", e);
+                        }
+                    }
+                }
+                Event::MouseMotion { x, y, .. } => {
+                    mouse_x = x as u16;
+                    mouse_y = y as u16;
+                    if let Err(e) = rdp_session.send_mouse_move(mouse_x, mouse_y).await {
+                        log::error!("Failed to send mouse move: {}", e);
+                    }
+                }
+                Event::MouseButtonDown { mouse_btn, .. } => {
+                    if let Some((btn, _)) = input_handler.handle_mouse_button(mouse_btn, true) {
+                        if let Err(e) = rdp_session.send_mouse_button(btn, true, mouse_x, mouse_y).await {
+                            log::error!("Failed to send mouse button down: {}", e);
+                        }
+                    }
+                }
+                Event::MouseButtonUp { mouse_btn, .. } => {
+                    if let Some((btn, _)) = input_handler.handle_mouse_button(mouse_btn, false) {
+                        if let Err(e) = rdp_session.send_mouse_button(btn, false, mouse_x, mouse_y).await {
+                            log::error!("Failed to send mouse button up: {}", e);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Receive RDP events
+        if let Ok(rdp_event) = tokio::time::timeout(
+            Duration::from_millis(50),
+            rdp_session.recv_event(),
+        )
+        .await
+        {
+            match rdp_event {
+                Ok(RdpEvent::Ready) => {
+                    log::info!("RDP session ready");
+                }
+                Ok(RdpEvent::Bitmap(bitmaps)) => {
+                    if let Err(e) = rdp_ui.update_screen(&bitmaps) {
+                        log::error!("Failed to update screen: {}", e);
+                    }
+                }
+                Ok(RdpEvent::Deactivated) => {
+                    log::info!("RDP session deactivated");
+                    running = false;
+                }
+                Err(e) => {
+                    log::error!("RDP error: {}", e);
+                    running = false;
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    log::info!("RDP client closing");
+    Ok(())
+}

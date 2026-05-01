@@ -3,5 +3,6 @@ members = [
     "rdp-core",
     "rdp-wasm",
     "proxy",
+    "rdp-sdl2",
 ]
 resolver = "2"
