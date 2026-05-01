@@ -12,6 +12,7 @@ typedef struct RdpH264Dec {
     struct SwsContext   *sws;
     int                  last_width;
     int                  last_height;
+    enum AVPixelFormat   last_pix_fmt;  /* track format changes for sws invalidation */
     int                  needs_keyframe; /* drop P-frames until next IDR/SPS */
     int                  stall_count;   /* consecutive frames with no decoder output */
 } RdpH264Dec;
@@ -44,7 +45,7 @@ RdpH264Dec* rdp_h264_new(void) {
     }
 
     d->needs_keyframe = 1; /* wait for IDR before decoding anything */
-
+    d->last_pix_fmt = AV_PIX_FMT_NONE;
     d->frame = av_frame_alloc();
     if (!d->frame) {
         avcodec_free_context(&d->ctx);
@@ -98,6 +99,7 @@ static int codec_hard_reset(RdpH264Dec *d)
     d->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
     d->ctx->thread_count = 1;
 
+    d->last_pix_fmt = AV_PIX_FMT_NONE;
     return avcodec_open2(d->ctx, d->codec, NULL);
 }
 
@@ -159,11 +161,11 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     #define CONVERT_FRAME(frame, presult, pw, ph) do { \
         int _w = (frame)->width, _h = (frame)->height; \
         enum AVPixelFormat _fmt = map_pixfmt((frame)->format); \
-        if (!d->sws || d->last_width != _w || d->last_height != _h) { \
+        if (!d->sws || d->last_width != _w || d->last_height != _h || d->last_pix_fmt != _fmt) { \
             if (d->sws) sws_freeContext(d->sws); \
             d->sws = sws_getContext(_w, _h, _fmt, _w, _h, AV_PIX_FMT_BGRA, \
                                     SWS_BILINEAR, NULL, NULL, NULL); \
-            d->last_width  = _w; d->last_height = _h; \
+            d->last_width  = _w; d->last_height = _h; d->last_pix_fmt = _fmt; \
         } \
         if (d->sws) { \
             uint8_t *_bgra = (uint8_t*)malloc((size_t)_w * _h * 4); \
