@@ -21,6 +21,16 @@ const GFX_CHANNEL_NAME:         &str = "Microsoft::Windows::RDS::Graphics";
 const AUDIO_DVC_CHANNEL_NAME:   &str = "AUDIO_PLAYBACK_DVC";
 const AUDIO_LOSSY_CHANNEL_NAME: &str = "AUDIO_PLAYBACK_LOSSY_DVC";
 
+/// VOR (Video Optimized Remoting) channels that rustrdp does not implement.
+/// Rejecting these forces the server to keep sending video via RDPGFX.
+/// Without rejection, the server silently switches to VOR during video
+/// playback or window transitions, causing the screen to freeze.
+const REJECTED_CHANNELS: &[&str] = &[
+    "Microsoft::Windows::RDS::Video::Control::v08.01",
+    "Microsoft::Windows::RDS::Video::Data::v08.01",
+    "Microsoft::Windows::RDS::Geometry::v08.01",
+];
+
 /// In-progress reassembly for a fragmented DVC message.
 struct Fragment {
     buf:      Vec<u8>,
@@ -129,7 +139,14 @@ impl DrdynvcHandler {
         let name = read_cstring(&data[name_start..]);
         log::debug!("[drdynvc] CREATE_REQ ch={} name={}", ch_id, name);
 
-        // Always send CREATE_RESPONSE (status=0 = S_OK) before any data.
+        // Reject VOR channels: send E_FAIL so the server keeps using RDPGFX.
+        if REJECTED_CHANNELS.contains(&name.as_str()) {
+            log::info!("[drdynvc] rejecting VOR channel: {}", name);
+            out.push(build_create_rsp(ch_id, cb_ch_id, 0x80004005)); // E_FAIL
+            return;
+        }
+
+        // Send CREATE_RESPONSE (status=0 = S_OK).
         out.push(build_create_rsp(ch_id, cb_ch_id, 0));
 
         if name == GFX_CHANNEL_NAME {
