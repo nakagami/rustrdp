@@ -148,16 +148,10 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
 
     int ret = avcodec_send_packet(d->ctx, d->pkt);
 
-    /* AVERROR(EAGAIN): decoder output is full; drain frames until send succeeds. */
-    for (int eagain_retries = 0;
-         ret == AVERROR(EAGAIN) && eagain_retries < 16;
-         eagain_retries++) {
-        int rv = avcodec_receive_frame(d->ctx, d->frame);
-        if (rv == 0) {
-            av_frame_unref(d->frame);
-        } else {
-            break; /* no frame available to drain */
-        }
+    /* AVERROR(EAGAIN): decoder output is full; drain one frame then retry. */
+    if (ret == AVERROR(EAGAIN)) {
+        avcodec_receive_frame(d->ctx, d->frame);
+        av_frame_unref(d->frame);
         ret = avcodec_send_packet(d->ctx, d->pkt);
     }
 
