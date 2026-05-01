@@ -37,74 +37,74 @@ fn build_capability(cap_type: u16, data: &[u8]) -> Vec<u8> {
 // CAPSTYPE_GENERAL (0x0001): 26 bytes
 fn build_general_capability() -> Vec<u8> {
     let mut inner = Vec::new();
-    write_u16_le(&mut inner, 1);       // osMajorType
-    write_u16_le(&mut inner, 3);       // osMinorType
-    write_u16_le(&mut inner, 0x0200);  // protocolVersion
-    write_u16_le(&mut inner, 0);       // pad2octetsA
-    write_u16_le(&mut inner, 0);       // generalCompressionTypes
-    write_u16_le(&mut inner, 0x040D);  // extraFlags (FastPath+LongCreds+AutoReconnect+NoBmpCompressHdr)
-    write_u16_le(&mut inner, 0);       // updateCapabilityFlag
-    write_u16_le(&mut inner, 0);       // remoteUnshareFlag
-    write_u16_le(&mut inner, 0);       // generalCompressionLevel
-    write_u8(&mut inner, 1);           // refreshRectSupport
-    write_u8(&mut inner, 1);           // suppressOutputSupport
+    write_u16_le(&mut inner, 1); // osMajorType
+    write_u16_le(&mut inner, 3); // osMinorType
+    write_u16_le(&mut inner, 0x0200); // protocolVersion
+    write_u16_le(&mut inner, 0); // pad2octetsA
+    write_u16_le(&mut inner, 0); // generalCompressionTypes
+    write_u16_le(&mut inner, 0x040D); // extraFlags (FastPath+LongCreds+AutoReconnect+NoBmpCompressHdr)
+    write_u16_le(&mut inner, 0); // updateCapabilityFlag
+    write_u16_le(&mut inner, 0); // remoteUnshareFlag
+    write_u16_le(&mut inner, 0); // generalCompressionLevel
+    write_u8(&mut inner, 1); // refreshRectSupport
+    write_u8(&mut inner, 1); // suppressOutputSupport
     build_capability(CAPSTYPE_GENERAL, &inner)
 }
 
 // CAPSTYPE_BITMAP (0x0002): 30 bytes
 fn build_bitmap_capability(width: u16, height: u16) -> Vec<u8> {
     let mut inner = Vec::new();
-    write_u16_le(&mut inner, 32);  // preferredBitsPerPixel
-    write_u16_le(&mut inner, 1);   // receive1BitPerPixel
-    write_u16_le(&mut inner, 1);   // receive4BitsPerPixel
-    write_u16_le(&mut inner, 1);   // receive8BitsPerPixel
+    write_u16_le(&mut inner, 32); // preferredBitsPerPixel
+    write_u16_le(&mut inner, 1); // receive1BitPerPixel
+    write_u16_le(&mut inner, 1); // receive4BitsPerPixel
+    write_u16_le(&mut inner, 1); // receive8BitsPerPixel
     write_u16_le(&mut inner, width);
     write_u16_le(&mut inner, height);
-    write_u16_le(&mut inner, 0);   // pad2octets
-    write_u16_le(&mut inner, 1);   // desktopResizeFlag
-    write_u16_le(&mut inner, 1);   // bitmapCompressionFlag
-    write_u8(&mut inner, 0);       // highColorFlags
-    write_u8(&mut inner, 0);       // drawingFlags
-    write_u16_le(&mut inner, 1);   // multipleRectangleSupport
-    write_u16_le(&mut inner, 0);   // pad2octetsB
+    write_u16_le(&mut inner, 0); // pad2octets
+    write_u16_le(&mut inner, 1); // desktopResizeFlag
+    write_u16_le(&mut inner, 1); // bitmapCompressionFlag
+    write_u8(&mut inner, 0); // highColorFlags
+    write_u8(&mut inner, 0); // drawingFlags
+    write_u16_le(&mut inner, 1); // multipleRectangleSupport
+    write_u16_le(&mut inner, 0); // pad2octetsB
     build_capability(CAPSTYPE_BITMAP, &inner)
 }
 
 // CAPSTYPE_ORDER (0x0003): 92 bytes (88 inner)
 fn build_order_capability() -> Vec<u8> {
     let mut inner = vec![0u8; 16]; // terminalDescriptor[16]
-    write_u32_le(&mut inner, 0);   // pad4octetsA
-    write_u16_le(&mut inner, 1);   // desktopSaveXGranularity
-    write_u16_le(&mut inner, 20);  // desktopSaveYGranularity
-    write_u16_le(&mut inner, 0);   // pad2octetsA
-    write_u16_le(&mut inner, 1);   // maximumOrderLevel
-    write_u16_le(&mut inner, 0);   // numberFonts
+    write_u32_le(&mut inner, 0); // pad4octetsA
+    write_u16_le(&mut inner, 1); // desktopSaveXGranularity
+    write_u16_le(&mut inner, 20); // desktopSaveYGranularity
+    write_u16_le(&mut inner, 0); // pad2octetsA
+    write_u16_le(&mut inner, 1); // maximumOrderLevel
+    write_u16_le(&mut inner, 0); // numberFonts
     write_u16_le(&mut inner, 0x00AA); // orderFlags
-    // orderSupport[32]: DstBlt, PatBlt, ScrBlt supported
+                                      // orderSupport[32]: DstBlt, PatBlt, ScrBlt supported
     let mut order_support = [0u8; 32];
     order_support[0] = 1; // DstBlt
     order_support[1] = 1; // PatBlt
     order_support[2] = 1; // ScrBlt
     inner.extend_from_slice(&order_support);
-    write_u16_le(&mut inner, 0);         // textFlags
-    write_u16_le(&mut inner, 4);         // orderSupportExFlags
-    write_u32_le(&mut inner, 0);         // pad4octetsB
+    write_u16_le(&mut inner, 0); // textFlags
+    write_u16_le(&mut inner, 4); // orderSupportExFlags
+    write_u32_le(&mut inner, 0); // pad4octetsB
     write_u32_le(&mut inner, 480 * 480); // desktopSaveSize
-    write_u16_le(&mut inner, 0);         // pad2octetsC
-    write_u16_le(&mut inner, 0);         // pad2octetsD
-    write_u16_le(&mut inner, 1252);      // textANSICodePage
-    write_u16_le(&mut inner, 0);         // pad2octetsE
+    write_u16_le(&mut inner, 0); // pad2octetsC
+    write_u16_le(&mut inner, 0); // pad2octetsD
+    write_u16_le(&mut inner, 1252); // textANSICodePage
+    write_u16_le(&mut inner, 0); // pad2octetsE
     build_capability(CAPSTYPE_ORDER, &inner)
 }
 
 // CAPSTYPE_BITMAPCACHE_REV2 (0x0013): 40 bytes
 fn build_bitmapcache_rev2_capability() -> Vec<u8> {
     let mut inner = Vec::new();
-    write_u16_le(&mut inner, 2);    // cacheFlags (ALLOW_CACHE_WAITING_LIST_FLAG)
-    write_u8(&mut inner, 0);        // pad2
-    write_u8(&mut inner, 5);        // numCellCaches
-    write_u32_le(&mut inner, 600);  // bitmapCache0CellInfo
-    write_u32_le(&mut inner, 600);  // bitmapCache1CellInfo
+    write_u16_le(&mut inner, 2); // cacheFlags (ALLOW_CACHE_WAITING_LIST_FLAG)
+    write_u8(&mut inner, 0); // pad2
+    write_u8(&mut inner, 5); // numCellCaches
+    write_u32_le(&mut inner, 600); // bitmapCache0CellInfo
+    write_u32_le(&mut inner, 600); // bitmapCache1CellInfo
     write_u32_le(&mut inner, 2048); // bitmapCache2CellInfo
     write_u32_le(&mut inner, 4096); // bitmapCache3CellInfo
     write_u32_le(&mut inner, 2048); // bitmapCache4CellInfo
@@ -135,7 +135,7 @@ fn build_activation_capability() -> Vec<u8> {
 // CAPSTYPE_POINTER (0x0008): 10 bytes
 fn build_pointer_capability() -> Vec<u8> {
     let mut inner = Vec::new();
-    write_u16_le(&mut inner, 1);  // colorPointerFlag
+    write_u16_le(&mut inner, 1); // colorPointerFlag
     write_u16_le(&mut inner, 20); // colorPointerCacheSize
     write_u16_le(&mut inner, 20); // pointerCacheSize
     build_capability(CAPSTYPE_POINTER, &inner)
@@ -172,8 +172,8 @@ fn build_input_capability(kbd_layout: u32) -> Vec<u8> {
     write_u16_le(&mut inner, 0x003D);
     write_u16_le(&mut inner, 0);
     write_u32_le(&mut inner, kbd_layout);
-    write_u32_le(&mut inner, 4);  // keyboardType (IBM enhanced)
-    write_u32_le(&mut inner, 0);  // keyboardSubType
+    write_u32_le(&mut inner, 4); // keyboardType (IBM enhanced)
+    write_u32_le(&mut inner, 0); // keyboardSubType
     write_u32_le(&mut inner, 12); // keyboardFunctionKey
     inner.extend_from_slice(&[0u8; 64]); // imeFileName
     build_capability(CAPSTYPE_INPUT, &inner)
@@ -197,16 +197,16 @@ fn build_brush_capability() -> Vec<u8> {
 // CAPSTYPE_GLYPHCACHE (0x0010): 52 bytes
 fn build_glyph_capability() -> Vec<u8> {
     let mut inner = vec![0u8; 40]; // glyphCache[10] x 4 bytes each
-    write_u32_le(&mut inner, 0);   // fragCache
-    write_u16_le(&mut inner, 0);   // glyphSupportLevel
-    write_u16_le(&mut inner, 0);   // pad2octets
+    write_u32_le(&mut inner, 0); // fragCache
+    write_u16_le(&mut inner, 0); // glyphSupportLevel
+    write_u16_le(&mut inner, 0); // pad2octets
     build_capability(CAPSTYPE_GLYPHCACHE, &inner)
 }
 
 // CAPSTYPE_VIRTUAL_CHANNEL (0x0014): 12 bytes
 fn build_virtual_channel_capability() -> Vec<u8> {
     let mut inner = Vec::new();
-    write_u32_le(&mut inner, 0);    // flags
+    write_u32_le(&mut inner, 0); // flags
     write_u32_le(&mut inner, 1600); // vcChunkSize
     build_capability(CAPSTYPE_VIRTUAL_CHANNEL, &inner)
 }
@@ -242,49 +242,28 @@ fn build_large_pointer_capability() -> Vec<u8> {
 // CAPSETTYPE_SURFACE_COMMANDS (0x001C): 12 bytes
 fn build_surface_commands_capability() -> Vec<u8> {
     let mut inner = Vec::new();
-    write_u32_le(&mut inner, 0x0000); // cmdFlags = 0: no surface commands
-    write_u32_le(&mut inner, 0);      // reserved
+    // Match grdp: accept surface bitmap commands and frame markers.
+    write_u32_le(&mut inner, 0x0002 | 0x0010 | 0x0040);
+    write_u32_le(&mut inner, 0); // reserved
     build_capability(CAPSETTYPE_SURFACE_COMMANDS, &inner)
 }
 
-// CAPSETTYPE_BITMAP_CODECS (0x001D): 2 codecs with properties matching grdp
+// CAPSETTYPE_BITMAP_CODECS (0x001D): NSCodec support for surface commands.
 fn build_bitmap_codecs_capability() -> Vec<u8> {
     // NSCodec GUID
     let nscodec_guid: [u8; 16] = [
-        0xB9, 0x1B, 0x8D, 0xCA, 0x0F, 0x00, 0x4F, 0x15,
-        0x58, 0x9F, 0xAE, 0x2D, 0x1A, 0x87, 0xE2, 0xD6,
+        0xB9, 0x1B, 0x8D, 0xCA, 0x0F, 0x00, 0x4F, 0x15, 0x58, 0x9F, 0xAE, 0x2D, 0x1A, 0x87, 0xE2,
+        0xD6,
     ];
     // NSCodec properties: fAllowDynamicFidelity=1, fAllowSubsampling=1, colorLossLevel=3
     let nscodec_props: [u8; 3] = [1, 1, 3];
 
-    // RemoteFX GUID
-    let rfx_guid: [u8; 16] = [
-        0x12, 0x2F, 0x77, 0x76, 0x72, 0xBD, 0x63, 0x44,
-        0xAF, 0xB3, 0xB7, 0x3C, 0x9C, 0x6F, 0x78, 0x86,
-    ];
-    // RemoteFX properties: TS_RFX_CAPABILITY_CONTAINER (41 bytes)
-    let rfx_props: [u8; 41] = [
-        41, 0, 0, 0,   // length = 41
-        0, 0, 0, 0,    // captureFlags
-        29, 0, 0, 0,   // capsLength = 29
-        // TS_RFX_CAPS (29 bytes):
-        0xC0, 0xCB, 8, 0, 0, 0, 1, 0,  // blockType=0xCBC0, blockLen=8, numIcap=1, icapLen=...
-        0xC1, 0xCB, 21, 0, 0, 0, 1,    // TS_RFX_ICAP: blockType, blockLen, version...
-        0xC0, 0xCF, 1, 0, 8, 0, 0, 1, 64, 0, 1, 1, 1, 4,
-    ];
-
     let mut inner = Vec::new();
-    inner.push(2u8); // bitmapCodecCount = 2
-    // NSCodec
+    inner.push(1u8); // bitmapCodecCount
     inner.extend_from_slice(&nscodec_guid);
     inner.push(1u8); // codecID
     write_u16_le(&mut inner, nscodec_props.len() as u16);
     inner.extend_from_slice(&nscodec_props);
-    // RemoteFX
-    inner.extend_from_slice(&rfx_guid);
-    inner.push(3u8); // codecID
-    write_u16_le(&mut inner, rfx_props.len() as u16);
-    inner.extend_from_slice(&rfx_props);
     build_capability(CAPSETTYPE_BITMAP_CODECS, &inner)
 }
 
@@ -316,7 +295,9 @@ pub fn build_all_capabilities(width: u16, height: u16, kbd_layout: u32) -> (Vec<
     caps.extend_from_slice(&build_compdesk_capability());
     caps.extend_from_slice(&build_multifragment_capability());
     caps.extend_from_slice(&build_large_pointer_capability());
+    caps.extend_from_slice(&build_bitmap_codecs_capability());
     caps.extend_from_slice(&build_surface_commands_capability());
-    let num = 19u16;
+    caps.extend_from_slice(&build_frame_acknowledge_capability());
+    let num = 21u16;
     (caps, num)
 }

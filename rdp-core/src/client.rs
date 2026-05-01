@@ -1,34 +1,40 @@
-use crate::error::RdpError;
 use crate::bitmap::Bitmap;
-use crate::protocol::Transport;
-use crate::protocol::tpkt::Tpkt;
-use crate::protocol::x224::{X224, PROTOCOL_HYBRID, PROTOCOL_SSL};
-use crate::protocol::t125::mcs::McsClient;
-use crate::protocol::t125::gcc::{ClientData, create_gcc_data};
-use crate::protocol::nla::cssp::Cssp;
-use crate::protocol::lic::parse_license_pdu;
-use crate::protocol::pdu::{
-    ShareControlHeader, ShareDataHeader,
-    PDUTYPE_DEMANDACTIVEPDU, PDUTYPE_CONFIRMACTIVEPDU, PDUTYPE_DEACTIVATEALLPDU, PDUTYPE_DATAPDU,
-    PDUTYPE2_UPDATE, PDUTYPE2_CONTROL, PDUTYPE2_SYNCHRONIZE, PDUTYPE2_INPUT,
-    PDUTYPE2_FONTMAP, PDUTYPE2_FONTLIST, PDUTYPE2_SUPPRESS_OUTPUT,
-    UPDATETYPE_BITMAP,
-};
-use crate::protocol::pdu::caps::build_all_capabilities;
-use crate::protocol::pdu::input::{
-
-    build_keyboard_event, build_mouse_event, wrap_input_pdu,
-    KBDFLAGS_KEYUP, PTRFLAGS_BUTTON1, PTRFLAGS_BUTTON2, PTRFLAGS_BUTTON3,
-    PTRFLAGS_DOWN, PTRFLAGS_MOVE, PTRFLAGS_WHEEL, PTRFLAGS_WHEEL_NEGATIVE,
-};
 use crate::core::io::*;
 use crate::core::rle;
-use crate::protocol::nla::ntlm::to_utf16_le;
-use crate::protocol::rdpsnd::{RdpsndHandler, AudioFormat};
+use crate::error::RdpError;
 use crate::protocol::drdynvc::DrdynvcHandler;
+use crate::protocol::lic::parse_license_pdu;
+use crate::protocol::nla::cssp::Cssp;
+use crate::protocol::nla::ntlm::to_utf16_le;
+use crate::protocol::pdu::caps::build_all_capabilities;
+use crate::protocol::pdu::input::{
+    build_keyboard_event, build_mouse_event, wrap_input_pdu, KBDFLAGS_KEYUP, PTRFLAGS_BUTTON1,
+    PTRFLAGS_BUTTON2, PTRFLAGS_BUTTON3, PTRFLAGS_DOWN, PTRFLAGS_MOVE, PTRFLAGS_WHEEL,
+    PTRFLAGS_WHEEL_NEGATIVE,
+};
+use crate::protocol::pdu::{
+    ShareControlHeader, ShareDataHeader, PDUTYPE2_CONTROL, PDUTYPE2_FONTLIST, PDUTYPE2_FONTMAP,
+    PDUTYPE2_INPUT, PDUTYPE2_SUPPRESS_OUTPUT, PDUTYPE2_SYNCHRONIZE, PDUTYPE2_UPDATE,
+    PDUTYPE_CONFIRMACTIVEPDU, PDUTYPE_DATAPDU, PDUTYPE_DEACTIVATEALLPDU, PDUTYPE_DEMANDACTIVEPDU,
+    UPDATETYPE_BITMAP,
+};
+use crate::protocol::rdpsnd::{AudioFormat, RdpsndHandler};
+use crate::protocol::t125::gcc::{create_gcc_data, ClientData};
+use crate::protocol::t125::mcs::McsClient;
+use crate::protocol::tpkt::Tpkt;
+use crate::protocol::x224::{PROTOCOL_HYBRID, PROTOCOL_SSL, X224};
+use crate::protocol::Transport;
 
 const BITMAP_COMPRESSION: u16 = 0x0001;
 const NO_BITMAP_COMPRESSION_HDR: u16 = 0x0400;
+const BITMAP_NO_PROCESSING: u16 = 0x8000;
+const PDUTYPE2_FRAME_ACKNOWLEDGE: u8 = 0x38;
+const FASTPATH_UPDATETYPE_BITMAP: u8 = 0x01;
+const FASTPATH_UPDATETYPE_SURFCMDS: u8 = 0x04;
+const CMDTYPE_SET_SURFACE_BITS: u16 = 0x0001;
+const CMDTYPE_FRAME_MARKER: u16 = 0x0004;
+const CMDTYPE_STREAM_SURFACE_BITS: u16 = 0x0006;
+const SURFCMD_FRAMEACTION_END: u16 = 0x0001;
 
 pub enum RdpEvent {
     Ready,
@@ -84,16 +90,19 @@ impl<T: Transport> RdpSession<T> {
         // Step 1: X.224 connection negotiation
         let tpkt = Tpkt::new(transport);
         let mut x224 = X224::new(tpkt);
-                log::debug!("[client] step1: X.224 connect");
+        log::debug!("[client] step1: X.224 connect");
         x224.connect(user).await?;
         let selected_protocol = x224.recv_confirm().await?;
-                log::debug!("[client] step1 done: selected_protocol=0x{:08x}", selected_protocol);
+        log::debug!(
+            "[client] step1 done: selected_protocol=0x{:08x}",
+            selected_protocol
+        );
 
         // Step 2: TLS upgrade (proxy performs TLS and sends back the server public key)
         let pub_key = if selected_protocol == PROTOCOL_SSL || selected_protocol == PROTOCOL_HYBRID {
-                        log::debug!("[client] step2: start_tls");
+            log::debug!("[client] step2: start_tls");
             let pk = x224.tpkt_mut().transport_mut().start_tls().await?;
-                        log::debug!("[client] step2 done: pub_key len={}", pk.len());
+            log::debug!("[client] step2 done: pub_key len={}", pk.len());
             pk
         } else {
             Vec::new()
@@ -101,11 +110,11 @@ impl<T: Transport> RdpSession<T> {
 
         // Step 3: CredSSP / NLA authentication
         let transport = if selected_protocol == PROTOCOL_HYBRID {
-                        log::debug!("[client] step3: CredSSP/NLA authenticate");
+            log::debug!("[client] step3: CredSSP/NLA authenticate");
             let inner_transport = x224.into_tpkt().into_transport();
             let mut cssp = Cssp::new(inner_transport, domain, user, password);
             cssp.authenticate(&pub_key).await?;
-                        log::debug!("[client] step3 done: CredSSP complete");
+            log::debug!("[client] step3 done: CredSSP complete");
             cssp.into_transport()
         } else {
             x224.into_tpkt().into_transport()
@@ -117,7 +126,7 @@ impl<T: Transport> RdpSession<T> {
         x224.selected_protocol = selected_protocol;
 
         // Step 5: MCS / GCC connection
-                log::debug!("[client] step5: MCS connect");
+        log::debug!("[client] step5: MCS connect");
         let client_data = ClientData {
             width,
             height,
@@ -131,11 +140,18 @@ impl<T: Transport> RdpSession<T> {
         mcs.connect(&gcc_data).await?;
         let server_data = mcs.recv_connect_response().await?;
         mcs.io_channel = server_data.io_channel;
-                log::debug!("[client] step5 done: io_channel={} channels={:?}", mcs.io_channel, server_data.channels);
+        log::debug!(
+            "[client] step5 done: io_channel={} channels={:?}",
+            mcs.io_channel,
+            server_data.channels
+        );
         mcs.erect_domain().await?;
         mcs.attach_user().await?;
         mcs.recv_attach_user_confirm().await?;
-                log::debug!("[client] attach_user done: user_channel={}", mcs.user_channel);
+        log::debug!(
+            "[client] attach_user done: user_channel={}",
+            mcs.user_channel
+        );
 
         // Step 6: Join all channels
         let user_channel = mcs.user_channel;
@@ -145,7 +161,7 @@ impl<T: Transport> RdpSession<T> {
         mcs.channel_join(io_channel).await?;
         mcs.recv_channel_join_confirm().await?;
         if let Some(msg_ch) = server_data.msg_channel {
-                        log::debug!("[client] joining msg_channel={}", msg_ch);
+            log::debug!("[client] joining msg_channel={}", msg_ch);
             mcs.channel_join(msg_ch).await?;
             mcs.recv_channel_join_confirm().await?;
         }
@@ -155,7 +171,7 @@ impl<T: Transport> RdpSession<T> {
         }
 
         // Step 7: Send ClientInfo PDU (with 4-byte security header for enhanced security)
-                log::debug!("[client] step7: send ClientInfo");
+        log::debug!("[client] step7: send ClientInfo");
         let info_pdu = build_client_info(domain, user, password);
         mcs.send_data(io_channel, &info_pdu).await?;
 
@@ -179,7 +195,10 @@ impl<T: Transport> RdpSession<T> {
                 if let Ok(hdr) = ShareControlHeader::parse(&data, &mut pos) {
                     if hdr.pdu_type == PDUTYPE_DEMANDACTIVEPDU && pos + 4 <= data.len() {
                         share_id = read_u32_le(&data, &mut pos);
-                                                log::debug!("[client] Demand Active received: share_id=0x{:08x}", share_id);
+                        log::debug!(
+                            "[client] Demand Active received: share_id=0x{:08x}",
+                            share_id
+                        );
                         break;
                     }
                 }
@@ -227,7 +246,10 @@ impl<T: Transport> RdpSession<T> {
     /// Confirm Active PDU + synchronize sequence + wait for FontMap.
     /// Called after login and after each Deactivate/Reactivate cycle.
     async fn complete_activation(&mut self) -> Result<(), RdpError> {
-        log::debug!("[client] complete_activation: share_id=0x{:08x}", self.share_id);
+        log::debug!(
+            "[client] complete_activation: share_id=0x{:08x}",
+            self.share_id
+        );
 
         // Confirm Active PDU
         let (caps, num_caps) = build_all_capabilities(self.width, self.height, self.kbd_layout);
@@ -241,7 +263,9 @@ impl<T: Transport> RdpSession<T> {
         write_u16_le(&mut confirm_body, 0); // pad2Octets
         confirm_body.extend_from_slice(&caps);
         let confirm_sch = ShareControlHeader::build(
-            PDUTYPE_CONFIRMACTIVEPDU, self.user_channel, confirm_body.len(),
+            PDUTYPE_CONFIRMACTIVEPDU,
+            self.user_channel,
+            confirm_body.len(),
         );
         let confirm_pdu = [confirm_sch, confirm_body].concat();
         self.mcs.send_data(self.io_channel, &confirm_pdu).await?;
@@ -250,7 +274,12 @@ impl<T: Transport> RdpSession<T> {
         let mut sync_body = Vec::new();
         write_u16_le(&mut sync_body, 1u16); // SYNCMSGTYPE_SYNC
         write_u16_le(&mut sync_body, 0x03EA);
-        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_SYNCHRONIZE, &sync_body);
+        let pdu = build_data_pdu(
+            self.share_id,
+            self.user_channel,
+            PDUTYPE2_SYNCHRONIZE,
+            &sync_body,
+        );
         self.mcs.send_data(self.io_channel, &pdu).await?;
 
         // Control Cooperate
@@ -287,7 +316,10 @@ impl<T: Transport> RdpSession<T> {
             }
             let mut pos = 0;
             if let Ok(hdr) = ShareControlHeader::parse(&data, &mut pos) {
-                log::debug!("[client] complete_activation recv: pdu_type=0x{:04x}", hdr.pdu_type);
+                log::debug!(
+                    "[client] complete_activation recv: pdu_type=0x{:04x}",
+                    hdr.pdu_type
+                );
                 if hdr.pdu_type == PDUTYPE_DATAPDU {
                     if let Ok(dh) = ShareDataHeader::parse(&data, &mut pos) {
                         if dh.pdu_type2 == PDUTYPE2_FONTMAP {
@@ -296,7 +328,10 @@ impl<T: Transport> RdpSession<T> {
                         }
                         if dh.pdu_type2 == 0x2F && pos + 4 <= data.len() {
                             let err_code = u32::from_le_bytes([
-                                data[pos], data[pos+1], data[pos+2], data[pos+3],
+                                data[pos],
+                                data[pos + 1],
+                                data[pos + 2],
+                                data[pos + 3],
                             ]);
                             log::error!("[client] ERROR INFO PDU: error_code=0x{:08x}", err_code);
                         }
@@ -319,7 +354,12 @@ impl<T: Transport> RdpSession<T> {
         write_u16_le(&mut body, 0);
         write_u16_le(&mut body, self.width - 1);
         write_u16_le(&mut body, self.height - 1);
-        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_SUPPRESS_OUTPUT, &body);
+        let pdu = build_data_pdu(
+            self.share_id,
+            self.user_channel,
+            PDUTYPE2_SUPPRESS_OUTPUT,
+            &body,
+        );
         log::debug!("[client] sending SuppressOutput (ALLOW_DISPLAY_UPDATES)");
         self.mcs.send_data(self.io_channel, &pdu).await
     }
@@ -330,7 +370,12 @@ impl<T: Transport> RdpSession<T> {
     async fn send_force_refresh(&mut self) -> Result<(), RdpError> {
         // SUPPRESS: AllowDisplayUpdates=0x00 + 3 bytes padding (no rect)
         let suppress_body = [0x00u8, 0x00, 0x00, 0x00];
-        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_SUPPRESS_OUTPUT, &suppress_body);
+        let pdu = build_data_pdu(
+            self.share_id,
+            self.user_channel,
+            PDUTYPE2_SUPPRESS_OUTPUT,
+            &suppress_body,
+        );
         self.mcs.send_data(self.io_channel, &pdu).await?;
 
         // ALLOW: AllowDisplayUpdates=0x01 + 3 bytes padding + desktop rect
@@ -341,7 +386,25 @@ impl<T: Transport> RdpSession<T> {
         write_u16_le(&mut allow_body, 0);
         write_u16_le(&mut allow_body, self.width - 1);
         write_u16_le(&mut allow_body, self.height - 1);
-        let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_SUPPRESS_OUTPUT, &allow_body);
+        let pdu = build_data_pdu(
+            self.share_id,
+            self.user_channel,
+            PDUTYPE2_SUPPRESS_OUTPUT,
+            &allow_body,
+        );
+        self.mcs.send_data(self.io_channel, &pdu).await
+    }
+
+    async fn send_frame_acknowledge(&mut self, frame_id: u32) -> Result<(), RdpError> {
+        let mut body = Vec::with_capacity(4);
+        write_u32_le(&mut body, frame_id);
+        let pdu = build_data_pdu(
+            self.share_id,
+            self.user_channel,
+            PDUTYPE2_FRAME_ACKNOWLEDGE,
+            &body,
+        );
+        log::debug!("[client] FastPath surface frame ack frame_id={}", frame_id);
         self.mcs.send_data(self.io_channel, &pdu).await
     }
 
@@ -351,18 +414,28 @@ impl<T: Transport> RdpSession<T> {
         loop {
             // Deliver any pending audio events before waiting for more data
             if let Some(ev) = self.pending_audio.pop_front() {
-                return Ok(RdpEvent::Audio { format: ev.format, data: ev.data });
+                return Ok(RdpEvent::Audio {
+                    format: ev.format,
+                    data: ev.data,
+                });
             }
 
             log::debug!("[recv_event] waiting for recv_data...");
             let result = self.mcs.recv_data().await;
-            log::debug!("[recv_event] recv_data returned: {}", if result.is_ok() { "Ok" } else { "Err" });
+            log::debug!(
+                "[recv_event] recv_data returned: {}",
+                if result.is_ok() { "Ok" } else { "Err" }
+            );
             let (ch, data) = result?;
 
             if ch == 0xFFFF {
                 // FastPath update
                 log::debug!("[recv_event] FastPath data_len={}", data.len());
-                let bitmaps = parse_fastpath_updates(&data, &mut self.frag_buf);
+                let result = parse_fastpath_updates(&data, &mut self.frag_buf);
+                for frame_id in result.frame_ids {
+                    self.send_frame_acknowledge(frame_id).await?;
+                }
+                let bitmaps = result.bitmaps;
                 log::debug!("[recv_event] FastPath bitmaps={}", bitmaps.len());
                 if !bitmaps.is_empty() {
                     return Ok(RdpEvent::Bitmap(bitmaps));
@@ -373,7 +446,10 @@ impl<T: Transport> RdpSession<T> {
             // Dispatch rdpsnd static virtual channel data
             if Some(ch) == self.rdpsnd_channel {
                 if let Some(event) = self.handle_rdpsnd_data(&data).await {
-                    return Ok(RdpEvent::Audio { format: event.format, data: event.data });
+                    return Ok(RdpEvent::Audio {
+                        format: event.format,
+                        data: event.data,
+                    });
                 }
                 continue;
             }
@@ -410,12 +486,17 @@ impl<T: Transport> RdpSession<T> {
                     // The server will immediately follow with a new Demand Active.
                     loop {
                         let (ch2, data2) = self.mcs.recv_data().await?;
-                        if ch2 == 0xFFFF { continue; }
+                        if ch2 == 0xFFFF {
+                            continue;
+                        }
                         let mut pos2 = 0;
                         if let Ok(hdr2) = ShareControlHeader::parse(&data2, &mut pos2) {
                             if hdr2.pdu_type == PDUTYPE_DEMANDACTIVEPDU && pos2 + 4 <= data2.len() {
                                 self.share_id = read_u32_le(&data2, &mut pos2);
-                                log::info!("[recv_event] new Demand Active: share_id=0x{:08x}", self.share_id);
+                                log::info!(
+                                    "[recv_event] new Demand Active: share_id=0x{:08x}",
+                                    self.share_id
+                                );
                                 break;
                             }
                         }
@@ -434,7 +515,12 @@ impl<T: Transport> RdpSession<T> {
                     };
                     log::debug!("[recv_event] pduType2={}", dh.pdu_type2);
                     if dh.pdu_type2 == 0x2F && pos + 4 <= data.len() {
-                        let err_code = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+                        let err_code = u32::from_le_bytes([
+                            data[pos],
+                            data[pos + 1],
+                            data[pos + 2],
+                            data[pos + 3],
+                        ]);
                         log::error!("[recv_event] ERROR INFO PDU: error_code=0x{:08x}", err_code);
                     }
                     if dh.pdu_type2 == PDUTYPE2_UPDATE && pos + 2 <= data.len() {
@@ -460,7 +546,10 @@ impl<T: Transport> RdpSession<T> {
     /// Handle data arriving on the rdpsnd virtual channel.
     /// Reassembles fragmented channel PDUs (MS-RDPBCGR virtual channel fragmentation)
     /// then passes the complete payload to the RDPSND state machine.
-    async fn handle_rdpsnd_data(&mut self, data: &[u8]) -> Option<crate::protocol::rdpsnd::AudioEvent> {
+    async fn handle_rdpsnd_data(
+        &mut self,
+        data: &[u8],
+    ) -> Option<crate::protocol::rdpsnd::AudioEvent> {
         // Virtual channel PDU header: length(4) + flags(4)
         const CHANNEL_FLAG_FIRST: u32 = 0x01;
         const CHANNEL_FLAG_LAST: u32 = 0x02;
@@ -508,16 +597,20 @@ impl<T: Transport> RdpSession<T> {
     /// Handle data arriving on the drdynvc virtual channel.
     /// Reassembles fragmented channel PDUs then passes the complete payload
     /// to the DrdynvcHandler, returns any decoded bitmaps and audio events.
-    async fn handle_drdynvc_data(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<crate::protocol::rdpsnd::AudioEvent>) {        const CHANNEL_FLAG_FIRST: u32 = 0x01;
-        const CHANNEL_FLAG_LAST:  u32 = 0x02;
+    async fn handle_drdynvc_data(
+        &mut self,
+        data: &[u8],
+    ) -> (Vec<Bitmap>, Vec<crate::protocol::rdpsnd::AudioEvent>) {
+        const CHANNEL_FLAG_FIRST: u32 = 0x01;
+        const CHANNEL_FLAG_LAST: u32 = 0x02;
 
         if data.len() < 8 {
             log::warn!("[drdynvc] channel data too short: {} bytes", data.len());
             return (vec![], vec![]);
         }
         let total_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let flags     = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let payload   = &data[8..];
+        let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let payload = &data[8..];
 
         if flags & CHANNEL_FLAG_FIRST != 0 {
             self.drdynvc_frag.clear();
@@ -530,7 +623,8 @@ impl<T: Transport> RdpSession<T> {
         }
 
         let assembled = std::mem::take(&mut self.drdynvc_frag);
-        let (bitmaps, responses, audio_events, needs_force_refresh) = self.drdynvc_handler.process(&assembled);
+        let (bitmaps, responses, audio_events, needs_force_refresh) =
+            self.drdynvc_handler.process(&assembled);
 
         // Send any outgoing DRDYNVC PDUs (CAPS response, FRAME_ACK, audio replies, etc.)
         for resp in responses {
@@ -547,12 +641,12 @@ impl<T: Transport> RdpSession<T> {
         }
 
         // Request a fresh IDR keyframe if the H264 decoder has lost sync.
-        // Rate-limited to once every 500 ms to avoid flooding the server.
+        // Match grdp's 2-second rate limit to avoid suppress/allow storms.
         if needs_force_refresh {
             let now = std::time::Instant::now();
             let should_send = match self.last_force_refresh {
                 None => true,
-                Some(t) => now.duration_since(t).as_millis() >= 500,
+                Some(t) => now.duration_since(t).as_secs() >= 2,
             };
             if should_send {
                 log::debug!("[client] sending force refresh (suppress→allow) to request IDR");
@@ -601,7 +695,11 @@ impl<T: Transport> RdpSession<T> {
             3 => PTRFLAGS_BUTTON3,
             _ => PTRFLAGS_BUTTON1,
         };
-        let flags = if down { btn_flag | PTRFLAGS_DOWN } else { btn_flag };
+        let flags = if down {
+            btn_flag | PTRFLAGS_DOWN
+        } else {
+            btn_flag
+        };
         let event = build_mouse_event(flags, x, y);
         let body = wrap_input_pdu(&[event]);
         let pdu = build_data_pdu(self.share_id, self.user_channel, PDUTYPE2_INPUT, &body);
@@ -654,7 +752,7 @@ fn build_client_info(domain: &str, user: &str, password: &str) -> Vec<u8> {
     write_u16_le(&mut info, pass_utf16.len() as u16); // cbPassword
     write_u16_le(&mut info, 0); // cbAlternateShell
     write_u16_le(&mut info, 0); // cbWorkingDir
-    // Fields include null terminators
+                                // Fields include null terminators
     info.extend_from_slice(&domain_utf16);
     info.extend_from_slice(&[0, 0]);
     info.extend_from_slice(&user_utf16);
@@ -703,13 +801,18 @@ fn parse_bitmap_update(data: &[u8], pos: &mut usize) -> Vec<Bitmap> {
         let bitmap_len = read_u16_le(data, pos) as usize;
 
         if *pos + bitmap_len > data.len() {
-            log::warn!("[bitmap] bitmap_len={} exceeds remaining data, breaking", bitmap_len);
+            log::warn!(
+                "[bitmap] bitmap_len={} exceeds remaining data, breaking",
+                bitmap_len
+            );
             break;
         }
         let raw = &data[*pos..*pos + bitmap_len];
         *pos += bitmap_len;
 
-        let pixel_data = if flags & BITMAP_COMPRESSION != 0 {
+        let pixel_data = if flags & BITMAP_NO_PROCESSING != 0 {
+            raw.to_vec()
+        } else if flags & BITMAP_COMPRESSION != 0 {
             let compressed = if flags & NO_BITMAP_COMPRESSION_HDR == 0 && raw.len() >= 8 {
                 // Parse TS_CD_HEADER: cbCompFirstRowSize(2) + cbCompMainBodySize(2) +
                 //                     cbScanWidth(2) + cbUncompressedSize(2)
@@ -745,7 +848,10 @@ fn flip_vertical(data: &[u8], width: usize, height: usize, bpp: usize) -> Vec<u8
     let stride = width.saturating_mul(bytes_per_pixel);
     let total = stride.saturating_mul(height);
     if total > 32 * 1024 * 1024 {
-        log::warn!("flip_vertical: suspiciously large total={}, skipping", total);
+        log::warn!(
+            "flip_vertical: suspiciously large total={}, skipping",
+            total
+        );
         return vec![];
     }
     let mut out = vec![0u8; total];
@@ -761,8 +867,16 @@ fn flip_vertical(data: &[u8], width: usize, height: usize, bpp: usize) -> Vec<u8
     out
 }
 
-fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> Vec<Bitmap> {
-    let mut bitmaps = Vec::new();
+struct FastPathUpdateResult {
+    bitmaps: Vec<Bitmap>,
+    frame_ids: Vec<u32>,
+}
+
+fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> FastPathUpdateResult {
+    let mut result = FastPathUpdateResult {
+        bitmaps: Vec::new(),
+        frame_ids: Vec::new(),
+    };
     let mut pos = 0;
 
     while pos < data.len() {
@@ -787,15 +901,27 @@ fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> Vec<Bitmap> {
         pos += 2;
 
         if pos + size > data.len() {
-            log::warn!("[fastpath] update_code={} frag={} size={} exceeds remaining={}", update_code, fragmentation, size, data.len() - pos);
+            log::warn!(
+                "[fastpath] update_code={} frag={} size={} exceeds remaining={}",
+                update_code,
+                fragmentation,
+                size,
+                data.len() - pos
+            );
             break;
         }
         let update_data = &data[pos..pos + size];
         pos += size;
 
-        log::debug!("[fastpath] update_code=0x{:02x} frag={} size={}", update_code, fragmentation, size);
+        log::debug!(
+            "[fastpath] update_code=0x{:02x} frag={} size={}",
+            update_code,
+            fragmentation,
+            size
+        );
 
-        if update_code != 0x01 {
+        if update_code != FASTPATH_UPDATETYPE_BITMAP && update_code != FASTPATH_UPDATETYPE_SURFCMDS
+        {
             continue;
         }
 
@@ -803,10 +929,7 @@ fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> Vec<Bitmap> {
         // frag: 0x00=SINGLE, 0x01=LAST, 0x02=FIRST, 0x03=NEXT
         match fragmentation {
             0x00 => {
-                // Non-fragmented: skip 2-byte updateType header, then parse rects
-                let mut p = 2;
-                let mut rects = parse_bitmap_update(update_data, &mut p);
-                bitmaps.append(&mut rects);
+                parse_fastpath_update_payload(update_code, update_data, &mut result);
             }
             0x02 => {
                 // FIRST fragment: start accumulating
@@ -823,13 +946,312 @@ fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> Vec<Bitmap> {
                 frag_buf.extend_from_slice(update_data);
                 let reassembled = frag_buf.clone();
                 frag_buf.clear();
-                let mut p = 2;
-                let mut rects = parse_bitmap_update(&reassembled, &mut p);
-                bitmaps.append(&mut rects);
+                parse_fastpath_update_payload(update_code, &reassembled, &mut result);
             }
             _ => {}
         }
     }
 
-    bitmaps
+    result
+}
+
+fn parse_fastpath_update_payload(
+    update_code: u8,
+    payload: &[u8],
+    result: &mut FastPathUpdateResult,
+) {
+    match update_code {
+        FASTPATH_UPDATETYPE_BITMAP => {
+            let mut p = 2; // FastPathBitmapUpdateDataPDU header
+            let mut rects = parse_bitmap_update(payload, &mut p);
+            result.bitmaps.append(&mut rects);
+        }
+        FASTPATH_UPDATETYPE_SURFCMDS => {
+            let (mut rects, mut frame_ids) = parse_surface_commands(payload);
+            result.bitmaps.append(&mut rects);
+            result.frame_ids.append(&mut frame_ids);
+        }
+        _ => {}
+    }
+}
+
+fn parse_surface_commands(data: &[u8]) -> (Vec<Bitmap>, Vec<u32>) {
+    let mut pos = 0;
+    let mut bitmaps = Vec::new();
+    let mut frame_ids = Vec::new();
+
+    while pos + 2 <= data.len() {
+        let cmd_type = read_u16_le(data, &mut pos);
+        match cmd_type {
+            CMDTYPE_SET_SURFACE_BITS | CMDTYPE_STREAM_SURFACE_BITS => {
+                if let Some(bitmap) = parse_surface_bits_cmd(data, &mut pos) {
+                    bitmaps.push(bitmap);
+                } else {
+                    break;
+                }
+            }
+            CMDTYPE_FRAME_MARKER => {
+                if pos + 6 > data.len() {
+                    break;
+                }
+                let frame_action = read_u16_le(data, &mut pos);
+                let frame_id = read_u32_le(data, &mut pos);
+                if frame_action == SURFCMD_FRAMEACTION_END {
+                    frame_ids.push(frame_id);
+                }
+            }
+            _ => {
+                log::warn!("[surface] unknown command type=0x{:04x}", cmd_type);
+                break;
+            }
+        }
+    }
+
+    (bitmaps, frame_ids)
+}
+
+fn parse_surface_bits_cmd(data: &[u8], pos: &mut usize) -> Option<Bitmap> {
+    if *pos + 20 > data.len() {
+        return None;
+    }
+
+    let dest_left = read_u16_le(data, pos) as i32;
+    let dest_top = read_u16_le(data, pos) as i32;
+    let dest_right = read_u16_le(data, pos) as i32;
+    let dest_bottom = read_u16_le(data, pos) as i32;
+
+    let bpp = read_u8(data, pos) as i32;
+    let flags = read_u8(data, pos);
+    *pos += 1; // reserved
+    let codec_id = read_u8(data, pos);
+    let width = read_u16_le(data, pos) as i32;
+    let height = read_u16_le(data, pos) as i32;
+    let mut bitmap_len = read_u32_le(data, pos) as usize;
+
+    if flags & 0x01 != 0 {
+        if *pos + 24 > data.len() || bitmap_len < 24 {
+            return None;
+        }
+        *pos += 24;
+        bitmap_len -= 24;
+    }
+
+    if *pos + bitmap_len > data.len() {
+        log::warn!(
+            "[surface] bitmap_len={} exceeds remaining={}",
+            bitmap_len,
+            data.len() - *pos
+        );
+        return None;
+    }
+    let bitmap_data = &data[*pos..*pos + bitmap_len];
+    *pos += bitmap_len;
+
+    let (mut pixels, out_bpp) = match codec_id {
+        0 => (bitmap_data.to_vec(), bpp),
+        1 => (
+            decode_nscodec(bitmap_data, width as usize, height as usize)?,
+            32,
+        ),
+        _ => {
+            log::warn!("[surface] unsupported codec_id={}", codec_id);
+            return None;
+        }
+    };
+
+    pixels = flip_vertical(&pixels, width as usize, height as usize, out_bpp as usize);
+
+    Some(Bitmap {
+        dest_left,
+        dest_top,
+        dest_right,
+        dest_bottom,
+        width,
+        height,
+        bits_per_pixel: out_bpp,
+        data: pixels,
+    })
+}
+
+fn decode_nscodec(data: &[u8], width: usize, height: usize) -> Option<Vec<u8>> {
+    if data.len() < 20 {
+        log::warn!("[nscodec] data too short: {}", data.len());
+        return None;
+    }
+    let mut pos = 0;
+    let luma_len = read_u32_le(data, &mut pos) as usize;
+    let orange_len = read_u32_le(data, &mut pos) as usize;
+    let green_len = read_u32_le(data, &mut pos) as usize;
+    let alpha_len = read_u32_le(data, &mut pos) as usize;
+    let mut color_loss_level = read_u8(data, &mut pos);
+    let chroma_subsampling_level = read_u8(data, &mut pos);
+    pos += 2; // reserved
+
+    if color_loss_level < 1 {
+        color_loss_level = 1;
+    }
+    let shift = color_loss_level - 1;
+    let remaining = &data[pos..];
+    let total_plane_len = luma_len
+        .saturating_add(orange_len)
+        .saturating_add(green_len)
+        .saturating_add(alpha_len);
+    if total_plane_len > remaining.len() {
+        log::warn!("[nscodec] plane lengths exceed data");
+        return None;
+    }
+
+    let temp_width = (width + 7) & !7;
+    let temp_height = (height + 1) & !1;
+    let (y_orig_size, co_orig_size, cg_orig_size) = if chroma_subsampling_level > 0 {
+        let c_size = (temp_width >> 1) * (temp_height >> 1);
+        (temp_width * height, c_size, c_size)
+    } else {
+        let size = width * height;
+        (size, size, size)
+    };
+    let a_orig_size = width * height;
+
+    let mut off = 0;
+    let y_plane = nsc_decompress_plane(&remaining[off..off + luma_len], y_orig_size);
+    off += luma_len;
+    let co_plane = nsc_decompress_plane(&remaining[off..off + orange_len], co_orig_size);
+    off += orange_len;
+    let cg_plane = nsc_decompress_plane(&remaining[off..off + green_len], cg_orig_size);
+    off += green_len;
+    let a_plane = if alpha_len > 0 {
+        Some(nsc_decompress_plane(
+            &remaining[off..off + alpha_len],
+            a_orig_size,
+        ))
+    } else {
+        None
+    };
+
+    let mut pixels = vec![0u8; width * height * 4];
+    let y_row_width = if chroma_subsampling_level > 0 {
+        temp_width
+    } else {
+        width
+    };
+    let co_row_width = if chroma_subsampling_level > 0 {
+        temp_width >> 1
+    } else {
+        width
+    };
+
+    for py in 0..height {
+        let y_row_off = py * y_row_width;
+        let mut co_idx = if chroma_subsampling_level > 0 {
+            (py >> 1) * co_row_width
+        } else {
+            py * co_row_width
+        };
+        let mut cg_idx = co_idx;
+        let out_base = py * width;
+
+        for px in 0..width {
+            let y_val = y_plane.get(y_row_off + px).copied().unwrap_or(0) as i16;
+            let co_val = co_plane
+                .get(co_idx)
+                .map(|v| ((*v as i16) << shift) as u8 as i8 as i16)
+                .unwrap_or(0);
+            let cg_val = cg_plane
+                .get(cg_idx)
+                .map(|v| ((*v as i16) << shift) as u8 as i8 as i16)
+                .unwrap_or(0);
+            if chroma_subsampling_level == 0 || px % 2 == 1 {
+                co_idx += 1;
+                cg_idx += 1;
+            }
+
+            let off = (out_base + px) * 4;
+            pixels[off] = clamp_i16_to_u8(y_val - co_val - cg_val);
+            pixels[off + 1] = clamp_i16_to_u8(y_val + cg_val);
+            pixels[off + 2] = clamp_i16_to_u8(y_val + co_val - cg_val);
+            pixels[off + 3] = a_plane
+                .as_ref()
+                .and_then(|a| a.get(out_base + px))
+                .copied()
+                .unwrap_or(0xFF);
+        }
+    }
+
+    Some(pixels)
+}
+
+fn nsc_decompress_plane(input: &[u8], original_size: usize) -> Vec<u8> {
+    if input.is_empty() {
+        return vec![0xFF; original_size];
+    }
+    if input.len() >= original_size {
+        let mut out = vec![0u8; original_size];
+        out.copy_from_slice(&input[..original_size]);
+        return out;
+    }
+    nrle_decode(input, original_size)
+}
+
+fn nrle_decode(input: &[u8], original_size: usize) -> Vec<u8> {
+    let mut output = vec![0u8; original_size];
+    let mut left = original_size;
+    let mut in_pos = 0usize;
+    let mut out_pos = 0usize;
+
+    while left > 4 && in_pos < input.len() && out_pos < original_size {
+        let value = input[in_pos];
+        in_pos += 1;
+
+        if left == 5 {
+            output[out_pos] = value;
+            out_pos += 1;
+            left -= 1;
+        } else if in_pos < input.len() && value == input[in_pos] {
+            in_pos += 1;
+            let mut run_len = 0usize;
+            if in_pos < input.len() {
+                if input[in_pos] < 0xFF {
+                    run_len = input[in_pos] as usize + 2;
+                    in_pos += 1;
+                } else {
+                    in_pos += 1;
+                    if in_pos + 4 <= input.len() {
+                        run_len = u32::from_le_bytes([
+                            input[in_pos],
+                            input[in_pos + 1],
+                            input[in_pos + 2],
+                            input[in_pos + 3],
+                        ]) as usize;
+                        in_pos += 4;
+                    }
+                }
+            }
+            run_len = run_len.min(left).min(original_size - out_pos);
+            if run_len > 0 {
+                output[out_pos] = value;
+                let mut wrote = 1usize;
+                while wrote < run_len {
+                    let step = wrote.min(run_len - wrote);
+                    output.copy_within(out_pos..out_pos + step, out_pos + wrote);
+                    wrote += step;
+                }
+                out_pos += run_len;
+                left -= run_len;
+            }
+        } else {
+            output[out_pos] = value;
+            out_pos += 1;
+            left -= 1;
+        }
+    }
+
+    if left >= 4 && in_pos + 4 <= input.len() && out_pos + 4 <= output.len() {
+        output[out_pos..out_pos + 4].copy_from_slice(&input[in_pos..in_pos + 4]);
+    }
+
+    output
+}
+
+fn clamp_i16_to_u8(v: i16) -> u8 {
+    v.clamp(0, 255) as u8
 }

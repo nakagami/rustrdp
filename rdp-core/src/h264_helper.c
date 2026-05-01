@@ -14,7 +14,6 @@ typedef struct RdpH264Dec {
     int                  last_height;
     enum AVPixelFormat   last_pix_fmt;  /* track format changes for sws invalidation */
     int                  needs_keyframe; /* drop P-frames until next IDR/SPS */
-    int                  stall_count;   /* consecutive frames with no decoder output */
 } RdpH264Dec;
 
 RdpH264Dec* rdp_h264_new(void) {
@@ -81,6 +80,57 @@ static enum AVPixelFormat map_pixfmt(enum AVPixelFormat fmt) {
     case AV_PIX_FMT_YUVJ444P: return AV_PIX_FMT_YUV444P;
     case AV_PIX_FMT_YUVJ440P: return AV_PIX_FMT_YUV440P;
     default:                  return fmt;
+    }
+}
+
+#define CLAMP8(x) ((x) < 0 ? 0 : (x) > 255 ? 255 : (uint8_t)(x))
+
+static inline void bt601_to_bgra(int y_raw, int u, int v, int full_range, uint8_t *dst)
+{
+    int r, g, b;
+    if (full_range) {
+        r = (256 * y_raw + 359 * v + 128) >> 8;
+        g = (256 * y_raw -  88 * u - 183 * v + 128) >> 8;
+        b = (256 * y_raw + 454 * u + 128) >> 8;
+    } else {
+        int c = y_raw - 16;
+        r = (298 * c + 409 * v + 128) >> 8;
+        g = (298 * c - 100 * u - 208 * v + 128) >> 8;
+        b = (298 * c + 516 * u + 128) >> 8;
+    }
+    dst[0] = CLAMP8(b);
+    dst[1] = CLAMP8(g);
+    dst[2] = CLAMP8(r);
+    dst[3] = 255;
+}
+
+static void yuv420p_to_bgra(const AVFrame *src, uint8_t *dst, int dst_stride, int full_range)
+{
+    for (int row = 0; row < src->height; row++) {
+        const uint8_t *yrow = src->data[0] + row * src->linesize[0];
+        const uint8_t *urow = src->data[1] + (row >> 1) * src->linesize[1];
+        const uint8_t *vrow = src->data[2] + (row >> 1) * src->linesize[2];
+        uint8_t *drow = dst + row * dst_stride;
+        for (int col = 0; col < src->width; col++) {
+            int u = (int)urow[col >> 1] - 128;
+            int v = (int)vrow[col >> 1] - 128;
+            bt601_to_bgra((int)yrow[col], u, v, full_range, drow + col * 4);
+        }
+    }
+}
+
+static void nv12_to_bgra(const AVFrame *src, uint8_t *dst, int dst_stride, int full_range)
+{
+    for (int row = 0; row < src->height; row++) {
+        const uint8_t *yrow = src->data[0] + row * src->linesize[0];
+        const uint8_t *uvrow = src->data[1] + (row >> 1) * src->linesize[1];
+        uint8_t *drow = dst + row * dst_stride;
+        for (int col = 0; col < src->width; col++) {
+            int uv = (col >> 1) * 2;
+            int u = (int)uvrow[uv] - 128;
+            int v = (int)uvrow[uv + 1] - 128;
+            bt601_to_bgra((int)yrow[col], u, v, full_range, drow + col * 4);
+        }
     }
 }
 
@@ -160,22 +210,34 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
      * Frees any previous *result so the last decoded frame wins. */
     #define CONVERT_FRAME(frame, presult, pw, ph) do { \
         int _w = (frame)->width, _h = (frame)->height; \
-        enum AVPixelFormat _fmt = map_pixfmt((frame)->format); \
-        if (!d->sws || d->last_width != _w || d->last_height != _h || d->last_pix_fmt != _fmt) { \
-            if (d->sws) sws_freeContext(d->sws); \
-            d->sws = sws_getContext(_w, _h, _fmt, _w, _h, AV_PIX_FMT_BGRA, \
-                                    SWS_BILINEAR, NULL, NULL, NULL); \
-            d->last_width  = _w; d->last_height = _h; d->last_pix_fmt = _fmt; \
-        } \
-        if (d->sws) { \
-            uint8_t *_bgra = (uint8_t*)malloc((size_t)_w * _h * 4); \
-            if (_bgra) { \
+        enum AVPixelFormat _src_fmt = (enum AVPixelFormat)(frame)->format; \
+        enum AVPixelFormat _fmt = map_pixfmt(_src_fmt); \
+        uint8_t *_bgra = (uint8_t*)malloc((size_t)_w * _h * 4); \
+        if (_bgra) { \
+            int _full_range = (_src_fmt == AV_PIX_FMT_YUVJ420P || (frame)->color_range == AVCOL_RANGE_JPEG); \
+            if (_src_fmt == AV_PIX_FMT_YUV420P || _src_fmt == AV_PIX_FMT_YUVJ420P) { \
+                yuv420p_to_bgra((frame), _bgra, _w * 4, _full_range); \
+                free(*(presult)); *(presult) = _bgra; *(pw) = _w; *(ph) = _h; \
+            } else if (_src_fmt == AV_PIX_FMT_NV12) { \
+                nv12_to_bgra((frame), _bgra, _w * 4, _full_range); \
+                free(*(presult)); *(presult) = _bgra; *(pw) = _w; *(ph) = _h; \
+            } else { \
+                if (!d->sws || d->last_width != _w || d->last_height != _h || d->last_pix_fmt != _fmt) { \
+                    if (d->sws) sws_freeContext(d->sws); \
+                    d->sws = sws_getContext(_w, _h, _fmt, _w, _h, AV_PIX_FMT_BGRA, \
+                                            SWS_BILINEAR, NULL, NULL, NULL); \
+                    d->last_width  = _w; d->last_height = _h; d->last_pix_fmt = _fmt; \
+                } \
+                if (d->sws) { \
                 uint8_t *_dd[4] = { _bgra, NULL, NULL, NULL }; \
                 int _dl[4] = { _w * 4, 0, 0, 0 }; \
                 sws_scale(d->sws, \
                           (const uint8_t * const *)(frame)->data, (frame)->linesize, \
                           0, _h, _dd, _dl); \
                 free(*(presult)); *(presult) = _bgra; *(pw) = _w; *(ph) = _h; \
+                } else { \
+                    free(_bgra); \
+                } \
             } \
         } \
         av_frame_unref(frame); \
@@ -213,32 +275,12 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     if (ret < 0) {
         char errbuf[128];
         av_strerror(ret, errbuf, sizeof(errbuf));
-        int pkt_idr = has_idr(data, len);
         fprintf(stderr, "[h264] avcodec_send_packet failed: %s (len=%d idr=%d)\n",
-                errbuf, len, pkt_idr);
-        if (!pkt_idr) {
-            /* P-frame failure: do NOT flush — that would destroy the reference
-             * frame buffer, causing SKIP macroblocks to decode as black.
-             * Just wait for the server to send the next IDR naturally. */
-            d->needs_keyframe = 1;
-            free(result);
-            return NULL;
-        }
-        /* IDR failure: flush stale state then retry. An IDR is self-contained
-         * so flushing and re-sending it is always safe. */
+                errbuf, len, has_idr(data, len));
         avcodec_flush_buffers(d->ctx);
-        ret = avcodec_send_packet(d->ctx, d->pkt);
-        if (ret < 0) {
-            /* Flush wasn't enough — full codec reset for resolution/param change. */
-            if (codec_hard_reset(d) >= 0) {
-                ret = avcodec_send_packet(d->ctx, d->pkt);
-            }
-        }
-        if (ret < 0) {
-            d->needs_keyframe = 1;
-            free(result);
-            return NULL;
-        }
+        d->needs_keyframe = 1;
+        free(result);
+        return NULL;
     }
 
     /* Drain all frames produced by this packet, keep the last one */
@@ -254,18 +296,6 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
 
     if (result) {
         *width = rw; *height = rh;
-        d->stall_count = 0;
-    } else {
-        /* Decoder accepted the packet but produced no frame.  This is NORMAL
-         * for H.264 streams using B-frames: the decoder may buffer 1–4 frames
-         * before producing output.  Only flush after a very large number of
-         * consecutive stalls, which indicates a genuine stream discontinuity. */
-        d->stall_count++;
-        if (d->stall_count >= 10) {
-            avcodec_flush_buffers(d->ctx);
-            d->needs_keyframe = 1;
-            d->stall_count = 0;
-        }
     }
     return result;
 }
