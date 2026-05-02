@@ -293,15 +293,36 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     }
 
     /* Drain all frames produced by this packet, keep the last one */
+    int drain_count = 0;
     for (;;) {
         ret = avcodec_receive_frame(d->ctx, d->frame);
         if (ret == AVERROR(EAGAIN)) break;
         if (ret == AVERROR_EOF) break;
         if (ret < 0) break;
         CONVERT_FRAME(d->frame, &result, &rw, &rh);
+        drain_count++;
     }
 
     #undef CONVERT_FRAME
+
+    /* VideoToolbox HW stall detection:
+     * Under macOS VideoToolbox, a large packet can cause EAGAIN for several
+     * subsequent packets (the HW pipeline is filling up).  When the pipeline
+     * drains, all buffered frames are returned in a single call — drain_count > 1.
+     * The pixels we hold are from a *delayed* earlier frame, NOT the frame
+     * whose AVC dirty regions we currently have.  Blitting stale pixels to the
+     * wrong regions causes permanent visual corruption (windows never redraw).
+     *
+     * Fix: discard the stale output, flush the decoder to reset VideoToolbox,
+     * and set needs_keyframe so the next IDR re-syncs cleanly.  This mirrors
+     * grdp's soft-reset + keyframe-request path. */
+    if (drain_count > 1) {
+        fprintf(stderr, "[h264] HW stall: drained %d frames at once, flushing and requesting IDR\n", drain_count);
+        avcodec_flush_buffers(d->ctx);
+        d->needs_keyframe = 1;
+        free(result);
+        return NULL;
+    }
 
     if (result) {
         *width = rw; *height = rh;
