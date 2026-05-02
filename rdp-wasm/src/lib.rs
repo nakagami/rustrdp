@@ -263,6 +263,7 @@ pub async fn connect(
                     break;
                 }
                 Ok(RdpEvent::Ready) => {}
+                Ok(RdpEvent::Resize { .. }) => {}
                 Err(e) => {
                     log::error!("RDP event error: {:?}", e);
                     break;

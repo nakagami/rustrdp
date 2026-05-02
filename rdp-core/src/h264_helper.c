@@ -14,6 +14,7 @@ typedef struct RdpH264Dec {
     int                  last_height;
     enum AVPixelFormat   last_pix_fmt;  /* track format changes for sws invalidation */
     int                  needs_keyframe; /* drop P-frames until next IDR/SPS */
+    int                  log_frames_left;
 } RdpH264Dec;
 
 RdpH264Dec* rdp_h264_new(void) {
@@ -44,6 +45,7 @@ RdpH264Dec* rdp_h264_new(void) {
     }
 
     d->needs_keyframe = 1; /* wait for IDR before decoding anything */
+    d->log_frames_left = 8;
     d->last_pix_fmt = AV_PIX_FMT_NONE;
     d->frame = av_frame_alloc();
     if (!d->frame) {
@@ -239,6 +241,20 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
                     free(_bgra); \
                 } \
             } \
+            if (_bgra && d->log_frames_left > 0) { \
+                size_t _pixels = (size_t)_w * _h; \
+                size_t _step = _pixels / 4096; \
+                if (_step == 0) _step = 1; \
+                unsigned long long _sum = 0, _cnt = 0; \
+                for (size_t _px = 0; _px < _pixels; _px += _step) { \
+                    uint8_t *_p = _bgra + _px * 4; \
+                    _sum += ((unsigned long long)_p[2] * 299 + (unsigned long long)_p[1] * 587 + (unsigned long long)_p[0] * 114) / 1000; \
+                    _cnt++; \
+                } \
+                fprintf(stderr, "[h264] frame fmt=%d range=%d full=%d size=%dx%d avg_luma=%llu samples=%llu\n", \
+                        (int)_src_fmt, (int)(frame)->color_range, _full_range, _w, _h, _cnt ? _sum / _cnt : 0, _cnt); \
+                d->log_frames_left--; \
+            } \
         } \
         av_frame_unref(frame); \
     } while (0)
@@ -246,31 +262,10 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     uint8_t *result = NULL;
     int rw = 0, rh = 0;
 
-    /* Drain any frames already buffered by the decoder from previous sends.
-     * This is important when frame-level threading is in use: a frame decoded
-     * asynchronously in a background thread may not be ready until the *next*
-     * avcodec_send_packet call, so we must collect it here rather than
-     * discarding it in the EAGAIN-on-send handler below. */
-    for (;;) {
-        int r = avcodec_receive_frame(d->ctx, d->frame);
-        if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) break;
-        if (r < 0) break;
-        CONVERT_FRAME(d->frame, &result, &rw, &rh);
-    }
-
     d->pkt->data = (uint8_t*)(uintptr_t)data;
     d->pkt->size = len;
 
     int ret = avcodec_send_packet(d->ctx, d->pkt);
-
-    /* AVERROR(EAGAIN): decoder output queue is full even after draining above.
-     * This should not happen with thread_count=1, but handle defensively:
-     * drain one more frame (save it, don't discard), then retry send. */
-    if (ret == AVERROR(EAGAIN)) {
-        int r = avcodec_receive_frame(d->ctx, d->frame);
-        if (r >= 0) { CONVERT_FRAME(d->frame, &result, &rw, &rh); }
-        ret = avcodec_send_packet(d->ctx, d->pkt);
-    }
 
     if (ret < 0) {
         char errbuf[128];

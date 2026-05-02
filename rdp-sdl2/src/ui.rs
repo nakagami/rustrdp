@@ -50,6 +50,8 @@ impl RdpUI {
         for bitmap in bitmaps {
             self.blit_bitmap_to_buf(bitmap);
         }
+        #[cfg(debug_assertions)]
+        self.log_back_buffer_sample(bitmaps);
         self.present()
     }
 
@@ -57,6 +59,24 @@ impl RdpUI {
     /// Call this on SDL Exposed / Restored events so the window redraws itself.
     pub fn repaint(&mut self) -> Result<(), Box<dyn Error>> {
         self.present()
+    }
+
+    pub fn resize(&mut self, width: u16, height: u16) -> Result<(), Box<dyn Error>> {
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+        self.canvas
+            .window_mut()
+            .set_size(width as u32, height as u32)?;
+        self.texture = self.texture_creator.create_texture_streaming(
+            PixelFormatEnum::RGBA32,
+            width as u32,
+            height as u32,
+        )?;
+        self.back_buf = vec![0u8; width as usize * height as usize * 4];
+        self.width = width;
+        self.height = height;
+        Ok(())
     }
 
     /// Upload the back-buffer to the persistent streaming texture and flip.
@@ -94,6 +114,36 @@ impl RdpUI {
             if src_end <= rgba.len() && dst_end <= self.back_buf.len() {
                 self.back_buf[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
             }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn log_back_buffer_sample(&self, bitmaps: &[Bitmap]) {
+        if bitmaps.is_empty() || self.back_buf.is_empty() {
+            return;
+        }
+        let mut sum = 0u64;
+        let mut count = 0u64;
+        let step = ((self.width as usize * self.height as usize) / 4096).max(1);
+        for px in (0..self.width as usize * self.height as usize).step_by(step) {
+            let off = px * 4;
+            if off + 2 >= self.back_buf.len() {
+                break;
+            }
+            let r = self.back_buf[off] as u64;
+            let g = self.back_buf[off + 1] as u64;
+            let b = self.back_buf[off + 2] as u64;
+            sum += (r * 299 + g * 587 + b * 114) / 1000;
+            count += 1;
+        }
+        if count > 0 {
+            eprintln!(
+                "[rdp-sdl2] backbuf avg_luma={} samples={} size={}x{}",
+                sum / count,
+                count,
+                self.width,
+                self.height
+            );
         }
     }
 

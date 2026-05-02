@@ -132,9 +132,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Receive RDP events (16 ms timeout → up to ~60 fps cadence)
+        // Keep this timeout longer than a typical RDPGFX/H.264 decode+ACK cycle.
+        // Cancelling recv_event too aggressively can drop a decoded frame before
+        // it is returned to the UI.
         if let Ok(rdp_event) = tokio::time::timeout(
-            Duration::from_millis(16),
+            Duration::from_millis(100),
             rdp_session.recv_event(),
         )
         .await
@@ -143,7 +145,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Ok(RdpEvent::Ready) => {
                     log::info!("RDP session ready");
                 }
+                Ok(RdpEvent::Resize { width, height }) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[rdp-sdl2] Resize {}x{}", width, height);
+                    if let Err(e) = rdp_ui.resize(width, height) {
+                        log::error!("Failed to resize UI: {}", e);
+                    }
+                }
                 Ok(RdpEvent::Bitmap(bitmaps)) => {
+                    #[cfg(debug_assertions)]
+                    if let Some(first) = bitmaps.first() {
+                        eprintln!(
+                            "[rdp-sdl2] Bitmap count={} first=({},{}-{},{} {}x{} bpp={})",
+                            bitmaps.len(),
+                            first.dest_left,
+                            first.dest_top,
+                            first.dest_right,
+                            first.dest_bottom,
+                            first.width,
+                            first.height,
+                            first.bits_per_pixel
+                        );
+                    }
                     if let Err(e) = rdp_ui.update_screen(&bitmaps) {
                         log::error!("Failed to update screen: {}", e);
                     }
