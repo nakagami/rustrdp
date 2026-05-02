@@ -820,6 +820,7 @@ impl RdpgfxHandler {
 
     fn decode_avc444(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>)> {
         let (stream, lc) = parse_avc444(data)?;
+        #[cfg(debug_assertions)]
         eprintln!(
             "[rdpgfx] decode_avc444: lc={} h264_len={}",
             lc,
@@ -827,6 +828,7 @@ impl RdpgfxHandler {
         );
         let regions = stream.regions;
         let result = self.decode_h264(&stream.h264_data);
+        #[cfg(debug_assertions)]
         if result.is_none() {
             eprintln!("[rdpgfx] decode_avc444: decode_h264 returned None (h264_len={})", stream.h264_data.len());
         }
@@ -1142,6 +1144,7 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
     let lc = ((cb_field >> 30) & 0x03) as u8;
     let cb_stream1 = (cb_field & 0x3FFF_FFFF) as usize;
     let rest = &data[4..];
+    #[cfg(debug_assertions)]
     eprintln!(
         "[rdpgfx] parse_avc444: data={} lc={} cb_stream1={} rest={}",
         data.len(), lc, cb_stream1, rest.len()

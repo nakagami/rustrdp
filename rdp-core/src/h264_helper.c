@@ -206,6 +206,20 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     if (d->needs_keyframe) {
         if (!idr) return NULL;
         d->needs_keyframe = 0;
+    } else if (idr) {
+        /* Flush the decoder pipeline before a mid-stream IDR.
+         *
+         * Without this, VideoToolbox (HW decoder) buffers the IDR internally
+         * and returns EAGAIN from avcodec_receive_frame for several subsequent
+         * packets.  When output eventually arrives it is paired with a later
+         * P-frame's AVC dirty regions instead of the IDR's full-scene regions,
+         * causing permanent visual corruption (new window never redraws).
+         *
+         * After avcodec_flush_buffers the decoder resets cleanly, and the next
+         * send_packet (this IDR) produces output in the same decode call —
+         * matching the IDR's AVC regions, just like grdp's soft-reset path. */
+        avcodec_flush_buffers(d->ctx);
+        fprintf(stderr, "[h264] flush before IDR (len=%d)\n", len);
     }
 
     /* Helper: convert one AVFrame to malloc'd BGRA and accumulate into *result.
