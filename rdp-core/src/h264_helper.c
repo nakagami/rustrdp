@@ -49,12 +49,16 @@ static void configure_codec_context(RdpH264Dec *d, int enable_hw)
 {
     d->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
     d->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-    d->ctx->thread_count = 1;
 
     d->use_hw = 0;
     d->hw_pix_fmt = AV_PIX_FMT_NONE;
 
-    if (!enable_hw) return;
+    if (!enable_hw) {
+        /* SW decoder: disable frame-level multi-threading so each
+         * send/receive is synchronous with no EAGAIN pipeline buffering. */
+        d->ctx->thread_count = 1;
+        return;
+    }
 
     enum AVHWDeviceType hw_type = av_hwdevice_find_type_by_name("videotoolbox");
     if (hw_type == AV_HWDEVICE_TYPE_NONE) return;
@@ -115,15 +119,17 @@ RdpH264Dec* rdp_h264_new(void) {
      * AV_CODEC_FLAG2_FAST reduces internal decoder latency by disabling
      * optional in-loop processing overhead.
      *
-     * thread_count=1: disables FFmpeg's frame-level multi-threading.  With
-     * the default multi-threaded mode, FFmpeg pipelines N packets (one per
-     * thread) before emitting the first output frame — returning EAGAIN for
-     * each buffered packet.  This pipeline is flushed and rebuilt from scratch
-     * on every IDR, adding thread_count-1 frames of EAGAIN latency after each
-     * keyframe.  Single-threaded mode makes every send/receive cycle
-     * synchronous so each decoded frame is immediately available without any
-     * EAGAIN buffering.  grdp uses the same setting for the same reason.
-     * (See grdp commit: "h264: add thread_count=1 to SW decoder") */
+     * thread_count=1 (SW decoder only): disables FFmpeg's frame-level
+     * multi-threading.  With the default multi-threaded mode, FFmpeg pipelines
+     * N packets (one per thread) before emitting the first output frame —
+     * returning EAGAIN for each buffered packet.  Single-threaded mode makes
+     * every send/receive cycle synchronous.
+     *
+     * For the HW (VideoToolbox) decoder we leave thread_count at its default
+     * so that FFmpeg's VideoToolbox wrapper uses its full callback thread pool.
+     * Setting thread_count=1 with VideoToolbox causes a 7-frame EAGAIN
+     * pipeline stall (~230 ms at 30 fps) on every scene change; leaving it
+     * at the default eliminates the stall, matching grdp's behaviour. */
     if (open_codec_with_fallback(d) < 0) {
         avcodec_free_context(&d->ctx);
         free(d);
