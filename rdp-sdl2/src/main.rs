@@ -141,11 +141,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Check for RDP events. Use a shorter timeout to balance responsiveness
-        // with RDP frame delivery. The 16ms timeout (~60 FPS) ensures regular
-        // polling while allowing input to flow through when poll_iter() has events.
+        // Check for RDP events. Timeout at 33ms (~30 FPS) to balance frame delivery
+        // with input responsiveness. This is longer than grdpsdl2's WaitEventTimeout(8),
+        // but allows H.264 decoder to complete keyframe waits without premature cancellation.
         if let Ok(rdp_event) = tokio::time::timeout(
-            Duration::from_millis(16),
+            Duration::from_millis(33),
             rdp_session.recv_event(),
         )
         .await
