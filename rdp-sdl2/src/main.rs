@@ -64,17 +64,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Main loop
     while running {
-        // Handle SDL2 events. Following grdpsdl2 (Go) pattern: process all pending events,
-        // then handle RDP updates. However, unlike Go's WaitEventTimeout which blocks, we use
-        // poll_iter() which returns immediately. To prevent starving recv_event(), we limit
-        // event iterations per frame and always reach the recv_event timeout check.
-        let mut event_count = 0;
-        const MAX_EVENTS_PER_FRAME: usize = 50;  // Typically <10 events per frame; 50 is generous
+        // Handle SDL2 events. Process all pending events without a fixed limit.
+        // Since poll_iter() returns immediately (non-blocking), we rely on the
+        // recv_event timeout to balance input responsiveness and RDP frame delivery.
         for event in event_pump.poll_iter() {
-            if event_count >= MAX_EVENTS_PER_FRAME {
-                break;
-            }
-            event_count += 1;
             match event {
                 Event::Quit { .. } => {
                     running = false;
@@ -148,11 +141,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Keep this timeout longer than a typical RDPGFX/H.264 decode+ACK cycle.
-        // Cancelling recv_event too aggressively can drop a decoded frame before
-        // it is returned to the UI.
+        // Check for RDP events. Use a shorter timeout to balance responsiveness
+        // with RDP frame delivery. The 16ms timeout (~60 FPS) ensures regular
+        // polling while allowing input to flow through when poll_iter() has events.
         if let Ok(rdp_event) = tokio::time::timeout(
-            Duration::from_millis(100),
+            Duration::from_millis(16),
             rdp_session.recv_event(),
         )
         .await
