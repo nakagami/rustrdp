@@ -659,18 +659,6 @@ impl<T: Transport> RdpSession<T> {
         let (bitmaps, responses, audio_events, needs_force_refresh, reset_size) =
             self.drdynvc_handler.process(&assembled);
 
-        // If the RDPGFX channel delivered a large surface update (e.g. a wire-to-surface
-        // or uncompressed surface bitmap sent by the server in response to our
-        // SuppressOutput force-refresh PDU), flush the stale VideoToolbox pipeline
-        // exactly as we do for FastPath and slow-path bitmap updates.
-        // Without this call the pipeline stays elevated indefinitely because
-        // gnome-remote-desktop sends its force-refresh responses over RDPGFX/DVC,
-        // not as legacy FastPath bitmap updates, so signal_screen_refreshed was
-        // never triggered and the stale AVC frames kept overwriting the fresh pixels.
-        if bitmaps_contain_large_refresh(&bitmaps) {
-            self.drdynvc_handler.signal_screen_refreshed();
-        }
-
         // Send any outgoing DRDYNVC PDUs (CAPS response, FRAME_ACK, audio replies, etc.)
         for resp in responses {
             let mut vchan_pdu = Vec::with_capacity(8 + resp.len());
