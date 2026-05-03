@@ -955,16 +955,19 @@ impl RdpgfxHandler {
         {
             if let Some(ref mut dec) = self.h264_dec {
                 let result = dec.decode(h264_data);
+                // Check unconditionally: needs_keyframe() returns true while
+                // pipeline_elevated=1 (C keeps request_refresh=1 after the
+                // first EAGAIN until the IDR flush).  Checking here (not just
+                // on EAGAIN) ensures force-refresh PDUs are retried every ~2 s
+                // while the pipeline stays elevated in steady-state drain mode.
+                if dec.needs_keyframe() {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[rdpgfx] H264 decoder needs IDR — scheduling force refresh");
+                    self.needs_force_refresh = true;
+                }
                 if result.is_none() {
-                    // No output is normal while the decoder buffers frames or waits for
-                    // VideoToolbox/FFmpeg to resume after an IDR.  Request a new IDR only
-                    // when the decoder explicitly entered keyframe-wait state after an
-                    // avcodec_send_packet failure.
-                    if dec.needs_keyframe() {
-                        #[cfg(debug_assertions)]
-                        eprintln!("[rdpgfx] H264 decoder needs IDR — scheduling force refresh");
-                        self.needs_force_refresh = true;
-                    }
+                    // No output is normal while the decoder buffers frames or waits
+                    // for VideoToolbox/FFmpeg to resume after an IDR.
                 }
                 log::info!(
                     "[rdpgfx] H264 decode {} bytes → {}",

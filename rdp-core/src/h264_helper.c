@@ -26,6 +26,7 @@ typedef struct RdpH264Dec {
     int                  decoder_flushed; /* set whenever avcodec_flush_buffers is called; taken by caller to reset region FIFO */
     int                  drain_happened;  /* set when drain_count>=1 (frame decoded, possibly suppressed); taken by caller to sync region FIFO */
     int                  hw_eagain_count;    /* consecutive no-output packets from VideoToolbox */
+    int                  pipeline_elevated;  /* set when hw_eagain_count first reaches 1; cleared only by IDR flush; while set, request_refresh=1 is re-armed every decode call so the server keeps receiving force-refresh PDUs every ~2 s */
     int                  keyframe_wait_count; /* packets dropped since last flush waiting for IDR */
     int                  log_frames_left;
 } RdpH264Dec;
@@ -254,6 +255,7 @@ static int codec_hard_reset(RdpH264Dec *d)
 
     d->last_pix_fmt = AV_PIX_FMT_NONE;
     d->hw_eagain_count   = 0;
+    d->pipeline_elevated = 0;
     d->keyframe_wait_count = 0;
     if (avcodec_open2(d->ctx, d->codec, NULL) == 0) return 0;
     if (!d->use_hw) return -1;
@@ -265,6 +267,7 @@ static int codec_hard_reset(RdpH264Dec *d)
     configure_codec_context(d, 0);
     d->last_pix_fmt = AV_PIX_FMT_NONE;
     d->hw_eagain_count   = 0;
+    d->pipeline_elevated = 0;
     d->keyframe_wait_count = 0;
     return avcodec_open2(d->ctx, d->codec, NULL);
 }
@@ -425,6 +428,8 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
         avcodec_flush_buffers(d->ctx);
         d->decoder_flushed   = 1;
         d->just_flushed      = 1;
+        d->pipeline_elevated = 0;  /* IDR resets the VideoToolbox pipeline */
+        d->hw_eagain_count   = 0;
         d->log_frames_left   = 8;  /* re-enable per-frame luma logging after each IDR */
     }
 
@@ -536,24 +541,33 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     if (drain_count >= 1) {
         d->drain_happened      = 1;
         d->hw_eagain_count     = 0;
-        d->request_refresh     = 0;
         d->keyframe_wait_count = 0;
+        /* Keep request_refresh=1 while pipeline_elevated so the Rust layer
+         * continues sending force-refresh PDUs every ~2 s until the server
+         * sends an IDR and the pre-IDR flush clears pipeline_elevated. */
+        if (d->pipeline_elevated) {
+            d->request_refresh = 1;
+        } else {
+            d->request_refresh = 0;
+        }
     }
 
     if (drain_count == 0) {
         if (d->use_hw) {
             d->hw_eagain_count++;
-            /* First EAGAIN after a stable-zero state: ask the server for a
-             * force-refresh (IDR) as soon as possible.  We do NOT set
-             * needs_keyframe here so P-frames continue to be accepted while
-             * waiting for the IDR (avoids a visible freeze).  When the IDR
-             * arrives the pre-IDR flush will clear the pipeline and the FIFO
-             * depth resets to 0.  This handles the VideoToolbox pipeline
-             * build-up that occurs on the first large scene-change I-frame
-             * (e.g. Chrome tab switch) after a period of zero-latency decoding. */
+            /* First EAGAIN after a stable-zero state: mark the pipeline as
+             * elevated and ask the server for a force-refresh (IDR) immediately.
+             * We do NOT set needs_keyframe here so P-frames continue to be
+             * accepted while waiting for the IDR (avoids a visible freeze).
+             * When the IDR arrives the pre-IDR flush will clear pipeline_elevated
+             * and the FIFO depth resets to 0.  While pipeline_elevated=1 the
+             * drain path above keeps request_refresh=1 so the Rust layer retries
+             * the force-refresh every ~2 s (rate-limited in client.rs) in case
+             * the server (e.g. gnome-remote-desktop) ignored the first request. */
             if (d->hw_eagain_count == 1) {
                 fprintf(stderr, "[h264] HW decoder first EAGAIN (len=%d); requesting IDR\n", len);
-                d->request_refresh = 1;
+                d->pipeline_elevated = 1;
+                d->request_refresh   = 1;
             }
             if (d->hw_eagain_count >= HW_EAGAIN_RESET_THRESHOLD) {
                 fprintf(stderr,
@@ -567,6 +581,7 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
                  * keyframe-wait path above escalates to codec_hard_reset(). */
                 d->needs_keyframe    = 1;
                 d->request_refresh   = 1;
+                d->pipeline_elevated = 0;  /* hard flush resets everything */
                 d->keyframe_wait_count = 0;
                 d->decoder_flushed   = 1;
                 d->just_flushed      = 0;
