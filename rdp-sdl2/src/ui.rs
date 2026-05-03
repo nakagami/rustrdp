@@ -137,12 +137,28 @@ impl RdpUI {
             count += 1;
         }
         if count > 0 {
+            // Also sample a few fixed positions to detect spatial non-uniformity.
+            let scr_w = self.width as usize;
+            let pixel_rgba = |px: usize, py: usize| -> (u8, u8, u8) {
+                let off = (py * scr_w + px) * 4;
+                if off + 2 < self.back_buf.len() {
+                    (self.back_buf[off], self.back_buf[off + 1], self.back_buf[off + 2])
+                } else {
+                    (0, 0, 0)
+                }
+            };
+            let (r0, g0, b0) = pixel_rgba(0, 0);
+            let (r1, g1, b1) = pixel_rgba(512.min(scr_w - 1), 128.min(self.height as usize - 1));
+            let (r2, g2, b2) = pixel_rgba(scr_w / 2, self.height as usize / 2);
             eprintln!(
-                "[rdp-sdl2] backbuf avg_luma={} samples={} size={}x{}",
+                "[rdp-sdl2] backbuf avg_luma={} samples={} size={}x{} px(0,0)=RGB({},{},{}) px(512,128)=RGB({},{},{}) px(mid)=RGB({},{},{})",
                 sum / count,
                 count,
                 self.width,
-                self.height
+                self.height,
+                r0, g0, b0,
+                r1, g1, b1,
+                r2, g2, b2,
             );
         }
     }

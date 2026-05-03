@@ -21,6 +21,7 @@ mod ffi {
         ) -> *mut c_uchar;
         pub fn rdp_h264_free_buf(buf: *mut c_uchar);
         pub fn rdp_h264_needs_keyframe(d: *mut RdpH264Dec) -> c_int;
+        pub fn rdp_h264_take_full_blit(d: *mut RdpH264Dec) -> c_int;
     }
 }
 
@@ -67,6 +68,13 @@ impl H264Decoder {
     /// This happens after P-frame decode failures or codec reset.
     pub fn needs_keyframe(&self) -> bool {
         unsafe { ffi::rdp_h264_needs_keyframe(self.ptr) != 0 }
+    }
+
+    /// Returns true (and clears the flag) if the last decoded frame must be
+    /// blitted to the full surface, ignoring AVC dirty regions.
+    /// This happens when a pipeline mismatch is detected (EAGAIN → drain).
+    pub fn take_full_blit(&mut self) -> bool {
+        unsafe { ffi::rdp_h264_take_full_blit(self.ptr) != 0 }
     }
 }
 

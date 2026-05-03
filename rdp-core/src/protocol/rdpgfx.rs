@@ -83,6 +83,12 @@ pub struct RdpgfxHandler {
     /// Set when the H264 decoder is waiting for a keyframe (IDR) after failures.
     /// Signals to the caller that a force-refresh (suppress→allow) should be sent.
     needs_force_refresh: bool,
+    /// Dirty regions accumulated while the H264 decoder returns EAGAIN (multi-slice
+    /// or pipeline-delayed frames).  When the frame finally drains and a pipeline
+    /// mismatch is detected, we blit with the union of these accumulated regions
+    /// rather than with the final slice's (tiny) region or a full-frame blit.
+    #[cfg(feature = "h264")]
+    pending_avc_regions: Vec<AvcRect>,
     #[cfg(feature = "h264")]
     h264_dec: Option<crate::h264::H264Decoder>,
 }
@@ -107,6 +113,8 @@ impl RdpgfxHandler {
             last_reset_size: None,
             needs_force_refresh: false,
             #[cfg(feature = "h264")]
+            pending_avc_regions: Vec::new(),
+            #[cfg(feature = "h264")]
             h264_dec,
         }
     }
@@ -115,7 +123,10 @@ impl RdpgfxHandler {
     /// Returns (decoded bitmaps, outgoing PDUs to send back via DVC, needs_force_refresh).
     /// `needs_force_refresh` is true when the H264 decoder is waiting for an IDR keyframe;
     /// the caller should send a SuppressOutput (suppress→allow) PDU to request one.
-    pub fn process(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>, bool, Option<(u16, u16)>) {
+    pub fn process(
+        &mut self,
+        data: &[u8],
+    ) -> (Vec<Bitmap>, Vec<Vec<u8>>, bool, Option<(u16, u16)>) {
         // ZGFX decompress
         let decompressed = self.zgfx.decompress(data);
         if decompressed.is_empty() {
@@ -462,12 +473,16 @@ impl RdpgfxHandler {
                         dest_top as i32,
                         abs_x,
                         abs_y,
+                        false,
+                        false,
                         &regions,
                     );
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
-                if let Some((pixels, fw, fh, regions)) = self.decode_avc444(bmp_data) {
+                if let Some((pixels, fw, fh, regions, force_regions, skip_stale_full_frame)) =
+                    self.decode_avc444(bmp_data)
+                {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!("[rdpgfx] AVC444 decoded {}x{} → blit {}x{} regions={} at ({},{}) abs=({},{}) mapped={}",
@@ -487,6 +502,8 @@ impl RdpgfxHandler {
                         dest_top as i32,
                         abs_x,
                         abs_y,
+                        force_regions,
+                        skip_stale_full_frame,
                         &regions,
                     );
                 }
@@ -593,12 +610,16 @@ impl RdpgfxHandler {
                         0,
                         abs_x,
                         abs_y,
+                        false,
+                        false,
                         &regions,
                     );
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
-                if let Some((pixels, fw, fh, regions)) = self.decode_avc444(bmp_data) {
+                if let Some((pixels, fw, fh, regions, force_regions, skip_stale_full_frame)) =
+                    self.decode_avc444(bmp_data)
+                {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!("[rdpgfx] WTS2 AVC444 decoded {}x{} → blit {}x{} regions={} abs=({},{}) mapped={}",
@@ -618,6 +639,8 @@ impl RdpgfxHandler {
                         0,
                         abs_x,
                         abs_y,
+                        force_regions,
+                        skip_stale_full_frame,
                         &regions,
                     );
                 }
@@ -746,7 +769,11 @@ impl RdpgfxHandler {
                 if w <= 0 || h <= 0 {
                     return;
                 }
-                (extract_region(&src.data, src.width as i32, left, top, w, h), w, h)
+                (
+                    extract_region(&src.data, src.width as i32, left, top, w, h),
+                    w,
+                    h,
+                )
             }
             None => return,
         };
@@ -818,7 +845,10 @@ impl RdpgfxHandler {
             .map(|(pixels, w, h)| (pixels, w, h, regions))
     }
 
-    fn decode_avc444(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>)> {
+    fn decode_avc444(
+        &mut self,
+        data: &[u8],
+    ) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>, bool, bool)> {
         let (stream, lc) = parse_avc444(data)?;
         #[cfg(debug_assertions)]
         eprintln!(
@@ -826,13 +856,121 @@ impl RdpgfxHandler {
             lc,
             stream.h264_data.len()
         );
+        let h264_len = stream.h264_data.len();
+        let has_keyframe_params = h264_has_idr_or_sps(&stream.h264_data);
         let regions = stream.regions;
         let result = self.decode_h264(&stream.h264_data);
+        let is_mismatch = self.h264_dec_take_full_blit();
         #[cfg(debug_assertions)]
         if result.is_none() {
-            eprintln!("[rdpgfx] decode_avc444: decode_h264 returned None (h264_len={})", stream.h264_data.len());
+            eprintln!(
+                "[rdpgfx] decode_avc444: decode_h264 returned None (lc={} h264_len={} regions={} pending_before={} mismatch_flag={})",
+                lc,
+                stream.h264_data.len(),
+                regions.len(),
+                self.pending_avc_regions.len(),
+                is_mismatch
+            );
         }
-        result.map(|(pixels, w, h)| (pixels, w, h, regions))
+
+        // Pipeline-mismatch / region-accumulation logic:
+        //
+        // When the decoder returns EAGAIN (None), the dirty regions for this packet
+        // describe pixels that belong to the frame being assembled but aren't output
+        // yet.  Accumulate them so that when the frame finally drains we blit the
+        // union of ALL slices' dirty regions, not just the final slice's region.
+        //
+        // When the decoder outputs a frame AND a mismatch was detected (full_blit flag
+        // set by h264_helper.c), use the accumulated union + current regions as the
+        // effective blit region.  This correctly covers the entire scene-change area
+        // without full-frame blitting (which would write stale DPB content in
+        // non-dirty areas, producing the observed black-corner / distortion artifact).
+        //
+        // For all other frames (no mismatch) the accumulated list is empty and we
+        // just use the current packet's regions normally.
+        #[cfg(feature = "h264")]
+        if result.is_none() {
+            // Decoder not ready yet — save this packet's dirty regions.
+            if !is_mismatch {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[rdpgfx] decode_avc444: accumulate pending regions add={} pending_before={} bounds={:?}",
+                    regions.len(),
+                    self.pending_avc_regions.len(),
+                    avc_regions_bounds(&regions)
+                );
+                self.pending_avc_regions.extend(regions);
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[rdpgfx] decode_avc444: pending regions now={} area={} bounds={:?}",
+                    self.pending_avc_regions.len(),
+                    avc_regions_area(&self.pending_avc_regions),
+                    avc_regions_bounds(&self.pending_avc_regions)
+                );
+            }
+            // If the decoder entered keyframe-wait state, clear any stale accumulation.
+            if let Some(ref dec) = self.h264_dec {
+                if dec.needs_keyframe() {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[rdpgfx] decode_avc444: decoder needs keyframe; clearing {} pending regions",
+                        self.pending_avc_regions.len()
+                    );
+                    self.pending_avc_regions.clear();
+                }
+            }
+            return None;
+        }
+
+        #[cfg(feature = "h264")]
+        let effective_regions = if is_mismatch {
+            // Mismatch: blit the union of all accumulated EAGAIN-packet regions
+            // plus this (final) packet's regions.
+            let mut combined = std::mem::take(&mut self.pending_avc_regions);
+            combined.extend(regions);
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[rdpgfx] decode_avc444: mismatch — using {} accumulated+current regions area={} bounds={:?}",
+                combined.len(),
+                avc_regions_area(&combined),
+                avc_regions_bounds(&combined)
+            );
+            combined
+        } else {
+            // Normal decode: just use the current packet's regions.
+            #[cfg(feature = "h264")]
+            self.pending_avc_regions.clear();
+            regions
+        };
+        #[cfg(not(feature = "h264"))]
+        let effective_regions = regions;
+
+        // AVC444 auxiliary stream handling is incomplete (LC=0 stream2 / LC=2 are
+        // skipped).  In that state the server can send very small full-screen
+        // P-frames whose decoded frame still contains stale reference content.
+        // Dropping only those tiny non-keyframe full-screen candidates preserves
+        // the last correct surface instead of repainting the previous desktop.
+        let skip_stale_full_frame = !is_mismatch && !has_keyframe_params && h264_len <= 1024;
+
+        result.map(|(pixels, w, h)| {
+            (
+                pixels,
+                w,
+                h,
+                effective_regions,
+                is_mismatch,
+                skip_stale_full_frame,
+            )
+        })
+    }
+
+    #[allow(dead_code)]
+    fn h264_dec_take_full_blit(&mut self) -> bool {
+        #[cfg(feature = "h264")]
+        if let Some(ref mut dec) = self.h264_dec {
+            return dec.take_full_blit();
+        }
+        false
     }
 
     #[allow(unused_variables)]
@@ -891,29 +1029,62 @@ impl RdpgfxHandler {
     }
 }
 
-const AVC_REGION_USE_THRESHOLD_PERCENT: i32 = 60;
-
 fn should_use_avc_regions(regions: &[AvcRect], frame_w: i32, frame_h: i32) -> bool {
     if frame_w <= 0 || frame_h <= 0 {
         return false;
     }
-    let total = frame_w.saturating_mul(frame_h);
-    if total == 0 {
-        return false;
-    }
-    let mut sum = 0i32;
+    let mut has_region = false;
     for rc in regions {
         if rc.right <= rc.left || rc.bottom <= rc.top {
             continue;
         }
-        let w = (rc.right - rc.left) as i32;
-        let h = (rc.bottom - rc.top) as i32;
-        sum = sum.saturating_add(w.saturating_mul(h));
-        if sum.saturating_mul(100) >= total.saturating_mul(AVC_REGION_USE_THRESHOLD_PERCENT) {
+        has_region = true;
+        if rc.left == 0 && rc.top == 0 && rc.right as i32 >= frame_w && rc.bottom as i32 >= frame_h
+        {
             return false;
         }
     }
-    sum > 0
+    has_region
+}
+
+fn has_full_frame_region(regions: &[AvcRect], frame_w: i32, frame_h: i32) -> bool {
+    regions.iter().any(|rc| {
+        rc.right > rc.left
+            && rc.bottom > rc.top
+            && rc.left == 0
+            && rc.top == 0
+            && rc.right as i32 >= frame_w
+            && rc.bottom as i32 >= frame_h
+    })
+}
+
+fn h264_has_idr_or_sps(data: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 3 < data.len() {
+        let sc_len = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            3
+        } else if i + 4 < data.len()
+            && data[i] == 0
+            && data[i + 1] == 0
+            && data[i + 2] == 0
+            && data[i + 3] == 1
+        {
+            4
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let nal_start = i + sc_len;
+        if nal_start < data.len() {
+            let nal_type = data[nal_start] & 0x1F;
+            if nal_type == 5 || nal_type == 7 {
+                return true;
+            }
+        }
+        i += sc_len;
+    }
+    false
 }
 
 fn avc_regions_area(regions: &[AvcRect]) -> i32 {
@@ -927,6 +1098,31 @@ fn avc_regions_area(regions: &[AvcRect]) -> i32 {
         sum = sum.saturating_add(w.saturating_mul(h));
     }
     sum
+}
+
+fn avc_regions_bounds(regions: &[AvcRect]) -> Option<(i32, i32, i32, i32)> {
+    let mut left = i32::MAX;
+    let mut top = i32::MAX;
+    let mut right = i32::MIN;
+    let mut bottom = i32::MIN;
+    let mut seen = false;
+
+    for rc in regions {
+        if rc.right <= rc.left || rc.bottom <= rc.top {
+            continue;
+        }
+        seen = true;
+        left = left.min(rc.left as i32);
+        top = top.min(rc.top as i32);
+        right = right.max(rc.right as i32);
+        bottom = bottom.max(rc.bottom as i32);
+    }
+
+    if seen {
+        Some((left, top, right, bottom))
+    } else {
+        None
+    }
 }
 
 /// Blit a decoded AVC frame into the surface and emit bitmap updates.
@@ -947,10 +1143,57 @@ fn blit_avc_frame(
     dy: i32, // destination offset on surface
     ax: i32,
     ay: i32, // absolute screen position
+    force_regions: bool,
+    skip_stale_full_frame: bool,
     regions: &[AvcRect],
 ) {
+    if force_regions && !regions.is_empty() {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[rdpgfx] emit AVC forced regions surf={} surface=({},{} {}x{}) abs=({},{}) frame={}x{} regions={} region_area={} frame_area={} bounds={:?}",
+            surf_id,
+            dx,
+            dy,
+            ew,
+            eh,
+            ax,
+            ay,
+            fw,
+            fh,
+            regions.len(),
+            avc_regions_area(regions),
+            ew.saturating_mul(eh),
+            avc_regions_bounds(regions)
+        );
+        blit_avc_regions(
+            surf_id, surfaces, bitmaps, pixels, fw, fh, ew, eh, dx, dy, ax, ay, regions,
+        );
+        return;
+    }
+
     if should_use_avc_regions(regions, ew, eh) {
-        blit_avc_regions(surf_id, surfaces, bitmaps, pixels, fw, fh, ew, eh, dx, dy, ax, ay, regions);
+        blit_avc_regions(
+            surf_id, surfaces, bitmaps, pixels, fw, fh, ew, eh, dx, dy, ax, ay, regions,
+        );
+        return;
+    }
+
+    if skip_stale_full_frame && has_full_frame_region(regions, ew, eh) {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[rdpgfx] drop suspicious AVC full surf={} surface=({},{} {}x{}) abs=({},{}) frame={}x{} regions={} bounds={:?}",
+            surf_id,
+            dx,
+            dy,
+            ew,
+            eh,
+            ax,
+            ay,
+            fw,
+            fh,
+            regions.len(),
+            avc_regions_bounds(regions)
+        );
         return;
     }
 
@@ -972,7 +1215,7 @@ fn blit_avc_frame(
     }
     #[cfg(debug_assertions)]
     eprintln!(
-        "[rdpgfx] emit AVC full surf={} surface=({},{} {}x{}) abs=({},{}) frame={}x{} regions={} region_area={} frame_area={}",
+        "[rdpgfx] emit AVC full surf={} surface=({},{} {}x{}) abs=({},{}) frame={}x{} regions={} region_area={} frame_area={} bounds={:?}",
         surf_id,
         dx,
         dy,
@@ -984,7 +1227,8 @@ fn blit_avc_frame(
         fh,
         regions.len(),
         avc_regions_area(regions),
-        ew.saturating_mul(eh)
+        ew.saturating_mul(eh),
+        avc_regions_bounds(regions)
     );
     bitmaps.push(make_bitmap(ax, ay, ew, eh, cropped));
 }
@@ -1055,16 +1299,40 @@ fn blit_avc_regions(
         }
 
         #[cfg(debug_assertions)]
-        eprintln!(
-            "[rdpgfx] emit AVC region surf={} surface=({},{} {}x{}) abs=({},{})",
-            surf_id,
-            dx + rx,
-            dy + ry,
-            rw,
-            rh,
-            ax + rx,
-            ay + ry
-        );
+        {
+            // Sample the first pixel of this region from the decoded frame (BGRA).
+            let sample_off = ((ry * frame_stride) + rx * 4) as usize;
+            let (fb, fg, fr) = if sample_off + 2 < pixels.len() {
+                (
+                    pixels[sample_off],
+                    pixels[sample_off + 1],
+                    pixels[sample_off + 2],
+                )
+            } else {
+                (0, 0, 0)
+            };
+            // Sample the centre pixel too.
+            let cx = rx + rw / 2;
+            let cy = ry + rh / 2;
+            let csample_off = ((cy * frame_stride) + cx * 4) as usize;
+            let (cb, cg, cr) = if csample_off + 2 < pixels.len() {
+                (
+                    pixels[csample_off],
+                    pixels[csample_off + 1],
+                    pixels[csample_off + 2],
+                )
+            } else {
+                (0, 0, 0)
+            };
+            eprintln!(
+                "[rdpgfx] emit AVC region surf={} surface=({},{} {}x{}) abs=({},{}) frame_px0=RGB({},{},{}) frame_ctr=RGB({},{},{})",
+                surf_id,
+                dx + rx, dy + ry, rw, rh,
+                ax + rx, ay + ry,
+                fr, fg, fb,
+                cr, cg, cb,
+            );
+        }
         bitmaps.push(make_bitmap(ax + rx, ay + ry, rw, rh, region));
     }
 }
@@ -1147,7 +1415,10 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
     #[cfg(debug_assertions)]
     eprintln!(
         "[rdpgfx] parse_avc444: data={} lc={} cb_stream1={} rest={}",
-        data.len(), lc, cb_stream1, rest.len()
+        data.len(),
+        lc,
+        cb_stream1,
+        rest.len()
     );
     match lc {
         0 => {
@@ -1155,11 +1426,21 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
             if cb_stream1 > rest.len() {
                 eprintln!(
                     "[rdpgfx] parse_avc444: lc=0 cb_stream1={} > rest={} → None",
-                    cb_stream1, rest.len()
+                    cb_stream1,
+                    rest.len()
                 );
                 return None;
             }
             let s = parse_avc420(&rest[..cb_stream1])?;
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[rdpgfx] parse_avc444: lc=0 stream1={} stream2={} regions={} h264_len={} bounds={:?}",
+                cb_stream1,
+                rest.len().saturating_sub(cb_stream1),
+                s.regions.len(),
+                s.h264_data.len(),
+                avc_regions_bounds(&s.regions)
+            );
             Some((s, lc))
         }
         1 => {
@@ -1170,6 +1451,14 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
                 &rest[..cb_stream1]
             };
             let s = parse_avc420(stream_data)?;
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[rdpgfx] parse_avc444: lc=1 stream={} regions={} h264_len={} bounds={:?}",
+                stream_data.len(),
+                s.regions.len(),
+                s.h264_data.len(),
+                avc_regions_bounds(&s.regions)
+            );
             Some((s, lc))
         }
         2 => {
@@ -1178,6 +1467,12 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
             // standalone YUV420 H.264 bitstream.  Feeding it to the H.264 decoder
             // would corrupt the decoder's reference-frame state.
             // Skip entirely — same behaviour as grdp v0.7.6.
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[rdpgfx] parse_avc444: lc=2 auxiliary-only skipped aux_len={} cb_stream1={}",
+                rest.len(),
+                cb_stream1
+            );
             None
         }
         _ => {
@@ -1249,12 +1544,6 @@ pub fn build_caps_advertise() -> Vec<u8> {
         caps.extend_from_slice(&4u32.to_le_bytes()); // capsDataLength
         caps.extend_from_slice(&flags.to_le_bytes());
     };
-    let push_cap16 = |caps: &mut Vec<u8>, version: u32| {
-        caps.extend_from_slice(&version.to_le_bytes());
-        caps.extend_from_slice(&16u32.to_le_bytes());
-        caps.extend_from_slice(&[0u8; 16]);
-    };
-
     push_cap(&mut caps, CAP_VERSION_8, CAP_FLAG_THIN_CLIENT);
     push_cap(
         &mut caps,
@@ -1262,7 +1551,9 @@ pub fn build_caps_advertise() -> Vec<u8> {
         CAP_FLAG_SMALL_CACHE | CAP_FLAG_AVC420_ENABLED,
     );
     push_cap(&mut caps, CAP_VERSION_10, CAP_FLAG_SMALL_CACHE);
-    push_cap16(&mut caps, CAP_VERSION_101);
+    caps.extend_from_slice(&CAP_VERSION_101.to_le_bytes());
+    caps.extend_from_slice(&16u32.to_le_bytes());
+    caps.extend_from_slice(&[0u8; 16]);
     push_cap(&mut caps, CAP_VERSION_102, CAP_FLAG_SMALL_CACHE);
     push_cap(&mut caps, CAP_VERSION_103, 0);
     push_cap(&mut caps, CAP_VERSION_104, CAP_FLAG_SMALL_CACHE);
