@@ -5,6 +5,8 @@ use crate::protocol::zgfx::ZgfxContext;
 /// Receives raw RDPGFX payload bytes (already ZGFX-decompressed),
 /// dispatches PDU commands, and returns decoded bitmap tiles.
 use std::collections::HashMap;
+#[cfg(feature = "h264")]
+use std::collections::VecDeque;
 
 // ── RDPGFX command IDs ────────────────────────────────────────────────────────
 const CMDID_WIRE_TO_SURFACE_1: u16 = 0x0001;
@@ -83,12 +85,13 @@ pub struct RdpgfxHandler {
     /// Set when the H264 decoder is waiting for a keyframe (IDR) after failures.
     /// Signals to the caller that a force-refresh (suppress→allow) should be sent.
     needs_force_refresh: bool,
-    /// Dirty regions accumulated while the H264 decoder returns EAGAIN (multi-slice
-    /// or pipeline-delayed frames).  When the frame finally drains and a pipeline
-    /// mismatch is detected, we blit with the union of these accumulated regions
-    /// rather than with the final slice's (tiny) region or a full-frame blit.
+    /// FIFO queue of dirty regions, one entry pushed per H.264 packet sent to the
+    /// decoder.  Because FFmpeg's frame-threading pipeline buffers N frames before
+    /// outputting (EAGAIN), we must pair each decoded frame with the dirty regions
+    /// of the *original* packet — not the *current* one.  Pushing before sending
+    /// and popping on each successful decode keeps content and regions in sync.
     #[cfg(feature = "h264")]
-    pending_avc_regions: Vec<AvcRect>,
+    pending_avc_regions_queue: VecDeque<Vec<AvcRect>>,
     #[cfg(feature = "h264")]
     h264_dec: Option<crate::h264::H264Decoder>,
 }
@@ -113,7 +116,7 @@ impl RdpgfxHandler {
             last_reset_size: None,
             needs_force_refresh: false,
             #[cfg(feature = "h264")]
-            pending_avc_regions: Vec::new(),
+            pending_avc_regions_queue: VecDeque::new(),
             #[cfg(feature = "h264")]
             h264_dec,
         }
@@ -474,13 +477,12 @@ impl RdpgfxHandler {
                         abs_x,
                         abs_y,
                         false,
-                        false,
                         &regions,
                     );
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
-                if let Some((pixels, fw, fh, regions, force_regions, skip_stale_full_frame)) =
+                if let Some((pixels, fw, fh, regions, force_regions)) =
                     self.decode_avc444(bmp_data)
                 {
                     let (fw, fh) = (fw as i32, fh as i32);
@@ -503,7 +505,6 @@ impl RdpgfxHandler {
                         abs_x,
                         abs_y,
                         force_regions,
-                        skip_stale_full_frame,
                         &regions,
                     );
                 }
@@ -611,13 +612,12 @@ impl RdpgfxHandler {
                         abs_x,
                         abs_y,
                         false,
-                        false,
                         &regions,
                     );
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
-                if let Some((pixels, fw, fh, regions, force_regions, skip_stale_full_frame)) =
+                if let Some((pixels, fw, fh, regions, force_regions)) =
                     self.decode_avc444(bmp_data)
                 {
                     let (fw, fh) = (fw as i32, fh as i32);
@@ -640,7 +640,6 @@ impl RdpgfxHandler {
                         abs_x,
                         abs_y,
                         force_regions,
-                        skip_stale_full_frame,
                         &regions,
                     );
                 }
@@ -848,7 +847,7 @@ impl RdpgfxHandler {
     fn decode_avc444(
         &mut self,
         data: &[u8],
-    ) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>, bool, bool)> {
+    ) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>, bool)> {
         let (stream, lc) = parse_avc444(data)?;
         #[cfg(debug_assertions)]
         eprintln!(
@@ -856,112 +855,84 @@ impl RdpgfxHandler {
             lc,
             stream.h264_data.len()
         );
-        let h264_len = stream.h264_data.len();
-        let has_keyframe_params = h264_has_idr_or_sps(&stream.h264_data);
         let regions = stream.regions;
+
+        // Push the current packet's dirty regions into the FIFO *before* sending
+        // the packet to the decoder.  The FFmpeg frame-threading pipeline may buffer
+        // multiple frames (returning EAGAIN for each) before producing output.  When
+        // frame K finally drains, we need the dirty regions of packet K — not the
+        // current (newer) packet's regions.  Maintaining a FIFO of per-packet regions
+        // and popping the front on each successful decode preserves the mapping.
+        #[cfg(feature = "h264")]
+        self.pending_avc_regions_queue.push_back(regions.clone());
+
         let result = self.decode_h264(&stream.h264_data);
+
+        // If the decoder flushed its internal buffers during this decode call
+        // (avcodec_flush_buffers was called), all previously buffered frames were
+        // discarded.  Clear the FIFO so the stale entries (from packets whose frames
+        // were flushed away) are not used.  Then re-push the current packet's regions
+        // so they are available when the packet's frame eventually drains.
+        #[cfg(feature = "h264")]
+        {
+            let flushed = if let Some(ref mut dec) = self.h264_dec {
+                dec.take_decoder_flushed()
+            } else {
+                false
+            };
+            if flushed {
+                let queue_len_before = self.pending_avc_regions_queue.len();
+                self.pending_avc_regions_queue.clear();
+                self.pending_avc_regions_queue.push_back(regions.clone());
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[rdpgfx] decode_avc444: decoder flushed during decode — cleared FIFO (had {} entries), re-pushed current regions",
+                    queue_len_before
+                );
+            }
+        }
+
         let is_mismatch = self.h264_dec_take_full_blit();
+
         #[cfg(debug_assertions)]
         if result.is_none() {
+            #[cfg(feature = "h264")]
             eprintln!(
-                "[rdpgfx] decode_avc444: decode_h264 returned None (lc={} h264_len={} regions={} pending_before={} mismatch_flag={})",
+                "[rdpgfx] decode_avc444: EAGAIN (lc={} h264_len={} regions={} fifo_depth={} mismatch_flag={})",
                 lc,
                 stream.h264_data.len(),
                 regions.len(),
-                self.pending_avc_regions.len(),
+                self.pending_avc_regions_queue.len(),
                 is_mismatch
             );
         }
 
-        // Pipeline-mismatch / region-accumulation logic:
-        //
-        // When the decoder returns EAGAIN (None), the dirty regions for this packet
-        // describe pixels that belong to the frame being assembled but aren't output
-        // yet.  Accumulate them so that when the frame finally drains we blit the
-        // union of ALL slices' dirty regions, not just the final slice's region.
-        //
-        // When the decoder outputs a frame AND a mismatch was detected (full_blit flag
-        // set by h264_helper.c), use the accumulated union + current regions as the
-        // effective blit region.  This correctly covers the entire scene-change area
-        // without full-frame blitting (which would write stale DPB content in
-        // non-dirty areas, producing the observed black-corner / distortion artifact).
-        //
-        // For all other frames (no mismatch) the accumulated list is empty and we
-        // just use the current packet's regions normally.
-        #[cfg(feature = "h264")]
+        // On EAGAIN (no frame output), keep the FIFO entry we just pushed and
+        // return None.  The blit is skipped; the display shows the previous frame.
         if result.is_none() {
-            // Decoder not ready yet — save this packet's dirty regions.
-            if !is_mismatch {
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[rdpgfx] decode_avc444: accumulate pending regions add={} pending_before={} bounds={:?}",
-                    regions.len(),
-                    self.pending_avc_regions.len(),
-                    avc_regions_bounds(&regions)
-                );
-                self.pending_avc_regions.extend(regions);
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[rdpgfx] decode_avc444: pending regions now={} area={} bounds={:?}",
-                    self.pending_avc_regions.len(),
-                    avc_regions_area(&self.pending_avc_regions),
-                    avc_regions_bounds(&self.pending_avc_regions)
-                );
-            }
-            // If the decoder entered keyframe-wait state, clear any stale accumulation.
-            if let Some(ref dec) = self.h264_dec {
-                if dec.needs_keyframe() {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[rdpgfx] decode_avc444: decoder needs keyframe; clearing {} pending regions",
-                        self.pending_avc_regions.len()
-                    );
-                    self.pending_avc_regions.clear();
-                }
-            }
             return None;
         }
 
+        // A frame decoded successfully.  Pop the oldest FIFO entry: it corresponds
+        // to the packet whose frame just drained (due to the FIFO-order guarantee).
+        // In the normal (no-delay) case this is the entry we just pushed; in the
+        // pipeline-delay case it is older, but the oldest buffered packet is always
+        // first to drain.
         #[cfg(feature = "h264")]
-        let effective_regions = if is_mismatch {
-            // Mismatch: blit the union of all accumulated EAGAIN-packet regions
-            // plus this (final) packet's regions.
-            let mut combined = std::mem::take(&mut self.pending_avc_regions);
-            combined.extend(regions);
+        let effective_regions = {
+            let popped = self.pending_avc_regions_queue.pop_front();
             #[cfg(debug_assertions)]
             eprintln!(
-                "[rdpgfx] decode_avc444: mismatch — using {} accumulated+current regions area={} bounds={:?}",
-                combined.len(),
-                avc_regions_area(&combined),
-                avc_regions_bounds(&combined)
+                "[rdpgfx] decode_avc444: frame decoded — fifo_depth_after={} used_regions={:?}",
+                self.pending_avc_regions_queue.len(),
+                popped.as_ref().map(|r| r.len())
             );
-            combined
-        } else {
-            // Normal decode: just use the current packet's regions.
-            #[cfg(feature = "h264")]
-            self.pending_avc_regions.clear();
-            regions
+            popped.unwrap_or(regions)
         };
         #[cfg(not(feature = "h264"))]
         let effective_regions = regions;
 
-        // AVC444 auxiliary stream handling is incomplete (LC=0 stream2 / LC=2 are
-        // skipped).  In that state the server can send very small full-screen
-        // P-frames whose decoded frame still contains stale reference content.
-        // Dropping only those tiny non-keyframe full-screen candidates preserves
-        // the last correct surface instead of repainting the previous desktop.
-        let skip_stale_full_frame = !is_mismatch && !has_keyframe_params && h264_len <= 1024;
-
-        result.map(|(pixels, w, h)| {
-            (
-                pixels,
-                w,
-                h,
-                effective_regions,
-                is_mismatch,
-                skip_stale_full_frame,
-            )
-        })
+        result.map(|(pixels, w, h)| (pixels, w, h, effective_regions, is_mismatch))
     }
 
     #[allow(dead_code)]
@@ -1047,46 +1018,6 @@ fn should_use_avc_regions(regions: &[AvcRect], frame_w: i32, frame_h: i32) -> bo
     has_region
 }
 
-fn has_full_frame_region(regions: &[AvcRect], frame_w: i32, frame_h: i32) -> bool {
-    regions.iter().any(|rc| {
-        rc.right > rc.left
-            && rc.bottom > rc.top
-            && rc.left == 0
-            && rc.top == 0
-            && rc.right as i32 >= frame_w
-            && rc.bottom as i32 >= frame_h
-    })
-}
-
-fn h264_has_idr_or_sps(data: &[u8]) -> bool {
-    let mut i = 0usize;
-    while i + 3 < data.len() {
-        let sc_len = if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            3
-        } else if i + 4 < data.len()
-            && data[i] == 0
-            && data[i + 1] == 0
-            && data[i + 2] == 0
-            && data[i + 3] == 1
-        {
-            4
-        } else {
-            i += 1;
-            continue;
-        };
-
-        let nal_start = i + sc_len;
-        if nal_start < data.len() {
-            let nal_type = data[nal_start] & 0x1F;
-            if nal_type == 5 || nal_type == 7 {
-                return true;
-            }
-        }
-        i += sc_len;
-    }
-    false
-}
-
 fn avc_regions_area(regions: &[AvcRect]) -> i32 {
     let mut sum = 0i32;
     for rc in regions {
@@ -1144,7 +1075,6 @@ fn blit_avc_frame(
     ax: i32,
     ay: i32, // absolute screen position
     force_regions: bool,
-    skip_stale_full_frame: bool,
     regions: &[AvcRect],
 ) {
     if force_regions && !regions.is_empty() {
@@ -1174,25 +1104,6 @@ fn blit_avc_frame(
     if should_use_avc_regions(regions, ew, eh) {
         blit_avc_regions(
             surf_id, surfaces, bitmaps, pixels, fw, fh, ew, eh, dx, dy, ax, ay, regions,
-        );
-        return;
-    }
-
-    if skip_stale_full_frame && has_full_frame_region(regions, ew, eh) {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[rdpgfx] drop suspicious AVC full surf={} surface=({},{} {}x{}) abs=({},{}) frame={}x{} regions={} bounds={:?}",
-            surf_id,
-            dx,
-            dy,
-            ew,
-            eh,
-            ax,
-            ay,
-            fw,
-            fh,
-            regions.len(),
-            avc_regions_bounds(regions)
         );
         return;
     }

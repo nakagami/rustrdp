@@ -17,10 +17,8 @@ typedef struct RdpH264Dec {
     int                  seen_idr5;      /* suppress output until first true IDR (NAL type 5) */
     int                  bright_frame_seen; /* suppress until first non-trivially-dark frame */
     int                  just_flushed;   /* set after pre-IDR flush; cleared on first drain */
+    int                  decoder_flushed; /* set whenever avcodec_flush_buffers is called; taken by caller to reset region FIFO */
     int                  log_frames_left;
-    int                  prev_eagain;    /* set when last packet produced EAGAIN (drain=0) */
-    int                  eagain_run;     /* consecutive EAGAIN count before most recent drain */
-    int                  full_blit_needed; /* set when pipeline mismatch detected; caller should use accumulated dirty regions */
 } RdpH264Dec;
 
 RdpH264Dec* rdp_h264_new(void) {
@@ -33,20 +31,11 @@ RdpH264Dec* rdp_h264_new(void) {
     d->ctx = avcodec_alloc_context3(d->codec);
     if (!d->ctx) { free(d); return NULL; }
 
-    /* Low-delay: RDP H.264 is in display order, no B-frame reordering needed */
+    /* Low-delay: RDP H.264 is in display order, no B-frame reordering needed.
+     * AV_CODEC_FLAG2_FAST matches grdp's decoder flags and reduces internal
+     * decoder latency by disabling optional in-loop processing overhead. */
     d->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
-    /* AV_CODEC_FLAG2_FAST intentionally omitted: it disables the H.264
-     * in-loop deblocking filter.  The server encoder uses deblocked frames
-     * as its DPB references, so our decoder must also apply deblocking to
-     * keep the two DPBs in sync.  Without it, skip-coded P-frames reference
-     * a stale (non-deblocked) frame and produce near-black garbled output. */
-    /* Disable frame-level threading to prevent 1-frame output delay.
-     * With frame threading, avcodec_receive_frame returns EAGAIN while
-     * the frame is decoded in a background thread.  Our EAGAIN-on-send
-     * handler discards the buffered frame, causing perpetual lag.
-     * thread_count=1 keeps slice threading (intra-frame parallelism) but
-     * eliminates the inter-frame pipeline delay. */
-    d->ctx->thread_count = 1;
+    d->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
     if (avcodec_open2(d->ctx, d->codec, NULL) < 0) {
         avcodec_free_context(&d->ctx);
@@ -149,7 +138,7 @@ static void nv12_to_bgra(const AVFrame *src, uint8_t *dst, int dst_stride, int f
 /* Reset codec context by freeing and reallocating with same parameters. */
 static int codec_hard_reset(RdpH264Dec *d)
 {
-    fprintf(stderr, "[h264] codec hard reset: reallocate context, low_delay=1 fast=0\n");
+    fprintf(stderr, "[h264] codec hard reset: reallocate context, low_delay=1 fast=1\n");
     avcodec_free_context(&d->ctx);
     if (d->sws) { sws_freeContext(d->sws); d->sws = NULL; }
     d->last_width  = 0;
@@ -159,7 +148,7 @@ static int codec_hard_reset(RdpH264Dec *d)
     if (!d->ctx) return -1;
 
     d->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
-    d->ctx->thread_count = 1;
+    d->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
     d->last_pix_fmt = AV_PIX_FMT_NONE;
     return avcodec_open2(d->ctx, d->codec, NULL);
@@ -302,6 +291,7 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     if (idr) {
         fprintf(stderr, "[h264] pre-IDR/SPS flush: len=%d idr5=%d sps7=%d\n", len, idr5, sps7);
         avcodec_flush_buffers(d->ctx);
+        d->decoder_flushed   = 1;
         d->just_flushed      = 1;
         d->log_frames_left   = 8;  /* re-enable per-frame luma logging after each IDR */
     }
@@ -373,6 +363,7 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
                 errbuf, len, has_idr(data, len));
         avcodec_flush_buffers(d->ctx);
         d->needs_keyframe    = 1;
+        d->decoder_flushed   = 1;
         d->seen_idr5         = 0;
         d->bright_frame_seen = 0;
         d->just_flushed      = 0;
@@ -394,43 +385,13 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     }
 
     if (drain_count == 0) {
-        /* SW decoder returned EAGAIN despite LOW_DELAY — the decoder has a
-         * one-frame internal delay for this packet.  Track this so the next
-         * call can detect a dirty-region mismatch. */
+        /* SW decoder returned EAGAIN: the frame is buffered internally.
+         * Return NULL so the Rust layer skips the blit and shows the last
+         * good frame instead.  No region accumulation — grdp handles EAGAIN
+         * the same way (returns nil, no dirty-region bookkeeping). */
         fprintf(stderr, "[h264] decoder EAGAIN (drain=0, len=%d idr=%d)\n", len, idr);
-        d->prev_eagain = 1;
-        d->eagain_run++;
         return NULL;
     }
-
-    /* Pipeline-mismatch detection.
-     *
-     * When the SW decoder has an internal pipeline delay (consecutive EAGAIN
-     * returns from multi-slice frames), the frame that finally drains covers
-     * the area described by ALL the earlier EAGAIN packets' dirty regions,
-     * not just the current packet's region.
-     *
-     * Signal full_blit_needed so the Rust layer uses its accumulated dirty
-     * region union (collected across all EAGAIN packets) for this blit.
-     *
-     * Exception: just_flushed=1 means a pre-IDR flush caused the EAGAIN; that
-     * is an expected one-frame lag handled separately below.
-     *
-     * Note: we do NOT signal full_blit_needed for the subsequent P-frames that
-     * follow the mismatch frame — those frames have their own correct dirty
-     * regions and correct decoded content. Forcing a full-blit on them would
-     * write stale DPB content (black corners / old desktop) outside the dirty
-     * region, causing the observed distortion. */
-    int was_mismatch = (d->prev_eagain && drain_count == 1 && !d->just_flushed);
-
-    if (was_mismatch) {
-        fprintf(stderr, "[h264] pipeline mismatch (prev EAGAIN + drain=1, len=%d eagain_run=%d drain=%d): use accumulated regions\n",
-                len, d->eagain_run, drain_count);
-        d->full_blit_needed = 1;
-        d->log_frames_left = 8;
-    }
-    d->prev_eagain = 0;
-    d->eagain_run  = 0;
 
     /* Stale-output detection: drain_count > 1 means the SW decoder output
      * multiple buffered frames in one call.
@@ -440,20 +401,18 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
      * the next packet arrives.  The last drained frame is the correct one to
      * display; keep it and clear just_flushed.
      *
-     * Also exempt: was_mismatch — we are already at the first drain after a
-     * pipeline delay; multi-drain is not unexpected here.
-     *
      * Otherwise drain_count > 1 is a genuine pipeline stall: the pixels belong
      * to an earlier frame and would be blitted with the CURRENT packet's dirty
      * regions, causing corruption.  Discard the output and request a fresh IDR. */
     if (drain_count > 1) {
-        if (d->just_flushed || was_mismatch) {
-            fprintf(stderr, "[h264] post-flush/mismatch drain=%d, showing last frame\n", drain_count);
+        if (d->just_flushed) {
+            fprintf(stderr, "[h264] post-flush drain=%d, showing last frame\n", drain_count);
             d->just_flushed = 0;
         } else {
             fprintf(stderr, "[h264] stale-output: drained %d frames at once, flushing and requesting IDR\n", drain_count);
             avcodec_flush_buffers(d->ctx);
             d->needs_keyframe    = 1;
+            d->decoder_flushed   = 1;
             d->seen_idr5         = 0;
             d->bright_frame_seen = 0;
             d->just_flushed      = 0;
@@ -489,6 +448,7 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
             last_pict_type == AV_PICTURE_TYPE_I) {
         fprintf(stderr, "[h264] non-IDR I-frame (len=%d): flush DPB + re-decode\n", len);
         avcodec_flush_buffers(d->ctx);
+        d->decoder_flushed = 1;
         d->log_frames_left = 8;
         d->pkt->data = (uint8_t*)(uintptr_t)data;
         d->pkt->size = len;
@@ -572,10 +532,20 @@ int rdp_h264_needs_keyframe(RdpH264Dec *d) {
 }
 
 /* Returns 1 if the last decoded frame must be blitted to the full surface
- * (ignoring AVC dirty regions) due to a pipeline mismatch.  Clears the flag. */
+ * (ignoring AVC dirty regions) due to a pipeline mismatch.  Always returns 0
+ * now that EAGAIN is handled by discarding (no accumulation). */
 int rdp_h264_take_full_blit(RdpH264Dec *d) {
+    (void)d;
+    return 0;
+}
+
+/* Returns 1 (and clears the flag) if avcodec_flush_buffers was called during
+ * the last rdp_h264_decode() call.  The Rust caller uses this to discard its
+ * region FIFO so that stale dirty-region entries don't get paired with frames
+ * that no longer correspond to them. */
+int rdp_h264_take_decoder_flushed(RdpH264Dec *d) {
     if (!d) return 0;
-    int v = d->full_blit_needed;
-    d->full_blit_needed = 0;
+    int v = d->decoder_flushed;
+    d->decoder_flushed = 0;
     return v;
 }

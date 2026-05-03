@@ -22,6 +22,7 @@ mod ffi {
         pub fn rdp_h264_free_buf(buf: *mut c_uchar);
         pub fn rdp_h264_needs_keyframe(d: *mut RdpH264Dec) -> c_int;
         pub fn rdp_h264_take_full_blit(d: *mut RdpH264Dec) -> c_int;
+        pub fn rdp_h264_take_decoder_flushed(d: *mut RdpH264Dec) -> c_int;
     }
 }
 
@@ -75,6 +76,13 @@ impl H264Decoder {
     /// This happens when a pipeline mismatch is detected (EAGAIN → drain).
     pub fn take_full_blit(&mut self) -> bool {
         unsafe { ffi::rdp_h264_take_full_blit(self.ptr) != 0 }
+    }
+
+    /// Returns true (and clears the flag) if `avcodec_flush_buffers` was called
+    /// during the last `decode()` call.  The Rust caller uses this to discard
+    /// its region FIFO so that stale entries are not paired with new frames.
+    pub fn take_decoder_flushed(&mut self) -> bool {
+        unsafe { ffi::rdp_h264_take_decoder_flushed(self.ptr) != 0 }
     }
 }
 
