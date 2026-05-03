@@ -75,6 +75,12 @@ pub struct RdpSession<T: Transport> {
     /// Timestamp of the last force-refresh (suppress→allow) sent to the server.
     /// Used to rate-limit keyframe requests to at most once every 2 seconds.
     last_force_refresh: Option<std::time::Instant>,
+    /// Frame IDs that still need acknowledgment. When recv_event() is cancelled by an
+    /// external timeout (e.g. tokio::time::timeout) between recv_data() returning and
+    /// send_frame_acknowledge() completing, these IDs are preserved here so the next
+    /// recv_event() call sends them before waiting for new data. Without this, unacknowledged
+    /// frames cause the server to stop sending display updates (RDPGFX backpressure).
+    pending_acks: std::collections::VecDeque<u32>,
 }
 
 impl<T: Transport> RdpSession<T> {
@@ -233,6 +239,7 @@ impl<T: Transport> RdpSession<T> {
             drdynvc_frag_total: 0,
             pending_audio: std::collections::VecDeque::new(),
             last_force_refresh: None,
+            pending_acks: std::collections::VecDeque::new(),
         };
 
         // Steps 10-12: Confirm Active, sync sequence, wait for FontMap
@@ -412,6 +419,16 @@ impl<T: Transport> RdpSession<T> {
     /// Receive the next display event from the server.
     pub async fn recv_event(&mut self) -> Result<RdpEvent, RdpError> {
         log::debug!("[recv_event] entering");
+
+        // Flush any frame ACKs that were not sent because the previous recv_event()
+        // call was cancelled by an external timeout (e.g. tokio::time::timeout) between
+        // recv_data() returning and send_frame_acknowledge() completing.
+        // Without this, the server stops sending display updates after a few missed ACKs.
+        while let Some(frame_id) = self.pending_acks.pop_front() {
+            log::debug!("[recv_event] sending deferred frame ack frame_id={}", frame_id);
+            self.send_frame_acknowledge(frame_id).await?;
+        }
+
         loop {
             // Deliver any pending audio events before waiting for more data
             if let Some(ev) = self.pending_audio.pop_front() {
@@ -433,7 +450,11 @@ impl<T: Transport> RdpSession<T> {
                 // FastPath update
                 log::debug!("[recv_event] FastPath data_len={}", data.len());
                 let result = parse_fastpath_updates(&data, &mut self.frag_buf);
-                for frame_id in result.frame_ids {
+                // Queue ACKs first so they survive cancellation, then send them.
+                // If cancelled mid-send, the remaining IDs stay in pending_acks and
+                // will be sent at the start of the next recv_event() call.
+                self.pending_acks.extend(result.frame_ids.iter().copied());
+                while let Some(frame_id) = self.pending_acks.pop_front() {
                     self.send_frame_acknowledge(frame_id).await?;
                 }
                 let bitmaps = result.bitmaps;
