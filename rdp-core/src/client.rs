@@ -460,6 +460,9 @@ impl<T: Transport> RdpSession<T> {
                 let bitmaps = result.bitmaps;
                 log::debug!("[recv_event] FastPath bitmaps={}", bitmaps.len());
                 if !bitmaps.is_empty() {
+                    if bitmaps_contain_large_refresh(&bitmaps) {
+                        self.drdynvc_handler.signal_screen_refreshed();
+                    }
                     return Ok(RdpEvent::Bitmap(bitmaps));
                 }
                 continue;
@@ -558,6 +561,9 @@ impl<T: Transport> RdpSession<T> {
                             let bitmaps = parse_bitmap_update(&data, &mut pos);
                             log::debug!("[recv_event] slow-path bitmaps={}", bitmaps.len());
                             if !bitmaps.is_empty() {
+                                if bitmaps_contain_large_refresh(&bitmaps) {
+                                    self.drdynvc_handler.signal_screen_refreshed();
+                                }
                                 return Ok(RdpEvent::Bitmap(bitmaps));
                             }
                         }
@@ -1283,4 +1289,13 @@ fn nrle_decode(input: &[u8], original_size: usize) -> Vec<u8> {
 
 fn clamp_i16_to_u8(v: i16) -> u8 {
     v.clamp(0, 255) as u8
+}
+
+/// Returns true if any bitmap in the slice is "large" (area > 300 000 pixels,
+/// roughly anything bigger than VGA / 640×480).  Used to detect a full-screen
+/// raw Bitmap Update that the server sends in response to a SuppressOutput
+/// force-refresh PDU, so we can flush the stale AVC pipeline/FIFO before those
+/// stale frames overwrite the freshly refreshed pixels.
+fn bitmaps_contain_large_refresh(bitmaps: &[crate::bitmap::Bitmap]) -> bool {
+    bitmaps.iter().any(|b| (b.width as i64) * (b.height as i64) > 300_000)
 }

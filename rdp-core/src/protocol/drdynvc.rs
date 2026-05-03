@@ -106,6 +106,19 @@ impl DrdynvcHandler {
         (bitmaps, outgoing, audio, force_refresh, reset_size)
     }
 
+    /// Called when a large/full-screen raw Bitmap Update arrives, indicating
+    /// the server responded to a SuppressOutput force-refresh PDU.  Passes
+    /// the signal through to the active RDPGFX channel so it can flush the
+    /// stale AVC pipeline and region FIFO before those stale frames overwrite
+    /// the freshly refreshed pixels.
+    pub fn signal_screen_refreshed(&mut self) {
+        for channel in self.channels.values_mut() {
+            if let DvcChannel::Gfx(gfx) = channel {
+                gfx.signal_screen_refreshed();
+            }
+        }
+    }
+
     // ── CAPABILITIES ──────────────────────────────────────────────────────────
 
     fn handle_capabilities(&mut self, data: &[u8], out: &mut Vec<Vec<u8>>) {

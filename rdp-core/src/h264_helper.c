@@ -772,3 +772,26 @@ int rdp_h264_take_drain_happened(RdpH264Dec *d) {
     d->drain_happened = 0;
     return v;
 }
+
+/* Called when the RDP server has delivered a full-screen raw bitmap refresh
+ * (typically as a response to a SuppressOutput force-refresh PDU that we sent
+ * while the VideoToolbox pipeline was elevated at depth > 0).
+ *
+ * We flush the FFmpeg/VideoToolbox pipeline to discard the N stale buffered
+ * frames that would otherwise be drained and blitted over the freshly
+ * refreshed bitmap pixels.  decoder_flushed=1 signals the Rust layer to also
+ * clear its region FIFO.  We then wait for an IDR before resuming.
+ *
+ * This is a no-op when pipeline_elevated=0 (depth=0, no stale frames). */
+void rdp_h264_signal_screen_refreshed(RdpH264Dec *d) {
+    if (!d || !d->ctx || !d->pipeline_elevated) return;
+    fprintf(stderr, "[h264] signal_screen_refreshed: flushing %d-deep pipeline, waiting for IDR\n",
+            d->hw_eagain_count > 0 ? d->hw_eagain_count : 5);
+    avcodec_flush_buffers(d->ctx);
+    d->decoder_flushed   = 1;
+    d->just_flushed      = 0;
+    d->needs_keyframe    = 1;
+    d->request_refresh   = 0;
+    d->pipeline_elevated = 0;
+    d->hw_eagain_count   = 0;
+}

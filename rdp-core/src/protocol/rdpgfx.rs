@@ -149,6 +149,32 @@ impl RdpgfxHandler {
         vec![build_caps_advertise()]
     }
 
+    /// Called when the server sent a large/full-screen raw Bitmap Update in
+    /// response to a SuppressOutput force-refresh PDU while the VideoToolbox
+    /// pipeline was elevated (depth > 0).  Flushes the H.264 decoder pipeline
+    /// and the region FIFO so stale frames do not overwrite the refreshed pixels.
+    /// The decoder_flushed flag returned from the next decode() call will be
+    /// true, causing the FIFO to be re-synced when AVC resumes with an IDR.
+    pub fn signal_screen_refreshed(&mut self) {
+        #[cfg(feature = "h264")]
+        {
+            if let Some(dec) = &mut self.h264_dec {
+                dec.signal_screen_refreshed();
+                // If decoder_flushed is now set, clear the FIFO immediately
+                // (no need to wait for the next decode() call).
+                if dec.take_decoder_flushed() {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[rdpgfx] signal_screen_refreshed: cleared FIFO (had {} entries)",
+                        self.pending_avc_regions_queue.len()
+                    );
+                    self.pending_avc_regions_queue.clear();
+                    self.needs_force_refresh = false;
+                }
+            }
+        }
+    }
+
     // ── PDU dispatcher ─────────────────────────────────────────────────────────
 
     fn dispatch_pdus(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>) {

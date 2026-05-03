@@ -24,6 +24,7 @@ mod ffi {
         pub fn rdp_h264_take_full_blit(d: *mut RdpH264Dec) -> c_int;
         pub fn rdp_h264_take_decoder_flushed(d: *mut RdpH264Dec) -> c_int;
         pub fn rdp_h264_take_drain_happened(d: *mut RdpH264Dec) -> c_int;
+        pub fn rdp_h264_signal_screen_refreshed(d: *mut RdpH264Dec);
     }
 }
 
@@ -93,6 +94,15 @@ impl H264Decoder {
     /// regardless of whether it was visible, to keep region–frame alignment.
     pub fn take_drain_happened(&mut self) -> bool {
         unsafe { ffi::rdp_h264_take_drain_happened(self.ptr) != 0 }
+    }
+
+    /// Called when the server sent a large/full-screen raw Bitmap Update in
+    /// response to a SuppressOutput force-refresh PDU.  Flushes the
+    /// VideoToolbox/FFmpeg pipeline so the N stale buffered frames do not get
+    /// blitted over the freshly refreshed screen.  Sets `decoder_flushed=1` so
+    /// the Rust FIFO is also cleared.  No-op when pipeline is not elevated.
+    pub fn signal_screen_refreshed(&mut self) {
+        unsafe { ffi::rdp_h264_signal_screen_refreshed(self.ptr) }
     }
 }
 
