@@ -543,6 +543,18 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     if (drain_count == 0) {
         if (d->use_hw) {
             d->hw_eagain_count++;
+            /* First EAGAIN after a stable-zero state: ask the server for a
+             * force-refresh (IDR) as soon as possible.  We do NOT set
+             * needs_keyframe here so P-frames continue to be accepted while
+             * waiting for the IDR (avoids a visible freeze).  When the IDR
+             * arrives the pre-IDR flush will clear the pipeline and the FIFO
+             * depth resets to 0.  This handles the VideoToolbox pipeline
+             * build-up that occurs on the first large scene-change I-frame
+             * (e.g. Chrome tab switch) after a period of zero-latency decoding. */
+            if (d->hw_eagain_count == 1) {
+                fprintf(stderr, "[h264] HW decoder first EAGAIN (len=%d); requesting IDR\n", len);
+                d->request_refresh = 1;
+            }
             if (d->hw_eagain_count >= HW_EAGAIN_RESET_THRESHOLD) {
                 fprintf(stderr,
                         "[h264] HW decoder stalled after %d EAGAIN packets; flush and request IDR\n",
@@ -561,21 +573,15 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
                 d->hw_eagain_count   = 0;
             }
         }
-        /* SW decoder returned EAGAIN: the frame is buffered internally.
+        /* EAGAIN: decoder has buffered this packet but not yet produced output.
          * Return NULL so the Rust layer skips the blit and shows the last
-         * good frame instead.
-         *
-         * Do NOT flush the decoder here.  Flushing on EAGAIN sets
-         * needs_keyframe=1 and the server (gnome-remote-desktop) does not
-         * reliably send a new IDR in response to SuppressOutput force-refresh
-         * requests, causing the screen to freeze indefinitely.
-         *
-         * Leaving the decoder running with a buffered frame means the FIFO
-         * depth stabilises at N (= number of EAGAINs received) and every
-         * subsequent frame is correctly paired with its own regions — just
-         * N frames of display lag.  With thread_count=1 this is typically 2
-         * frames (~67 ms at 30 fps), which is far preferable to a frozen
-         * screen. */
+         * good frame instead.  We do NOT flush here — flushing on EAGAIN would
+         * set needs_keyframe=1, and if the server is slow to respond with an
+         * IDR the screen freezes indefinitely.  The FIFO depth stabilises at
+         * N (number of EAGAINs) and every subsequent frame is paired with its
+         * correct dirty regions, just N frames late.  The request_refresh=1
+         * path above (on first EAGAIN) asks the server for an IDR so the
+         * pipeline resets promptly. */
         fprintf(stderr, "[h264] decoder EAGAIN (drain=0, len=%d idr=%d)\n", len, idr);
         return NULL;
     }
