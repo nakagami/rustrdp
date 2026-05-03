@@ -1292,10 +1292,12 @@ fn clamp_i16_to_u8(v: i16) -> u8 {
 }
 
 /// Returns true if any bitmap in the slice is "large" (area > 300 000 pixels,
-/// roughly anything bigger than VGA / 640×480).  Used to detect a full-screen
-/// raw Bitmap Update that the server sends in response to a SuppressOutput
-/// force-refresh PDU, so we can flush the stale AVC pipeline/FIFO before those
-/// stale frames overwrite the freshly refreshed pixels.
+/// Returns true if any bitmap is large enough to be considered a meaningful
+/// content refresh (as opposed to a small cursor/icon/tooltip update).
+/// The threshold (60 000 px ≈ 245×245) is intentionally low so that
+/// sub-region force-refresh responses (e.g. 416×240 = 99 840 px for a video
+/// area) also flush the stale AVC FIFO.  The C-level guard on
+/// `pipeline_elevated` makes this a no-op when no pipeline stall is active.
 fn bitmaps_contain_large_refresh(bitmaps: &[crate::bitmap::Bitmap]) -> bool {
-    bitmaps.iter().any(|b| (b.width as i64) * (b.height as i64) > 300_000)
+    bitmaps.iter().any(|b| (b.width as i64) * (b.height as i64) > 60_000)
 }
