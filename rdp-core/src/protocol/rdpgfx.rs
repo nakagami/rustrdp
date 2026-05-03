@@ -1155,22 +1155,25 @@ fn blit_avc_frame(
         return;
     }
 
-    if should_use_avc_regions(regions, ew, eh) {
-        blit_avc_regions(
-            surf_id, surfaces, bitmaps, pixels, fw, fh, ew, eh, dx, dy, ax, ay, regions,
+    // Suppress all AVC blits (region and full-frame) when the pipeline is
+    // stale (force-refresh pending).  Even a small dirty-region blit can paint
+    // 6-frames-old dark pixels over areas that a fresh force-refresh bitmap
+    // already corrected, producing black rectangular flicker.
+    // The force_regions path above is exempt: it fixes a decoder/surface size
+    // mismatch and its pixels are always from the current IDR.
+    if suppress_full_frame {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "[rdpgfx] suppress AVC blit (stale pipeline) surf={} surface=({},{} {}x{}) regions={} region_area={} frame_area={}",
+            surf_id, dx, dy, ew, eh,
+            regions.len(), avc_regions_area(regions), ew.saturating_mul(eh)
         );
         return;
     }
 
-    // Full-frame blit: skip when the pipeline is stale (force-refresh pending).
-    // Painting a stale AVC frame over the entire screen would cause a visible
-    // flicker right before the server's fresh bitmap update overwrites it.
-    if suppress_full_frame {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[rdpgfx] suppress AVC full blit (stale pipeline) surf={} surface=({},{} {}x{}) regions={} region_area={} frame_area={}",
-            surf_id, dx, dy, ew, eh,
-            regions.len(), avc_regions_area(regions), ew.saturating_mul(eh)
+    if should_use_avc_regions(regions, ew, eh) {
+        blit_avc_regions(
+            surf_id, surfaces, bitmaps, pixels, fw, fh, ew, eh, dx, dy, ax, ay, regions,
         );
         return;
     }
