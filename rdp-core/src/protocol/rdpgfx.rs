@@ -92,6 +92,14 @@ pub struct RdpgfxHandler {
     /// and popping on each successful decode keeps content and regions in sync.
     #[cfg(feature = "h264")]
     pending_avc_regions_queue: VecDeque<Vec<AvcRect>>,
+    /// True when the FIFO still has entries after the most recent successful AVC
+    /// drain — i.e. the decoded frame's regions are stale (from an earlier packet).
+    /// More precise than `needs_force_refresh`: becomes false as soon as the
+    /// VideoToolbox pipeline drains (FIFO depth reaches 0), so AVC blits resume
+    /// immediately after the IDR flush, rather than waiting for the next
+    /// force-refresh cycle.
+    #[cfg(feature = "h264")]
+    avc_pipeline_stale: bool,
     #[cfg(feature = "h264")]
     h264_dec: Option<crate::h264::H264Decoder>,
 }
@@ -117,6 +125,8 @@ impl RdpgfxHandler {
             needs_force_refresh: false,
             #[cfg(feature = "h264")]
             pending_avc_regions_queue: VecDeque::new(),
+            #[cfg(feature = "h264")]
+            avc_pipeline_stale: false,
             #[cfg(feature = "h264")]
             h264_dec,
         }
@@ -517,7 +527,7 @@ impl RdpgfxHandler {
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!("[rdpgfx] AVC444 decoded {}x{} → blit {}x{} regions={} at ({},{}) abs=({},{}) mapped={}",
                         fw, fh, ew, eh, regions.len(), dest_left, dest_top, abs_x, abs_y, mapped);
-                    let suppress_full = self.needs_force_refresh;
+                    let suppress_full = self.avc_pipeline_stale;
                     let mut discard = Vec::new();
                     let out = if mapped { bitmaps } else { &mut discard };
                     blit_avc_frame(
@@ -656,7 +666,7 @@ impl RdpgfxHandler {
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!("[rdpgfx] WTS2 AVC444 decoded {}x{} → blit {}x{} regions={} abs=({},{}) mapped={}",
                         fw, fh, ew, eh, regions.len(), abs_x, abs_y, mapped);
-                    let suppress_full = self.needs_force_refresh;
+                    let suppress_full = self.avc_pipeline_stale;
                     let mut discard = Vec::new();
                     let out = if mapped { bitmaps } else { &mut discard };
                     blit_avc_frame(
@@ -942,10 +952,14 @@ impl RdpgfxHandler {
         #[cfg(feature = "h264")]
         let effective_regions = if drain_happened {
             let popped = self.pending_avc_regions_queue.pop_front();
+            // Update stale flag: if FIFO still has entries after pop, the frame
+            // we just decoded corresponds to a packet submitted N frames ago.
+            self.avc_pipeline_stale = !self.pending_avc_regions_queue.is_empty();
             #[cfg(debug_assertions)]
             eprintln!(
-                "[rdpgfx] decode_avc444: drain_happened — fifo_depth_after={} used_regions={:?} result={}",
+                "[rdpgfx] decode_avc444: drain_happened — fifo_depth_after={} stale={} used_regions={:?} result={}",
                 self.pending_avc_regions_queue.len(),
+                self.avc_pipeline_stale,
                 popped.as_ref().map(|r| r.len()),
                 if result.is_some() { "frame" } else { "suppressed" }
             );
