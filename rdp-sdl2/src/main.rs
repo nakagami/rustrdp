@@ -64,9 +64,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Main loop
     while running {
-        // Handle SDL2 events (limit iterations to avoid starving recv_event)
+        // Handle SDL2 events. Following grdpsdl2 (Go) pattern: process all pending events,
+        // then handle RDP updates. However, unlike Go's WaitEventTimeout which blocks, we use
+        // poll_iter() which returns immediately. To prevent starving recv_event(), we limit
+        // event iterations per frame and always reach the recv_event timeout check.
         let mut event_count = 0;
-        const MAX_EVENTS_PER_FRAME: usize = 100;
+        const MAX_EVENTS_PER_FRAME: usize = 50;  // Typically <10 events per frame; 50 is generous
         for event in event_pump.poll_iter() {
             if event_count >= MAX_EVENTS_PER_FRAME {
                 break;
