@@ -64,8 +64,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Main loop
     while running {
-        // Handle SDL2 events
+        // Handle SDL2 events (limit iterations to avoid starving recv_event)
+        let mut event_count = 0;
+        const MAX_EVENTS_PER_FRAME: usize = 100;
         for event in event_pump.poll_iter() {
+            if event_count >= MAX_EVENTS_PER_FRAME {
+                break;
+            }
+            event_count += 1;
             match event {
                 Event::Quit { .. } => {
                     running = false;
