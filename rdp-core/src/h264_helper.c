@@ -1,6 +1,8 @@
 #include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,11 +10,14 @@ typedef struct RdpH264Dec {
     const AVCodec       *codec;
     AVCodecContext      *ctx;
     AVFrame             *frame;
+    AVFrame             *sw_frame;
     AVPacket            *pkt;
     struct SwsContext   *sws;
     int                  last_width;
     int                  last_height;
     enum AVPixelFormat   last_pix_fmt;  /* track format changes for sws invalidation */
+    enum AVPixelFormat   hw_pix_fmt;
+    int                  use_hw;
     int                  needs_keyframe; /* drop P-frames until next IDR/SPS */
     int                  seen_idr5;      /* suppress output until first true IDR (NAL type 5) */
     int                  bright_frame_seen; /* suppress until first non-trivially-dark frame */
@@ -21,6 +26,73 @@ typedef struct RdpH264Dec {
     int                  drain_happened;  /* set when drain_count>=1 (frame decoded, possibly suppressed); taken by caller to sync region FIFO */
     int                  log_frames_left;
 } RdpH264Dec;
+
+static enum AVPixelFormat rdp_get_hw_format(
+    AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts)
+{
+    enum AVPixelFormat hw_fmt = (enum AVPixelFormat)(intptr_t)ctx->opaque;
+    if (hw_fmt == AV_PIX_FMT_NONE) return pix_fmts[0];
+    for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        if (*p == hw_fmt) return *p;
+    }
+    return pix_fmts[0];
+}
+
+static void configure_codec_context(RdpH264Dec *d, int enable_hw)
+{
+    d->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
+    d->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+    d->ctx->thread_count = 1;
+
+    d->use_hw = 0;
+    d->hw_pix_fmt = AV_PIX_FMT_NONE;
+
+    if (!enable_hw) return;
+
+    enum AVHWDeviceType hw_type = av_hwdevice_find_type_by_name("videotoolbox");
+    if (hw_type == AV_HWDEVICE_TYPE_NONE) return;
+
+    AVBufferRef *dev_ctx = NULL;
+    if (av_hwdevice_ctx_create(&dev_ctx, hw_type, NULL, NULL, 0) < 0) return;
+
+    for (int i = 0;; i++) {
+        const AVCodecHWConfig *cfg = avcodec_get_hw_config(d->codec, i);
+        if (!cfg) break;
+        if (cfg->device_type == hw_type &&
+            (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0) {
+            d->hw_pix_fmt = cfg->pix_fmt;
+            break;
+        }
+    }
+
+    if (d->hw_pix_fmt != AV_PIX_FMT_NONE) {
+        d->ctx->hw_device_ctx = av_buffer_ref(dev_ctx);
+        if (d->ctx->hw_device_ctx) {
+            d->ctx->opaque = (void *)(intptr_t)d->hw_pix_fmt;
+            d->ctx->get_format = rdp_get_hw_format;
+            d->use_hw = 1;
+            fprintf(stderr, "[h264] hardware acceleration enabled: videotoolbox\n");
+        }
+    }
+
+    av_buffer_unref(&dev_ctx);
+}
+
+static int open_codec_with_fallback(RdpH264Dec *d)
+{
+    configure_codec_context(d, 1);
+    if (avcodec_open2(d->ctx, d->codec, NULL) == 0) return 0;
+
+    if (!d->use_hw) return -1;
+
+    fprintf(stderr, "[h264] hardware decoder open failed; falling back to software\n");
+    avcodec_free_context(&d->ctx);
+    d->ctx = avcodec_alloc_context3(d->codec);
+    if (!d->ctx) return -1;
+
+    configure_codec_context(d, 0);
+    return avcodec_open2(d->ctx, d->codec, NULL);
+}
 
 RdpH264Dec* rdp_h264_new(void) {
     RdpH264Dec *d = (RdpH264Dec*)calloc(1, sizeof(RdpH264Dec));
@@ -45,11 +117,7 @@ RdpH264Dec* rdp_h264_new(void) {
      * synchronous so each decoded frame is immediately available without any
      * EAGAIN buffering.  grdp uses the same setting for the same reason.
      * (See grdp commit: "h264: add thread_count=1 to SW decoder") */
-    d->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
-    d->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
-    d->ctx->thread_count = 1;
-
-    if (avcodec_open2(d->ctx, d->codec, NULL) < 0) {
+    if (open_codec_with_fallback(d) < 0) {
         avcodec_free_context(&d->ctx);
         free(d);
         return NULL;
@@ -65,8 +133,17 @@ RdpH264Dec* rdp_h264_new(void) {
         return NULL;
     }
 
+    d->sw_frame = av_frame_alloc();
+    if (!d->sw_frame) {
+        av_frame_free(&d->frame);
+        avcodec_free_context(&d->ctx);
+        free(d);
+        return NULL;
+    }
+
     d->pkt = av_packet_alloc();
     if (!d->pkt) {
+        av_frame_free(&d->sw_frame);
         av_frame_free(&d->frame);
         avcodec_free_context(&d->ctx);
         free(d);
@@ -80,6 +157,7 @@ void rdp_h264_free(RdpH264Dec *d) {
     if (!d) return;
     if (d->sws) sws_freeContext(d->sws);
     av_packet_free(&d->pkt);
+    av_frame_free(&d->sw_frame);
     av_frame_free(&d->frame);
     avcodec_free_context(&d->ctx);
     free(d);
@@ -159,9 +237,17 @@ static int codec_hard_reset(RdpH264Dec *d)
     d->ctx = avcodec_alloc_context3(d->codec);
     if (!d->ctx) return -1;
 
-    d->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
-    d->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+    configure_codec_context(d, 1);
 
+    d->last_pix_fmt = AV_PIX_FMT_NONE;
+    if (avcodec_open2(d->ctx, d->codec, NULL) == 0) return 0;
+    if (!d->use_hw) return -1;
+
+    fprintf(stderr, "[h264] hardware decoder open failed after reset; falling back to software\n");
+    avcodec_free_context(&d->ctx);
+    d->ctx = avcodec_alloc_context3(d->codec);
+    if (!d->ctx) return -1;
+    configure_codec_context(d, 0);
     d->last_pix_fmt = AV_PIX_FMT_NONE;
     return avcodec_open2(d->ctx, d->codec, NULL);
 }
@@ -311,17 +397,26 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     /* Helper: convert one AVFrame to malloc'd BGRA and accumulate into *result.
      * Frees any previous *result so the last decoded frame wins. */
     #define CONVERT_FRAME(frame, presult, pw, ph) do { \
-        int _w = (frame)->width, _h = (frame)->height; \
-        enum AVPixelFormat _src_fmt = (enum AVPixelFormat)(frame)->format; \
+        AVFrame *_src = (frame); \
+        if (d->use_hw && (enum AVPixelFormat)(frame)->format == d->hw_pix_fmt) { \
+            if (av_hwframe_transfer_data(d->sw_frame, (frame), 0) < 0) { \
+                fprintf(stderr, "[h264] av_hwframe_transfer_data failed\n"); \
+                av_frame_unref(frame); \
+                break; \
+            } \
+            _src = d->sw_frame; \
+        } \
+        int _w = _src->width, _h = _src->height; \
+        enum AVPixelFormat _src_fmt = (enum AVPixelFormat)_src->format; \
         enum AVPixelFormat _fmt = map_pixfmt(_src_fmt); \
         uint8_t *_bgra = (uint8_t*)malloc((size_t)_w * _h * 4); \
         if (_bgra) { \
-            int _full_range = (_src_fmt == AV_PIX_FMT_YUVJ420P || (frame)->color_range == AVCOL_RANGE_JPEG); \
+            int _full_range = (_src_fmt == AV_PIX_FMT_YUVJ420P || _src->color_range == AVCOL_RANGE_JPEG); \
             if (_src_fmt == AV_PIX_FMT_YUV420P || _src_fmt == AV_PIX_FMT_YUVJ420P) { \
-                yuv420p_to_bgra((frame), _bgra, _w * 4, _full_range); \
+                yuv420p_to_bgra(_src, _bgra, _w * 4, _full_range); \
                 free(*(presult)); *(presult) = _bgra; *(pw) = _w; *(ph) = _h; \
             } else if (_src_fmt == AV_PIX_FMT_NV12) { \
-                nv12_to_bgra((frame), _bgra, _w * 4, _full_range); \
+                nv12_to_bgra(_src, _bgra, _w * 4, _full_range); \
                 free(*(presult)); *(presult) = _bgra; *(pw) = _w; *(ph) = _h; \
             } else { \
                 if (!d->sws || d->last_width != _w || d->last_height != _h || d->last_pix_fmt != _fmt) { \
@@ -334,7 +429,7 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
                 uint8_t *_dd[4] = { _bgra, NULL, NULL, NULL }; \
                 int _dl[4] = { _w * 4, 0, 0, 0 }; \
                 sws_scale(d->sws, \
-                          (const uint8_t * const *)(frame)->data, (frame)->linesize, \
+                          (const uint8_t * const *)_src->data, _src->linesize, \
                           0, _h, _dd, _dl); \
                 free(*(presult)); *(presult) = _bgra; *(pw) = _w; *(ph) = _h; \
                 } else { \
@@ -352,11 +447,12 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
                     _cnt++; \
                 } \
                 fprintf(stderr, "[h264] frame pict=%d fmt=%d range=%d full=%d size=%dx%d avg_luma=%llu samples=%llu px0=(%d,%d,%d)\n", \
-                        (int)(frame)->pict_type, (int)_src_fmt, (int)(frame)->color_range, _full_range, _w, _h, \
+                        (int)_src->pict_type, (int)_src_fmt, (int)_src->color_range, _full_range, _w, _h, \
                         _cnt ? _sum / _cnt : 0, _cnt, \
                         (int)_bgra[2], (int)_bgra[1], (int)_bgra[0]); \
             } \
         } \
+        if (_src == d->sw_frame) av_frame_unref(d->sw_frame); \
         av_frame_unref(frame); \
     } while (0)
 
