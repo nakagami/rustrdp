@@ -676,12 +676,14 @@ impl<T: Transport> RdpSession<T> {
                 Some(t) => now.duration_since(t).as_secs() >= 2,
             };
             if should_send {
-                log::debug!("[client] sending force refresh (suppress→allow) to request IDR");
+                eprintln!("[client] sending force refresh (suppress→allow) to request IDR");
                 if let Err(e) = self.send_force_refresh().await {
-                    log::warn!("[client] force refresh failed: {:?}", e);
+                    eprintln!("[client] force refresh failed: {:?}", e);
                 } else {
                     self.last_force_refresh = Some(now);
                 }
+            } else {
+                eprintln!("[client] force refresh skipped (rate-limited, last sent <2s ago)");
             }
         }
 

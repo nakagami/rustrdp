@@ -961,9 +961,8 @@ impl RdpgfxHandler {
                     // when the decoder explicitly entered keyframe-wait state after an
                     // avcodec_send_packet failure.
                     if dec.needs_keyframe() {
-                        log::warn!(
-                            "[rdpgfx] H264 decoder waiting for IDR — requesting force refresh"
-                        );
+                        #[cfg(debug_assertions)]
+                        eprintln!("[rdpgfx] H264 decoder needs IDR — scheduling force refresh");
                         self.needs_force_refresh = true;
                     }
                 }
