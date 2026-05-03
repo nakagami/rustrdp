@@ -100,4 +100,12 @@ impl InputHandler {
         };
         Some((btn, down))
     }
+
+    pub fn handle_mouse_wheel(&self, x: i32, y: i32) -> Option<i16> {
+        if x == 0 && y != 0 {
+            Some((y * 10) as i16)
+        } else {
+            None
+        }
+    }
 }

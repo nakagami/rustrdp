@@ -118,6 +118,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
+                Event::MouseWheel { x, y, .. } => {
+                    if let Some(delta) = input_handler.handle_mouse_wheel(x, y) {
+                        if let Err(e) = rdp_session.send_mouse_wheel(delta).await {
+                            log::error!("Failed to send mouse wheel: {}", e);
+                        }
+                    }
+                }
                 Event::Window {
                     win_event: WindowEvent::Exposed
                         | WindowEvent::Restored
