@@ -18,6 +18,7 @@ typedef struct RdpH264Dec {
     int                  bright_frame_seen; /* suppress until first non-trivially-dark frame */
     int                  just_flushed;   /* set after pre-IDR flush; cleared on first drain */
     int                  decoder_flushed; /* set whenever avcodec_flush_buffers is called; taken by caller to reset region FIFO */
+    int                  drain_happened;  /* set when drain_count>=1 (frame decoded, possibly suppressed); taken by caller to sync region FIFO */
     int                  log_frames_left;
 } RdpH264Dec;
 
@@ -32,10 +33,21 @@ RdpH264Dec* rdp_h264_new(void) {
     if (!d->ctx) { free(d); return NULL; }
 
     /* Low-delay: RDP H.264 is in display order, no B-frame reordering needed.
-     * AV_CODEC_FLAG2_FAST matches grdp's decoder flags and reduces internal
-     * decoder latency by disabling optional in-loop processing overhead. */
+     * AV_CODEC_FLAG2_FAST reduces internal decoder latency by disabling
+     * optional in-loop processing overhead.
+     *
+     * thread_count=1: disables FFmpeg's frame-level multi-threading.  With
+     * the default multi-threaded mode, FFmpeg pipelines N packets (one per
+     * thread) before emitting the first output frame — returning EAGAIN for
+     * each buffered packet.  This pipeline is flushed and rebuilt from scratch
+     * on every IDR, adding thread_count-1 frames of EAGAIN latency after each
+     * keyframe.  Single-threaded mode makes every send/receive cycle
+     * synchronous so each decoded frame is immediately available without any
+     * EAGAIN buffering.  grdp uses the same setting for the same reason.
+     * (See grdp commit: "h264: add thread_count=1 to SW decoder") */
     d->ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
     d->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+    d->ctx->thread_count = 1;
 
     if (avcodec_open2(d->ctx, d->codec, NULL) < 0) {
         avcodec_free_context(&d->ctx);
@@ -351,6 +363,8 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     uint8_t *result = NULL;
     int rw = 0, rh = 0;
 
+    d->drain_happened = 0;  /* cleared on every decode call; set when drain_count>=1 */
+
     d->pkt->data = (uint8_t*)(uintptr_t)data;
     d->pkt->size = len;
 
@@ -384,11 +398,24 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
         drain_count++;
     }
 
+    if (drain_count >= 1) d->drain_happened = 1;
+
     if (drain_count == 0) {
         /* SW decoder returned EAGAIN: the frame is buffered internally.
          * Return NULL so the Rust layer skips the blit and shows the last
-         * good frame instead.  No region accumulation — grdp handles EAGAIN
-         * the same way (returns nil, no dirty-region bookkeeping). */
+         * good frame instead.
+         *
+         * Do NOT flush the decoder here.  Flushing on EAGAIN sets
+         * needs_keyframe=1 and the server (gnome-remote-desktop) does not
+         * reliably send a new IDR in response to SuppressOutput force-refresh
+         * requests, causing the screen to freeze indefinitely.
+         *
+         * Leaving the decoder running with a buffered frame means the FIFO
+         * depth stabilises at N (= number of EAGAINs received) and every
+         * subsequent frame is correctly paired with its own regions — just
+         * N frames of display lag.  With thread_count=1 this is typically 2
+         * frames (~67 ms at 30 fps), which is far preferable to a frozen
+         * screen. */
         fprintf(stderr, "[h264] decoder EAGAIN (drain=0, len=%d idr=%d)\n", len, idr);
         return NULL;
     }
@@ -547,5 +574,20 @@ int rdp_h264_take_decoder_flushed(RdpH264Dec *d) {
     if (!d) return 0;
     int v = d->decoder_flushed;
     d->decoder_flushed = 0;
+    return v;
+}
+
+/* Returns 1 (and clears the flag) if the last rdp_h264_decode() call drained
+ * at least one frame from the decoder (drain_count >= 1), regardless of whether
+ * it was suppressed (dark frame) or returned to the caller.
+ *
+ * The Rust FIFO logic uses this to pop one entry whenever a frame was consumed
+ * by the decoder pipeline — including suppressed dark frames.  Without this,
+ * dark-frame suppression at connection time leaves stale FIFO entries, causing
+ * subsequent frames to be paired with wrong dirty regions and garbling the video. */
+int rdp_h264_take_drain_happened(RdpH264Dec *d) {
+    if (!d) return 0;
+    int v = d->drain_happened;
+    d->drain_happened = 0;
     return v;
 }

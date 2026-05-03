@@ -874,29 +874,50 @@ impl RdpgfxHandler {
         // were flushed away) are not used.  Then re-push the current packet's regions
         // so they are available when the packet's frame eventually drains.
         #[cfg(feature = "h264")]
-        {
-            let flushed = if let Some(ref mut dec) = self.h264_dec {
-                dec.take_decoder_flushed()
+        let (flushed, drain_happened) = {
+            if let Some(ref mut dec) = self.h264_dec {
+                (dec.take_decoder_flushed(), dec.take_drain_happened())
             } else {
-                false
-            };
-            if flushed {
-                let queue_len_before = self.pending_avc_regions_queue.len();
-                self.pending_avc_regions_queue.clear();
-                self.pending_avc_regions_queue.push_back(regions.clone());
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[rdpgfx] decode_avc444: decoder flushed during decode — cleared FIFO (had {} entries), re-pushed current regions",
-                    queue_len_before
-                );
+                (false, false)
             }
+        };
+        #[cfg(not(feature = "h264"))]
+        let (flushed, drain_happened) = (false, false);
+
+        #[cfg(feature = "h264")]
+        if flushed {
+            let queue_len_before = self.pending_avc_regions_queue.len();
+            self.pending_avc_regions_queue.clear();
+            self.pending_avc_regions_queue.push_back(regions.clone());
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[rdpgfx] decode_avc444: decoder flushed during decode — cleared FIFO (had {} entries), re-pushed current regions",
+                queue_len_before
+            );
         }
 
         let is_mismatch = self.h264_dec_take_full_blit();
 
-        #[cfg(debug_assertions)]
-        if result.is_none() {
-            #[cfg(feature = "h264")]
+        // Pop the FIFO whenever the decoder drained a frame — even if the frame was
+        // suppressed (dark-frame suppression) and C returned NULL.  Without this,
+        // suppressed frames at connection time leave extra FIFO entries, causing
+        // subsequent frames to be paired with stale dirty regions and garbling video.
+        //
+        // When drain_happened=false (EAGAIN, no frame consumed), keep the FIFO entry
+        // we just pushed and return None.
+        #[cfg(feature = "h264")]
+        let effective_regions = if drain_happened {
+            let popped = self.pending_avc_regions_queue.pop_front();
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[rdpgfx] decode_avc444: drain_happened — fifo_depth_after={} used_regions={:?} result={}",
+                self.pending_avc_regions_queue.len(),
+                popped.as_ref().map(|r| r.len()),
+                if result.is_some() { "frame" } else { "suppressed" }
+            );
+            popped.unwrap_or_else(|| regions.clone())
+        } else {
+            #[cfg(debug_assertions)]
             eprintln!(
                 "[rdpgfx] decode_avc444: EAGAIN (lc={} h264_len={} regions={} fifo_depth={} mismatch_flag={})",
                 lc,
@@ -905,32 +926,16 @@ impl RdpgfxHandler {
                 self.pending_avc_regions_queue.len(),
                 is_mismatch
             );
-        }
-
-        // On EAGAIN (no frame output), keep the FIFO entry we just pushed and
-        // return None.  The blit is skipped; the display shows the previous frame.
-        if result.is_none() {
-            return None;
-        }
-
-        // A frame decoded successfully.  Pop the oldest FIFO entry: it corresponds
-        // to the packet whose frame just drained (due to the FIFO-order guarantee).
-        // In the normal (no-delay) case this is the entry we just pushed; in the
-        // pipeline-delay case it is older, but the oldest buffered packet is always
-        // first to drain.
-        #[cfg(feature = "h264")]
-        let effective_regions = {
-            let popped = self.pending_avc_regions_queue.pop_front();
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[rdpgfx] decode_avc444: frame decoded — fifo_depth_after={} used_regions={:?}",
-                self.pending_avc_regions_queue.len(),
-                popped.as_ref().map(|r| r.len())
-            );
-            popped.unwrap_or(regions)
+            regions.clone()
         };
         #[cfg(not(feature = "h264"))]
         let effective_regions = regions;
+
+        // No frame decoded (EAGAIN or dark-frame suppression with no result):
+        // skip the blit; the display shows the previous frame.
+        if result.is_none() {
+            return None;
+        }
 
         result.map(|(pixels, w, h)| (pixels, w, h, effective_regions, is_mismatch))
     }
@@ -1004,18 +1009,25 @@ fn should_use_avc_regions(regions: &[AvcRect], frame_w: i32, frame_h: i32) -> bo
     if frame_w <= 0 || frame_h <= 0 {
         return false;
     }
-    let mut has_region = false;
+    let total = frame_w * frame_h;
+    if total == 0 {
+        return false;
+    }
+    // Sum region areas.  If the total dirty area reaches 60% of the frame,
+    // fall back to a single full-frame blit (matching grdp's 60% threshold).
+    let mut sum = 0i32;
     for rc in regions {
         if rc.right <= rc.left || rc.bottom <= rc.top {
             continue;
         }
-        has_region = true;
-        if rc.left == 0 && rc.top == 0 && rc.right as i32 >= frame_w && rc.bottom as i32 >= frame_h
-        {
+        let w = (rc.right - rc.left) as i32;
+        let h = (rc.bottom - rc.top) as i32;
+        sum = sum.saturating_add(w.saturating_mul(h));
+        if sum.saturating_mul(100) >= total.saturating_mul(60) {
             return false;
         }
     }
-    has_region
+    sum > 0
 }
 
 fn avc_regions_area(regions: &[AvcRect]) -> i32 {

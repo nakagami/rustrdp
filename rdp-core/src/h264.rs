@@ -23,6 +23,7 @@ mod ffi {
         pub fn rdp_h264_needs_keyframe(d: *mut RdpH264Dec) -> c_int;
         pub fn rdp_h264_take_full_blit(d: *mut RdpH264Dec) -> c_int;
         pub fn rdp_h264_take_decoder_flushed(d: *mut RdpH264Dec) -> c_int;
+        pub fn rdp_h264_take_drain_happened(d: *mut RdpH264Dec) -> c_int;
     }
 }
 
@@ -83,6 +84,15 @@ impl H264Decoder {
     /// its region FIFO so that stale entries are not paired with new frames.
     pub fn take_decoder_flushed(&mut self) -> bool {
         unsafe { ffi::rdp_h264_take_decoder_flushed(self.ptr) != 0 }
+    }
+
+    /// Returns true (and clears the flag) if the last `decode()` call drained
+    /// at least one frame from the decoder pipeline (drain_count >= 1), even if
+    /// that frame was suppressed (dark-frame suppression) and not returned to
+    /// the caller.  The FIFO must be popped whenever a frame was drained,
+    /// regardless of whether it was visible, to keep region–frame alignment.
+    pub fn take_drain_happened(&mut self) -> bool {
+        unsafe { ffi::rdp_h264_take_drain_happened(self.ptr) != 0 }
     }
 }
 
