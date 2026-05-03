@@ -19,13 +19,20 @@ typedef struct RdpH264Dec {
     enum AVPixelFormat   hw_pix_fmt;
     int                  use_hw;
     int                  needs_keyframe; /* drop P-frames until next IDR/SPS */
+    int                  request_refresh; /* ask server for IDR without dropping P-frames */
     int                  seen_idr5;      /* suppress output until first true IDR (NAL type 5) */
     int                  bright_frame_seen; /* suppress until first non-trivially-dark frame */
     int                  just_flushed;   /* set after pre-IDR flush; cleared on first drain */
     int                  decoder_flushed; /* set whenever avcodec_flush_buffers is called; taken by caller to reset region FIFO */
     int                  drain_happened;  /* set when drain_count>=1 (frame decoded, possibly suppressed); taken by caller to sync region FIFO */
+    int                  hw_eagain_count;    /* consecutive no-output packets from VideoToolbox */
+    int                  keyframe_wait_count; /* packets dropped since last flush waiting for IDR */
     int                  log_frames_left;
 } RdpH264Dec;
+
+#define HW_EAGAIN_RESET_THRESHOLD  30
+/* Max packets to wait for an IDR after a flush before escalating to hard reset */
+#define KEYFRAME_WAIT_LIMIT        120
 
 static enum AVPixelFormat rdp_get_hw_format(
     AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts)
@@ -240,6 +247,8 @@ static int codec_hard_reset(RdpH264Dec *d)
     configure_codec_context(d, 1);
 
     d->last_pix_fmt = AV_PIX_FMT_NONE;
+    d->hw_eagain_count   = 0;
+    d->keyframe_wait_count = 0;
     if (avcodec_open2(d->ctx, d->codec, NULL) == 0) return 0;
     if (!d->use_hw) return -1;
 
@@ -249,6 +258,8 @@ static int codec_hard_reset(RdpH264Dec *d)
     if (!d->ctx) return -1;
     configure_codec_context(d, 0);
     d->last_pix_fmt = AV_PIX_FMT_NONE;
+    d->hw_eagain_count   = 0;
+    d->keyframe_wait_count = 0;
     return avcodec_open2(d->ctx, d->codec, NULL);
 }
 
@@ -354,6 +365,8 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
 {
     if (!d || !data || len <= 0) return NULL;
 
+    d->drain_happened = 0;  /* cleared on every decode call; set when drain_count>=1 */
+
     int idr  = has_idr(data, len);
     int idr5 = has_idr5(data, len);
     int sps7 = has_sps7(data, len);
@@ -368,8 +381,23 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
 
     /* Wait for a keyframe after flush or at decoder start */
     if (d->needs_keyframe) {
-        if (!idr) return NULL;
-        d->needs_keyframe = 0;
+        if (!idr) {
+            d->keyframe_wait_count++;
+            if (d->keyframe_wait_count >= KEYFRAME_WAIT_LIMIT) {
+                /* Server hasn't sent an IDR; escalate to hard codec reset. */
+                fprintf(stderr, "[h264] no IDR after %d packets, escalating to hard reset\n",
+                        d->keyframe_wait_count);
+                codec_hard_reset(d);
+                d->needs_keyframe    = 1;
+                d->request_refresh   = 1;
+                d->seen_idr5         = 0;
+                d->bright_frame_seen = 0;
+            }
+            return NULL;
+        }
+        d->needs_keyframe        = 0;
+        d->request_refresh       = 0;
+        d->keyframe_wait_count   = 0;
     }
 
     /* Pre-IDR flush: clear the decoder's DPB (decoded picture buffer) before
@@ -459,8 +487,6 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     uint8_t *result = NULL;
     int rw = 0, rh = 0;
 
-    d->drain_happened = 0;  /* cleared on every decode call; set when drain_count>=1 */
-
     d->pkt->data = (uint8_t*)(uintptr_t)data;
     d->pkt->size = len;
 
@@ -472,11 +498,18 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
         fprintf(stderr, "[h264] avcodec_send_packet failed: %s (len=%d idr=%d)\n",
                 errbuf, len, has_idr(data, len));
         avcodec_flush_buffers(d->ctx);
-        d->needs_keyframe    = 1;
-        d->decoder_flushed   = 1;
-        d->seen_idr5         = 0;
-        d->bright_frame_seen = 0;
-        d->just_flushed      = 0;
+        d->decoder_flushed = 1;
+        if (d->use_hw && !idr) {
+            d->request_refresh = 1;
+            d->just_flushed = 0;
+            d->hw_eagain_count = 0;
+        } else {
+            d->needs_keyframe    = 1;
+            d->request_refresh   = 1;
+            d->seen_idr5         = 0;
+            d->bright_frame_seen = 0;
+            d->just_flushed      = 0;
+        }
         free(result);
         return NULL;
     }
@@ -494,9 +527,34 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
         drain_count++;
     }
 
-    if (drain_count >= 1) d->drain_happened = 1;
+    if (drain_count >= 1) {
+        d->drain_happened      = 1;
+        d->hw_eagain_count     = 0;
+        d->request_refresh     = 0;
+        d->keyframe_wait_count = 0;
+    }
 
     if (drain_count == 0) {
+        if (d->use_hw) {
+            d->hw_eagain_count++;
+            if (d->hw_eagain_count >= HW_EAGAIN_RESET_THRESHOLD) {
+                fprintf(stderr,
+                        "[h264] HW decoder stalled after %d EAGAIN packets; flush and request IDR\n",
+                        d->hw_eagain_count);
+                avcodec_flush_buffers(d->ctx);
+                /* Set needs_keyframe=1 so P-frames are dropped until the
+                 * server sends a fresh IDR.  Combined with request_refresh=1
+                 * the Rust layer will send a SuppressOutput force-refresh PDU.
+                 * If no IDR arrives within KEYFRAME_WAIT_LIMIT packets the
+                 * keyframe-wait path above escalates to codec_hard_reset(). */
+                d->needs_keyframe    = 1;
+                d->request_refresh   = 1;
+                d->keyframe_wait_count = 0;
+                d->decoder_flushed   = 1;
+                d->just_flushed      = 0;
+                d->hw_eagain_count   = 0;
+            }
+        }
         /* SW decoder returned EAGAIN: the frame is buffered internally.
          * Return NULL so the Rust layer skips the blit and shows the last
          * good frame instead.
@@ -649,9 +707,9 @@ void rdp_h264_free_buf(uint8_t *buf) {
     free(buf);
 }
 
-/* Returns 1 if the decoder is waiting for an IDR keyframe, 0 otherwise. */
+/* Returns 1 if the decoder wants the server to send a fresh IDR keyframe. */
 int rdp_h264_needs_keyframe(RdpH264Dec *d) {
-    return d ? d->needs_keyframe : 1;
+    return d ? (d->needs_keyframe || d->request_refresh) : 1;
 }
 
 /* Returns 1 if the last decoded frame must be blitted to the full surface
