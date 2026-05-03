@@ -14,6 +14,8 @@ typedef struct RdpH264Dec {
     int                  last_height;
     enum AVPixelFormat   last_pix_fmt;  /* track format changes for sws invalidation */
     int                  needs_keyframe; /* drop P-frames until next IDR/SPS */
+    int                  seen_idr5;      /* suppress output until first true IDR (NAL type 5) */
+    int                  bright_frame_seen; /* suppress until first non-trivially-dark frame */
     int                  log_frames_left;
 } RdpH264Dec;
 
@@ -187,6 +189,37 @@ static int has_idr(const uint8_t *data, int len)
 }
 
 /*
+ * Scan an Annex-B H.264 bitstream for a true IDR slice (NAL type 5 only).
+ * Used to suppress output of dark/zeroed frames produced by SPS-only packets
+ * at decoder start.  Returns 1 if found, 0 otherwise.
+ */
+static int has_idr5(const uint8_t *data, int len)
+{
+    int i = 0;
+    while (i + 3 < len) {
+        int sc_len = 0;
+        if (data[i] == 0 && data[i+1] == 0) {
+            if (data[i+2] == 1)
+                sc_len = 3;
+            else if (i + 4 < len && data[i+2] == 0 && data[i+3] == 1)
+                sc_len = 4;
+        }
+        if (sc_len > 0) {
+            int nal_start = i + sc_len;
+            if (nal_start < len) {
+                int nal_type = data[nal_start] & 0x1F;
+                if (nal_type == 5)
+                    return 1;
+            }
+            i += sc_len;
+        } else {
+            i++;
+        }
+    }
+    return 0;
+}
+
+/*
  * Decode one H.264 NAL packet.
  * Drops packets until an IDR/SPS is seen (after flush or at start).
  * On send failure flushes the decoder and waits for next IDR.
@@ -206,21 +239,14 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     if (d->needs_keyframe) {
         if (!idr) return NULL;
         d->needs_keyframe = 0;
-    } else if (idr) {
-        /* Flush the decoder pipeline before a mid-stream IDR.
-         *
-         * Without this, VideoToolbox (HW decoder) buffers the IDR internally
-         * and returns EAGAIN from avcodec_receive_frame for several subsequent
-         * packets.  When output eventually arrives it is paired with a later
-         * P-frame's AVC dirty regions instead of the IDR's full-scene regions,
-         * causing permanent visual corruption (new window never redraws).
-         *
-         * After avcodec_flush_buffers the decoder resets cleanly, and the next
-         * send_packet (this IDR) produces output in the same decode call —
-         * matching the IDR's AVC regions, just like grdp's soft-reset path. */
-        avcodec_flush_buffers(d->ctx);
-        fprintf(stderr, "[h264] flush before IDR (len=%d)\n", len);
     }
+    /* No pre-IDR flush: the FFmpeg software decoder handles mid-stream IDRs
+     * without needing avcodec_flush_buffers.  Flushing before every IDR
+     * introduces a one-frame pipeline delay (the IDR is sent but EAGAIN is
+     * returned; output arrives on the NEXT packet call) which misaligns the
+     * decoded frame with its AVC dirty regions, causing permanent corruption.
+     * grdp and FreeRDP both take this passive approach: they only flush on
+     * avcodec_send_packet failure, not proactively before IDRs. */
 
     /* Helper: convert one AVFrame to malloc'd BGRA and accumulate into *result.
      * Frees any previous *result so the last decoded frame wins. */
@@ -288,6 +314,8 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
                 errbuf, len, has_idr(data, len));
         avcodec_flush_buffers(d->ctx);
         d->needs_keyframe = 1;
+        d->seen_idr5 = 0;
+        d->bright_frame_seen = 0;
         free(result);
         return NULL;
     }
@@ -320,11 +348,61 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
         fprintf(stderr, "[h264] HW stall: drained %d frames at once, flushing and requesting IDR\n", drain_count);
         avcodec_flush_buffers(d->ctx);
         d->needs_keyframe = 1;
+        d->seen_idr5 = 0;
+        d->bright_frame_seen = 0;
         free(result);
         return NULL;
     }
 
     if (result) {
+        /* Suppress output until the first true IDR (NAL type 5) is decoded.
+         * SPS-only packets (type 7) accepted by has_idr() allow the decoder to
+         * initialise its codec context but produce dark/zeroed frames that should
+         * not be displayed.  Once a real IDR is seen we latch seen_idr5 and
+         * stop suppressing. */
+        if (!d->seen_idr5) {
+            if (has_idr5(data, len)) {
+                d->seen_idr5 = 1;
+            } else {
+                free(result);
+                return NULL;
+            }
+        }
+
+        /* Suppress display until the first non-trivially-dark frame.
+         * RDP servers often send all-black IDR frames during encoder
+         * initialisation before the actual desktop content is ready.
+         * VideoToolbox (HW decoder) naturally stalls on these and never
+         * outputs them; to match that behaviour we suppress frames whose
+         * average luma is below a "definitely black" threshold until we have
+         * seen at least one bright frame.  Once latched, all frames pass
+         * through — including legitimately dark content. */
+        if (!d->bright_frame_seen) {
+            /* Compute approximate average luma from the blue channel offset in
+             * the already-converted BGRA buffer.  Y ≈ 0.114B + 0.587G + 0.299R;
+             * checking B alone at stride 4 gives a very fast approximation that
+             * is sufficient to distinguish "all-black" from "has content". */
+            size_t _pixels = (size_t)rw * rh;
+            size_t _step = _pixels / 1024;
+            if (_step == 0) _step = 1;
+            unsigned long long _sum = 0, _cnt = 0;
+            for (size_t _px = 0; _px < _pixels; _px += _step) {
+                uint8_t *_p = result + _px * 4;
+                _sum += ((unsigned long long)_p[2] * 299 +
+                         (unsigned long long)_p[1] * 587 +
+                         (unsigned long long)_p[0] * 114) / 1000;
+                _cnt++;
+            }
+            unsigned long long _avg = _cnt ? _sum / _cnt : 0;
+            if (_avg <= 4) {
+                /* Frame is nearly black — suppress and wait for real content */
+                free(result);
+                return NULL;
+            }
+            d->bright_frame_seen = 1;
+            fprintf(stderr, "[h264] first bright frame (avg_luma=%llu), display unlocked\n", _avg);
+        }
+
         *width = rw; *height = rh;
     }
     return result;
