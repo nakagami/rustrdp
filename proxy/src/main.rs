@@ -1,5 +1,8 @@
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Query},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Query,
+    },
     response::Response,
     routing::get,
     Router,
@@ -197,9 +200,7 @@ async fn handle_socket(mut socket: WebSocket, target: String) {
     let mut tcp = match TcpStream::connect(&target).await {
         Ok(t) => t,
         Err(e) => {
-            let _ = socket
-                .send(Message::Text(format!("ERROR: {}", e)))
-                .await;
+            let _ = socket.send(Message::Text(format!("ERROR: {}", e))).await;
             return;
         }
     };
@@ -332,7 +333,11 @@ async fn handle_socket(mut socket: WebSocket, target: String) {
                         total += n;
                         if first {
                             first = false;
-                            log::info!("TLS→WS first chunk {} bytes hex={}", n, hex_head(&buf[..n], 32));
+                            log::info!(
+                                "TLS→WS first chunk {} bytes hex={}",
+                                n,
+                                hex_head(&buf[..n], 32)
+                            );
                         } else {
                             log::info!("TLS→WS {} bytes (total {})", n, total);
                         }

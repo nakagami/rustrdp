@@ -1,5 +1,5 @@
-use crate::error::RdpError;
 use crate::core::io::*;
+use crate::error::RdpError;
 
 pub struct Channel {
     pub name: String,
@@ -32,10 +32,22 @@ impl Default for ClientData {
             kbd_layout: 0x0409,
             color_depth: 0xca01,
             channels: vec![
-                Channel { name: "rdpdr".into(),   options: 0xC0800000 },
-                Channel { name: "rdpsnd".into(),  options: 0xC0000000 },
-                Channel { name: "drdynvc".into(), options: 0xC0800000 },
-                Channel { name: "cliprdr".into(), options: 0xC0800000 },
+                Channel {
+                    name: "rdpdr".into(),
+                    options: 0xC0800000,
+                },
+                Channel {
+                    name: "rdpsnd".into(),
+                    options: 0xC0000000,
+                },
+                Channel {
+                    name: "drdynvc".into(),
+                    options: 0xC0800000,
+                },
+                Channel {
+                    name: "cliprdr".into(),
+                    options: 0xC0800000,
+                },
             ],
             server_selected_protocol: 0,
         }
@@ -101,27 +113,27 @@ fn build_core_data(cd: &ClientData) -> Vec<u8> {
     write_u32_le(&mut buf, 0x00080007); // RDP_VERSION_10_2
     write_u16_le(&mut buf, cd.width);
     write_u16_le(&mut buf, cd.height);
-    write_u16_le(&mut buf, 0xca01);     // ColorDepth
-    write_u16_le(&mut buf, 0xAA03);     // SASSequence
+    write_u16_le(&mut buf, 0xca01); // ColorDepth
+    write_u16_le(&mut buf, 0xAA03); // SASSequence
     write_u32_le(&mut buf, cd.kbd_layout);
-    write_u32_le(&mut buf, 22621);      // ClientBuild (Windows 11 22H2)
+    write_u32_le(&mut buf, 22621); // ClientBuild (Windows 11 22H2)
     let name = "rdpwasm";
     let mut name_utf16: Vec<u8> = name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
     name_utf16.resize(32, 0);
     buf.extend_from_slice(&name_utf16);
-    write_u32_le(&mut buf, 0x04);       // KeyboardType (IBM 101/102)
-    write_u32_le(&mut buf, 0x00);       // KeyboardSubType
-    write_u32_le(&mut buf, 12);         // KeyboardFnKeys
-    buf.extend_from_slice(&[0u8; 64]);  // ImeFileName
-    write_u16_le(&mut buf, 0xca01);     // PostBeta2ColorDepth
-    write_u16_le(&mut buf, 1);          // ClientProductId
-    write_u32_le(&mut buf, 0);          // SerialNumber
-    write_u16_le(&mut buf, 24);         // HighColorDepth
-    write_u16_le(&mut buf, 0x000f);     // SupportedColorDepths (all depths)
-    write_u16_le(&mut buf, 0x01a3);     // EarlyCapabilityFlags
-    buf.extend_from_slice(&[0u8; 64]);  // ClientDigProductId
-    write_u8(&mut buf, 6);              // ConnectionType (LAN)
-    write_u8(&mut buf, 0);              // pad
+    write_u32_le(&mut buf, 0x04); // KeyboardType (IBM 101/102)
+    write_u32_le(&mut buf, 0x00); // KeyboardSubType
+    write_u32_le(&mut buf, 12); // KeyboardFnKeys
+    buf.extend_from_slice(&[0u8; 64]); // ImeFileName
+    write_u16_le(&mut buf, 0xca01); // PostBeta2ColorDepth
+    write_u16_le(&mut buf, 1); // ClientProductId
+    write_u32_le(&mut buf, 0); // SerialNumber
+    write_u16_le(&mut buf, 24); // HighColorDepth
+    write_u16_le(&mut buf, 0x000f); // SupportedColorDepths (all depths)
+    write_u16_le(&mut buf, 0x01a3); // EarlyCapabilityFlags
+    buf.extend_from_slice(&[0u8; 64]); // ClientDigProductId
+    write_u8(&mut buf, 6); // ConnectionType (LAN)
+    write_u8(&mut buf, 0); // pad
     write_u32_le(&mut buf, cd.server_selected_protocol);
     buf
 }
@@ -160,7 +172,11 @@ pub fn parse_gcc_response(data: &[u8]) -> Result<ServerData, RdpError> {
     let mut pos = 0;
     while pos + 4 <= data.len() {
         let block_type = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        if block_type == 0x0C01 || block_type == 0x0C02 || block_type == 0x0C03 || block_type == 0x0C04 {
+        if block_type == 0x0C01
+            || block_type == 0x0C02
+            || block_type == 0x0C03
+            || block_type == 0x0C04
+        {
             break;
         }
         pos += 1;

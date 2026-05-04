@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 rdp-core = { path = "../rdp-core" }
-openh264 = "0.9"
+ffmpeg-next = "8"
 tokio = { version = "1", features = ["full"] }
 sdl2 = { version = "0.35", features = ["ttf", "unsafe_textures"] }
 clap = { version = "4", features = ["derive"] }
@@ -22,4 +22,3 @@ tokio-rustls = "0.26"
 
 [build-dependencies]
 pkg-config = "0.3"
-

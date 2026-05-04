@@ -37,7 +37,12 @@ pub fn encode_integer(v: i32) -> Vec<u8> {
     } else if v > 0 && v < 0x800000 {
         vec![(v >> 16) as u8, (v >> 8) as u8, (v & 0xFF) as u8]
     } else {
-        vec![(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, (v & 0xFF) as u8]
+        vec![
+            (v >> 24) as u8,
+            (v >> 16) as u8,
+            (v >> 8) as u8,
+            (v & 0xFF) as u8,
+        ]
     };
     encode_tag_len(TAG_INTEGER, &bytes)
 }
@@ -93,7 +98,10 @@ pub fn decode_bool(data: &[u8], pos: &mut usize) -> Result<bool, RdpError> {
 pub fn decode_integer(data: &[u8], pos: &mut usize) -> Result<i32, RdpError> {
     // Accept both INTEGER (0x02) and ENUMERATED (0x0A) — both encode the same way
     if data[*pos] != TAG_INTEGER && data[*pos] != TAG_ENUMERATED {
-        return Err(RdpError::Protocol(format!("BER: expected INTERGER tag, got {:02x}", data[*pos])));
+        return Err(RdpError::Protocol(format!(
+            "BER: expected INTERGER tag, got {:02x}",
+            data[*pos]
+        )));
     }
     *pos += 1;
     let len = decode_length(data, pos)?;
@@ -107,7 +115,10 @@ pub fn decode_integer(data: &[u8], pos: &mut usize) -> Result<i32, RdpError> {
 
 pub fn decode_octet_string(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, RdpError> {
     if data[*pos] != TAG_OCTET_STRING {
-        return Err(RdpError::Protocol(format!("BER: expected OCTET STRING tag, got {:02x}", data[*pos])));
+        return Err(RdpError::Protocol(format!(
+            "BER: expected OCTET STRING tag, got {:02x}",
+            data[*pos]
+        )));
     }
     *pos += 1;
     let len = decode_length(data, pos)?;

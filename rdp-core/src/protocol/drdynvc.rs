@@ -1,24 +1,23 @@
+use crate::bitmap::Bitmap;
+use crate::protocol::rdpgfx::RdpgfxHandler;
+use crate::protocol::rdpsnd::{AudioEvent, RdpsndHandler};
 /// DRDYNVC (MS-RDPEDYC) dynamic virtual channel handler.
 ///
 /// Receives raw PDU bytes from the static "drdynvc" channel,
 /// multiplexes dynamic channels, routes RDPGFX messages, and
 /// returns decoded bitmaps plus outgoing PDUs to send back.
-
 use std::collections::HashMap;
-use crate::bitmap::Bitmap;
-use crate::protocol::rdpgfx::RdpgfxHandler;
-use crate::protocol::rdpsnd::{RdpsndHandler, AudioEvent};
 
 // ── DYNVC message commands ────────────────────────────────────────────────────
-const CMD_CREATE_REQ:        u8 = 0x01;
-const CMD_DATA_FIRST:        u8 = 0x02;
-const CMD_DATA:              u8 = 0x03;
-const CMD_CLOSE:             u8 = 0x04;
-const CMD_CAPABILITIES:      u8 = 0x05;
+const CMD_CREATE_REQ: u8 = 0x01;
+const CMD_DATA_FIRST: u8 = 0x02;
+const CMD_DATA: u8 = 0x03;
+const CMD_CLOSE: u8 = 0x04;
+const CMD_CAPABILITIES: u8 = 0x05;
 const CMD_SOFT_SYNC_REQUEST: u8 = 0x08;
 
-const GFX_CHANNEL_NAME:         &str = "Microsoft::Windows::RDS::Graphics";
-const AUDIO_DVC_CHANNEL_NAME:   &str = "AUDIO_PLAYBACK_DVC";
+const GFX_CHANNEL_NAME: &str = "Microsoft::Windows::RDS::Graphics";
+const AUDIO_DVC_CHANNEL_NAME: &str = "AUDIO_PLAYBACK_DVC";
 const AUDIO_LOSSY_CHANNEL_NAME: &str = "AUDIO_PLAYBACK_LOSSY_DVC";
 
 /// VOR (Video Optimized Remoting) channels that rustrdp does not implement.
@@ -33,7 +32,7 @@ const REJECTED_CHANNELS: &[&str] = &[
 
 /// In-progress reassembly for a fragmented DVC message.
 struct Fragment {
-    buf:      Vec<u8>,
+    buf: Vec<u8>,
     expected: usize,
 }
 
@@ -44,8 +43,8 @@ enum DvcChannel {
 }
 
 pub struct DrdynvcHandler {
-    channels:   HashMap<u32, DvcChannel>,
-    fragments:  HashMap<u32, Fragment>,
+    channels: HashMap<u32, DvcChannel>,
+    fragments: HashMap<u32, Fragment>,
     server_version: u16,
     /// Optional AVC decoder plug-in, given away to the first GFX channel created.
     avc_dec: Option<Box<dyn crate::avc::AvcDecoder>>,
@@ -54,7 +53,7 @@ pub struct DrdynvcHandler {
 impl DrdynvcHandler {
     pub fn new() -> Self {
         DrdynvcHandler {
-            channels:  HashMap::new(),
+            channels: HashMap::new(),
             fragments: HashMap::new(),
             server_version: 1,
             avc_dec: None,
@@ -70,18 +69,27 @@ impl DrdynvcHandler {
     /// Process one DVC PDU.
     /// Returns (bitmaps produced, raw DRDYNVC PDUs to send back to server, audio events, needs_force_refresh, reset_size).
     /// `needs_force_refresh` is true when the H264 decoder needs an IDR keyframe.
-    pub fn process(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>, Vec<AudioEvent>, bool, Option<(u16, u16)>) {
+    pub fn process(
+        &mut self,
+        data: &[u8],
+    ) -> (
+        Vec<Bitmap>,
+        Vec<Vec<u8>>,
+        Vec<AudioEvent>,
+        bool,
+        Option<(u16, u16)>,
+    ) {
         if data.is_empty() {
             return (vec![], vec![], vec![], false, None);
         }
-        let header   = data[0];
-        let cmd      = (header >> 4) & 0x0F;
-        let sp       = (header >> 2) & 0x03;
+        let header = data[0];
+        let cmd = (header >> 4) & 0x0F;
+        let sp = (header >> 2) & 0x03;
         let cb_ch_id = header & 0x03;
 
-        let mut bitmaps  = Vec::new();
+        let mut bitmaps = Vec::new();
         let mut outgoing = Vec::new();
-        let mut audio    = Vec::new();
+        let mut audio = Vec::new();
         let mut force_refresh = false;
         let mut reset_size = None;
 
@@ -93,10 +101,27 @@ impl DrdynvcHandler {
                 self.handle_create(data, cb_ch_id, &mut outgoing);
             }
             CMD_DATA_FIRST => {
-                self.handle_data_first(data, cb_ch_id, sp, &mut bitmaps, &mut outgoing, &mut audio, &mut force_refresh, &mut reset_size);
+                self.handle_data_first(
+                    data,
+                    cb_ch_id,
+                    sp,
+                    &mut bitmaps,
+                    &mut outgoing,
+                    &mut audio,
+                    &mut force_refresh,
+                    &mut reset_size,
+                );
             }
             CMD_DATA => {
-                self.handle_data(data, cb_ch_id, &mut bitmaps, &mut outgoing, &mut audio, &mut force_refresh, &mut reset_size);
+                self.handle_data(
+                    data,
+                    cb_ch_id,
+                    &mut bitmaps,
+                    &mut outgoing,
+                    &mut audio,
+                    &mut force_refresh,
+                    &mut reset_size,
+                );
             }
             CMD_CLOSE => {
                 let ch_id = read_ch_id(data, 1, cb_ch_id);
@@ -132,13 +157,18 @@ impl DrdynvcHandler {
 
     fn handle_capabilities(&mut self, data: &[u8], out: &mut Vec<Vec<u8>>) {
         // Header(1) + Pad(1) + Version(2)
-        if data.len() < 4 { return; }
+        if data.len() < 4 {
+            return;
+        }
         self.server_version = u16::from_le_bytes([data[2], data[3]]);
-        log::debug!("[drdynvc] CAPABILITIES server_version={}", self.server_version);
+        log::debug!(
+            "[drdynvc] CAPABILITIES server_version={}",
+            self.server_version
+        );
         let version = self.server_version.min(3);
         let mut pdu = vec![
-            0x50u8,       // Cmd=5 (CAPABILITIES) | Sp=0 | CbChId=0
-            0x00,         // pad
+            0x50u8, // Cmd=5 (CAPABILITIES) | Sp=0 | CbChId=0
+            0x00,   // pad
             (version & 0xFF) as u8,
             ((version >> 8) & 0xFF) as u8,
         ];
@@ -154,7 +184,9 @@ impl DrdynvcHandler {
 
     fn handle_create(&mut self, data: &[u8], cb_ch_id: u8, out: &mut Vec<Vec<u8>>) {
         let id_bytes = ch_id_len(cb_ch_id);
-        if data.len() < 1 + id_bytes { return; }
+        if data.len() < 1 + id_bytes {
+            return;
+        }
         let ch_id = read_ch_id(data, 1, cb_ch_id);
 
         // Channel name is null-terminated UTF-8 after the channel ID
@@ -194,7 +226,8 @@ impl DrdynvcHandler {
             }
         } else if name == AUDIO_DVC_CHANNEL_NAME || name == AUDIO_LOSSY_CHANNEL_NAME {
             log::debug!("[drdynvc] registering audio DVC channel: {}", name);
-            self.channels.insert(ch_id, DvcChannel::Audio(RdpsndHandler::new()));
+            self.channels
+                .insert(ch_id, DvcChannel::Audio(RdpsndHandler::new()));
         } else {
             self.channels.insert(ch_id, DvcChannel::Unknown);
         }
@@ -203,15 +236,22 @@ impl DrdynvcHandler {
     // ── DATA_FIRST ────────────────────────────────────────────────────────────
 
     fn handle_data_first(
-        &mut self, data: &[u8], cb_ch_id: u8, sp: u8,
-        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>, audio: &mut Vec<AudioEvent>,
+        &mut self,
+        data: &[u8],
+        cb_ch_id: u8,
+        sp: u8,
+        bitmaps: &mut Vec<Bitmap>,
+        out: &mut Vec<Vec<u8>>,
+        audio: &mut Vec<AudioEvent>,
         force_refresh: &mut bool,
         reset_size: &mut Option<(u16, u16)>,
     ) {
-        let id_bytes  = ch_id_len(cb_ch_id);
+        let id_bytes = ch_id_len(cb_ch_id);
         let len_bytes = len_field_len(sp);
         let header_sz = 1 + id_bytes + len_bytes;
-        if data.len() < header_sz { return; }
+        if data.len() < header_sz {
+            return;
+        }
 
         let ch_id = read_ch_id(data, 1, cb_ch_id);
         let total = read_len(&data[1 + id_bytes..], sp) as usize;
@@ -219,9 +259,20 @@ impl DrdynvcHandler {
 
         if total == payload.len() {
             // Single-packet message (total matches first chunk)
-            self.dispatch_channel_data(ch_id, payload, bitmaps, out, audio, force_refresh, reset_size);
+            self.dispatch_channel_data(
+                ch_id,
+                payload,
+                bitmaps,
+                out,
+                audio,
+                force_refresh,
+                reset_size,
+            );
         } else {
-            let mut frag = Fragment { buf: Vec::with_capacity(total), expected: total };
+            let mut frag = Fragment {
+                buf: Vec::with_capacity(total),
+                expected: total,
+            };
             frag.buf.extend_from_slice(payload);
             self.fragments.insert(ch_id, frag);
         }
@@ -230,14 +281,20 @@ impl DrdynvcHandler {
     // ── DATA ──────────────────────────────────────────────────────────────────
 
     fn handle_data(
-        &mut self, data: &[u8], cb_ch_id: u8,
-        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>, audio: &mut Vec<AudioEvent>,
+        &mut self,
+        data: &[u8],
+        cb_ch_id: u8,
+        bitmaps: &mut Vec<Bitmap>,
+        out: &mut Vec<Vec<u8>>,
+        audio: &mut Vec<AudioEvent>,
         force_refresh: &mut bool,
         reset_size: &mut Option<(u16, u16)>,
     ) {
         let id_bytes = ch_id_len(cb_ch_id);
-        if data.len() < 1 + id_bytes { return; }
-        let ch_id  = read_ch_id(data, 1, cb_ch_id);
+        if data.len() < 1 + id_bytes {
+            return;
+        }
+        let ch_id = read_ch_id(data, 1, cb_ch_id);
         let payload = &data[1 + id_bytes..];
 
         // Reassemble or dispatch directly
@@ -246,7 +303,15 @@ impl DrdynvcHandler {
             frag.buf.len() >= frag.expected
         } else {
             // No fragment in progress → single-shot data
-            self.dispatch_channel_data(ch_id, payload, bitmaps, out, audio, force_refresh, reset_size);
+            self.dispatch_channel_data(
+                ch_id,
+                payload,
+                bitmaps,
+                out,
+                audio,
+                force_refresh,
+                reset_size,
+            );
             return;
         };
 
@@ -259,8 +324,12 @@ impl DrdynvcHandler {
     // ── Channel dispatch ──────────────────────────────────────────────────────
 
     fn dispatch_channel_data(
-        &mut self, ch_id: u32, data: &[u8],
-        bitmaps: &mut Vec<Bitmap>, out: &mut Vec<Vec<u8>>, audio: &mut Vec<AudioEvent>,
+        &mut self,
+        ch_id: u32,
+        data: &[u8],
+        bitmaps: &mut Vec<Bitmap>,
+        out: &mut Vec<Vec<u8>>,
+        audio: &mut Vec<AudioEvent>,
         force_refresh: &mut bool,
         reset_size: &mut Option<(u16, u16)>,
     ) {
@@ -269,8 +338,12 @@ impl DrdynvcHandler {
             Some(DvcChannel::Gfx(gfx)) => {
                 let (new_bitmaps, replies, fr, rs) = gfx.process(data);
                 bitmaps.extend(new_bitmaps);
-                if fr { *force_refresh = true; }
-                if rs.is_some() { *reset_size = rs; }
+                if fr {
+                    *force_refresh = true;
+                }
+                if rs.is_some() {
+                    *reset_size = rs;
+                }
                 for r in replies {
                     out.push(wrap_data_pdu(ch_id, cb_ch_id, &r));
                 }
@@ -293,24 +366,36 @@ impl DrdynvcHandler {
 
 /// Number of bytes used for the channel ID field.
 fn ch_id_len(cb_ch_id: u8) -> usize {
-    match cb_ch_id { 0 => 1, 1 => 2, _ => 4 }
+    match cb_ch_id {
+        0 => 1,
+        1 => 2,
+        _ => 4,
+    }
 }
 
 /// Number of bytes used for the length field (DATA_FIRST only).
 fn len_field_len(sp: u8) -> usize {
-    match sp { 0 => 1, 1 => 2, _ => 4 }
+    match sp {
+        0 => 1,
+        1 => 2,
+        _ => 4,
+    }
 }
 
 /// Read a channel ID from `data[offset..]` based on `cb_ch_id`.
 fn read_ch_id(data: &[u8], offset: usize, cb_ch_id: u8) -> u32 {
     let len = ch_id_len(cb_ch_id);
-    if offset + len > data.len() { return 0; }
+    if offset + len > data.len() {
+        return 0;
+    }
     match len {
         1 => data[offset] as u32,
         2 => u16::from_le_bytes([data[offset], data[offset + 1]]) as u32,
         _ => u32::from_le_bytes([
-            data[offset], data[offset + 1],
-            data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]),
     }
 }
@@ -319,8 +404,8 @@ fn read_ch_id(data: &[u8], offset: usize, cb_ch_id: u8) -> u32 {
 fn read_len(data: &[u8], sp: u8) -> u32 {
     match sp {
         0 if !data.is_empty() => data[0] as u32,
-        1 if data.len() >= 2  => u16::from_le_bytes([data[0], data[1]]) as u32,
-        2 if data.len() >= 4  => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        1 if data.len() >= 2 => u16::from_le_bytes([data[0], data[1]]) as u32,
+        2 if data.len() >= 4 => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
         _ => 0,
     }
 }
@@ -333,7 +418,13 @@ fn read_cstring(data: &[u8]) -> String {
 
 /// Determine cb_ch_id encoding for a given channel ID.
 fn ch_id_size(ch_id: u32) -> u8 {
-    if ch_id <= 0xFF { 0 } else if ch_id <= 0xFFFF { 1 } else { 2 }
+    if ch_id <= 0xFF {
+        0
+    } else if ch_id <= 0xFFFF {
+        1
+    } else {
+        2
+    }
 }
 
 /// Write a channel ID into a buffer, returning the number of bytes written.

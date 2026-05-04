@@ -1,17 +1,17 @@
+use async_trait::async_trait;
+use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures_channel::oneshot;
+use futures_util::StreamExt;
+use js_sys::{ArrayBuffer, Uint8Array};
+use rdp_core::bitmap::Bitmap;
+use rdp_core::protocol::Transport;
+use rdp_core::{RdpError, RdpEvent, RdpSession};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
-use web_sys::{WebSocket, MessageEvent, BinaryType};
-use js_sys::{Uint8Array, ArrayBuffer};
-use futures_channel::mpsc::{self, UnboundedSender, UnboundedReceiver};
-use futures_channel::oneshot;
-use futures_util::StreamExt;
-use async_trait::async_trait;
-use rdp_core::{RdpError, RdpEvent, RdpSession};
-use rdp_core::protocol::Transport;
-use rdp_core::bitmap::Bitmap;
+use web_sys::{BinaryType, MessageEvent, WebSocket};
 
 #[wasm_bindgen(start)]
 pub fn main() {
@@ -39,8 +39,7 @@ impl WsTransport {
             mpsc::unbounded();
         // Wrap in Rc<RefCell<Option>> so onclose can drop the sender,
         // which causes rx.next() to return None and unblock recv().
-        let tx: Rc<RefCell<Option<UnboundedSender<Vec<u8>>>>> =
-            Rc::new(RefCell::new(Some(raw_tx)));
+        let tx: Rc<RefCell<Option<UnboundedSender<Vec<u8>>>>> = Rc::new(RefCell::new(Some(raw_tx)));
 
         let (open_tx, open_rx) = oneshot::channel::<Result<(), String>>();
 
@@ -84,7 +83,9 @@ impl WsTransport {
         ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
 
         // wait for open
-        open_rx.await.map_err(|e| JsValue::from_str(&e.to_string()))?
+        open_rx
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?
             .map_err(|e| JsValue::from_str(&e))?;
 
         Ok(WsTransport {
@@ -130,7 +131,9 @@ impl Transport for WsTransport {
         self.fill_buf_to(4).await?;
         let hdr: Vec<u8> = self.buf.drain(..4).collect();
         if hdr[0] != 0x00 || hdr[1] != 0x00 {
-            return Err(RdpError::Protocol("WsTransport: unexpected TLS control header".into()));
+            return Err(RdpError::Protocol(
+                "WsTransport: unexpected TLS control header".into(),
+            ));
         }
         let len = ((hdr[2] as usize) << 8) | (hdr[3] as usize);
         if len == 0 {
@@ -144,11 +147,26 @@ impl Transport for WsTransport {
 // ─── InputEvent ───────────────────────────────────────────────────────────────
 
 enum InputEvent {
-    KeyDown { flags: u16, scancode: u8 },
-    KeyUp { scancode: u8 },
-    MouseMove { x: u16, y: u16 },
-    MouseButton { button: u8, down: bool, x: u16, y: u16 },
-    MouseWheel { delta: i16 },
+    KeyDown {
+        flags: u16,
+        scancode: u8,
+    },
+    KeyUp {
+        scancode: u8,
+    },
+    MouseMove {
+        x: u16,
+        y: u16,
+    },
+    MouseButton {
+        button: u8,
+        down: bool,
+        x: u16,
+        y: u16,
+    },
+    MouseWheel {
+        delta: i16,
+    },
 }
 
 // ─── RdpController ────────────────────────────────────────────────────────────
@@ -162,7 +180,9 @@ pub struct RdpController {
 #[wasm_bindgen]
 impl RdpController {
     pub fn key_down(&self, flags: u16, scancode: u8) {
-        let _ = self.input_tx.unbounded_send(InputEvent::KeyDown { flags, scancode });
+        let _ = self
+            .input_tx
+            .unbounded_send(InputEvent::KeyDown { flags, scancode });
     }
 
     pub fn key_up(&self, scancode: u8) {
@@ -174,11 +194,15 @@ impl RdpController {
     }
 
     pub fn mouse_button(&self, button: u8, down: bool, x: u16, y: u16) {
-        let _ = self.input_tx.unbounded_send(InputEvent::MouseButton { button, down, x, y });
+        let _ = self
+            .input_tx
+            .unbounded_send(InputEvent::MouseButton { button, down, x, y });
     }
 
     pub fn mouse_wheel(&self, delta: i16) {
-        let _ = self.input_tx.unbounded_send(InputEvent::MouseWheel { delta });
+        let _ = self
+            .input_tx
+            .unbounded_send(InputEvent::MouseWheel { delta });
     }
 }
 

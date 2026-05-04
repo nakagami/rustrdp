@@ -18,7 +18,10 @@ fn main() {
     let _sdl2_include_path = format!("{}/include", sdl2_path);
 
     println!("cargo:rustc-link-search=native={}", sdl2_lib_path);
-    println!("cargo:rustc-link-search=native={}/SDL2.framework/Frameworks", sdl2_path);
+    println!(
+        "cargo:rustc-link-search=native={}/SDL2.framework/Frameworks",
+        sdl2_path
+    );
 
     // SDL2_ttf
     let output = Command::new("brew")
@@ -38,5 +41,6 @@ fn main() {
     // Use pkg-config if available
     pkg_config::probe_library("sdl2").ok();
     pkg_config::probe_library("SDL2_ttf").ok();
-    // H.264 decode is handled by the `openh264` Rust crate (no FFmpeg needed).
+    // H.264 decode is handled by `ffmpeg-next`, which links against the system
+    // FFmpeg libraries discovered by pkg-config / the toolchain defaults.
 }

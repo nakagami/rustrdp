@@ -177,7 +177,9 @@ pub fn decompress(input: &[u8], width: usize, height: usize, bpp: usize) -> Vec<
             0xF => {
                 opcode = code & 0xF;
                 if opcode < 9 {
-                    if pos + 1 >= input.len() { break; }
+                    if pos + 1 >= input.len() {
+                        break;
+                    }
                     let lo = input[pos] as usize;
                     let hi = input[pos + 1] as usize;
                     pos += 2;
@@ -199,7 +201,9 @@ pub fn decompress(input: &[u8], width: usize, height: usize, bpp: usize) -> Vec<
         let isfillormix = opcode == 2 || opcode == 7;
         if offset != 0 {
             if count == 0 {
-                if pos >= input.len() { break; }
+                if pos >= input.len() {
+                    break;
+                }
                 if isfillormix {
                     count = input[pos] as usize + 1;
                 } else {
@@ -219,24 +223,32 @@ pub fn decompress(input: &[u8], width: usize, height: usize, bpp: usize) -> Vec<
                 }
             }
             3 => {
-                if pos + bpp_bytes > input.len() { break; }
+                if pos + bpp_bytes > input.len() {
+                    break;
+                }
                 colour2[..bpp_bytes].copy_from_slice(&input[pos..pos + bpp_bytes]);
                 pos += bpp_bytes;
             }
             6 => {
-                if pos + bpp_bytes > input.len() { break; }
+                if pos + bpp_bytes > input.len() {
+                    break;
+                }
                 mix[..bpp_bytes].copy_from_slice(&input[pos..pos + bpp_bytes]);
                 pos += bpp_bytes;
                 opcode = 1;
             }
             7 => {
-                if pos + bpp_bytes > input.len() { break; }
+                if pos + bpp_bytes > input.len() {
+                    break;
+                }
                 mix[..bpp_bytes].copy_from_slice(&input[pos..pos + bpp_bytes]);
                 pos += bpp_bytes;
                 opcode = 2;
             }
             8 => {
-                if pos + bpp_bytes * 2 > input.len() { break; }
+                if pos + bpp_bytes * 2 > input.len() {
+                    break;
+                }
                 colour1[..bpp_bytes].copy_from_slice(&input[pos..pos + bpp_bytes]);
                 pos += bpp_bytes;
                 colour2[..bpp_bytes].copy_from_slice(&input[pos..pos + bpp_bytes]);
@@ -261,7 +273,9 @@ pub fn decompress(input: &[u8], width: usize, height: usize, bpp: usize) -> Vec<
         // Output body: process `count` pixels, advancing scanlines as needed
         while count > 0 {
             if x >= width {
-                if h == 0 { return out; }
+                if h == 0 {
+                    return out;
+                }
                 x = 0;
                 h -= 1;
                 prevline = line;
@@ -327,7 +341,9 @@ pub fn decompress(input: &[u8], width: usize, height: usize, bpp: usize) -> Vec<
                             if fom_mask != 0 {
                                 mask = fom_mask;
                             } else {
-                                if pos >= input.len() { return out; }
+                                if pos >= input.len() {
+                                    return out;
+                                }
                                 mask = input[pos];
                                 pos += 1;
                             }
@@ -367,7 +383,9 @@ pub fn decompress(input: &[u8], width: usize, height: usize, bpp: usize) -> Vec<
                 4 => {
                     // Copy: literal pixels from input
                     while count > 0 && x < width {
-                        if pos + bpp_bytes > input.len() { return out; }
+                        if pos + bpp_bytes > input.len() {
+                            return out;
+                        }
                         let base = line + x * bpp_bytes;
                         out[base..base + bpp_bytes].copy_from_slice(&input[pos..pos + bpp_bytes]);
                         pos += bpp_bytes;

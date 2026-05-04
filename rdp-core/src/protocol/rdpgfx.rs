@@ -124,7 +124,7 @@ impl RdpgfxHandler {
 
     /// Process a raw RDPGFX payload (ZGFX-compressed).
     /// Returns (decoded bitmaps, outgoing PDUs to send back via DVC, needs_force_refresh).
-    /// `needs_force_refresh` is true when the H264 decoder is waiting for an IDR keyframe;
+    /// `needs_force_refresh` is true when the H264 decoder wants an IDR keyframe;
     /// the caller should send a SuppressOutput (suppress→allow) PDU to request one.
     pub fn process(
         &mut self,
@@ -161,8 +161,7 @@ impl RdpgfxHandler {
             // If decoder_flushed is now set, clear the FIFO immediately
             // (no need to wait for the next decode() call).
             if dec.take_decoder_flushed() {
-                #[cfg(debug_assertions)]
-                eprintln!(
+                log::debug!(
                     "[rdpgfx] signal_screen_refreshed: cleared FIFO (had {} entries)",
                     self.pending_avc_regions_queue.len()
                 );
@@ -207,9 +206,7 @@ impl RdpgfxHandler {
         bitmaps: &mut Vec<Bitmap>,
         outgoing: &mut Vec<Vec<u8>>,
     ) {
-        log::info!("[rdpgfx] cmd 0x{:04X} len={}", cmd_id, data.len());
-        #[cfg(debug_assertions)]
-        eprintln!("[rdpgfx] cmd=0x{:04X} len={}", cmd_id, data.len());
+        log::trace!("[rdpgfx] cmd 0x{:04X} len={}", cmd_id, data.len());
         match cmd_id {
             CMDID_CAPS_CONFIRM => {
                 self.on_caps_confirm(data);
@@ -348,9 +345,7 @@ impl RdpgfxHandler {
         let id = u16::from_le_bytes([data[0], data[1]]);
         let ox = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let oy = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        log::info!("[rdpgfx] MAP_SURFACE_SCALED id={} ox={} oy={}", id, ox, oy);
-        #[cfg(debug_assertions)]
-        eprintln!(
+        log::debug!(
             "[rdpgfx] MAP_SURFACE_SCALED id={} ox={} oy={} target={}x{}",
             id,
             ox,
@@ -370,9 +365,7 @@ impl RdpgfxHandler {
             return;
         }
         let id = u16::from_le_bytes([data[0], data[1]]);
-        log::info!("[rdpgfx] MAP_SURFACE_TO_WINDOW id={} ignored", id);
-        #[cfg(debug_assertions)]
-        eprintln!("[rdpgfx] MAP_SURFACE_TO_WINDOW id={} ignored", id);
+        log::debug!("[rdpgfx] MAP_SURFACE_TO_WINDOW id={} ignored", id);
     }
 
     fn on_end_frame(&mut self, data: &[u8]) -> Option<Vec<u8>> {
@@ -392,9 +385,7 @@ impl RdpgfxHandler {
         }
         let w = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         let h = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        log::info!("[rdpgfx] RESET_GRAPHICS {}x{}", w, h);
-        #[cfg(debug_assertions)]
-        eprintln!("[rdpgfx] RESET_GRAPHICS {}x{}", w, h);
+        log::debug!("[rdpgfx] RESET_GRAPHICS {}x{}", w, h);
         if let (Ok(w16), Ok(h16)) = (u16::try_from(w), u16::try_from(h)) {
             self.last_reset_size = Some((w16, h16));
         }
@@ -470,8 +461,7 @@ impl RdpgfxHandler {
                 let pixels = bmp_data[..expected].to_vec();
                 self.blit_to_surface(surf_id, dest_left as i32, dest_top as i32, w, h, &pixels);
                 if mapped {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
+                    log::debug!(
                         "[rdpgfx] emit WTS1 uncompressed surf={} rect=({},{} {}x{}) abs=({},{})",
                         surf_id, dest_left, dest_top, w, h, abs_x, abs_y
                     );
@@ -503,8 +493,7 @@ impl RdpgfxHandler {
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
-                if let Some((pixels, fw, fh, regions, force_regions)) =
-                    self.decode_avc444(bmp_data)
+                if let Some((pixels, fw, fh, regions, force_regions)) = self.decode_avc444(bmp_data)
                 {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
@@ -597,8 +586,7 @@ impl RdpgfxHandler {
                 let pixels = bmp_data[..expected].to_vec();
                 self.blit_to_surface(surf_id, 0, 0, w, h, &pixels);
                 if mapped {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
+                    log::debug!(
                         "[rdpgfx] emit WTS2 uncompressed surf={} rect=(0,0 {}x{}) abs=({},{})",
                         surf_id, w, h, abs_x, abs_y
                     );
@@ -638,8 +626,7 @@ impl RdpgfxHandler {
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
-                if let Some((pixels, fw, fh, regions, force_regions)) =
-                    self.decode_avc444(bmp_data)
+                if let Some((pixels, fw, fh, regions, force_regions)) = self.decode_avc444(bmp_data)
                 {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
@@ -865,27 +852,37 @@ impl RdpgfxHandler {
             .map(|(pixels, w, h)| (pixels, w, h, regions))
     }
 
-    fn decode_avc444(
-        &mut self,
-        data: &[u8],
-    ) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>, bool)> {
+    fn decode_avc444(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>, bool)> {
         let (stream, lc) = parse_avc444(data)?;
-        #[cfg(debug_assertions)]
-        eprintln!(
+        log::trace!(
             "[rdpgfx] decode_avc444: lc={} h264_len={}",
             lc,
             stream.h264_data.len()
         );
         let regions = stream.regions;
+        let uses_region_fifo = self
+            .avc_dec
+            .as_ref()
+            .map(|dec| dec.uses_region_fifo())
+            .unwrap_or(false);
 
-        // Push the current packet's dirty regions into the FIFO *before* sending
-        // the packet to the decoder.  The FFmpeg frame-threading pipeline may buffer
-        // multiple frames (returning EAGAIN for each) before producing output.  When
-        // frame K finally drains, we need the dirty regions of packet K — not the
-        // current (newer) packet's regions.  Maintaining a FIFO of per-packet regions
-        // and popping the front on each successful decode preserves the mapping.
-        if self.avc_dec.is_some() {
+        // Some decoders can emit delayed frames that belong to older packets,
+        // so their dirty regions must be tracked through a FIFO. Others stay
+        // aligned with the current packet, so applying a FIFO causes obvious
+        // region mismatches (stale rects on fresh frames).
+        if uses_region_fifo {
             self.pending_avc_regions_queue.push_back(regions.clone());
+        }
+
+        // Give the decoder a region hint so it can skip converting pixels outside
+        // the dirty area. For VT (uses_region_fifo=false) the current packet's
+        // regions always match the decoded frame, so the hint is always valid.
+        if let Some(ref mut dec) = self.avc_dec {
+            let hints: Vec<(u16, u16, u16, u16)> = regions
+                .iter()
+                .map(|r| (r.left, r.top, r.right, r.bottom))
+                .collect();
+            dec.set_region_hint(&hints);
         }
 
         let result = self.decode_h264(&stream.h264_data);
@@ -895,18 +892,19 @@ impl RdpgfxHandler {
         // discarded.  Clear the FIFO so the stale entries (from packets whose frames
         // were flushed away) are not used.  Then re-push the current packet's regions
         // so they are available when the packet's frame eventually drains.
-        let (flushed, drain_happened) = if let Some(ref mut dec) = self.avc_dec {
-            (dec.take_decoder_flushed(), dec.take_drain_happened())
+        let (flushed, drain_count) = if let Some(ref mut dec) = self.avc_dec {
+            (dec.take_decoder_flushed(), dec.take_drain_count())
         } else {
-            (false, false)
+            (false, 0)
         };
 
         if flushed {
             let queue_len_before = self.pending_avc_regions_queue.len();
             self.pending_avc_regions_queue.clear();
-            self.pending_avc_regions_queue.push_back(regions.clone());
-            #[cfg(debug_assertions)]
-            eprintln!(
+            if uses_region_fifo {
+                self.pending_avc_regions_queue.push_back(regions.clone());
+            }
+            log::debug!(
                 "[rdpgfx] decode_avc444: decoder flushed during decode — cleared FIFO (had {} entries), re-pushed current regions",
                 queue_len_before
             );
@@ -914,31 +912,44 @@ impl RdpgfxHandler {
 
         let is_mismatch = self.avc_dec_take_full_blit();
 
-        // Pop the FIFO whenever the decoder drained a frame — even if the frame was
-        // suppressed (dark-frame suppression) and C returned NULL.  Without this,
-        // suppressed frames at connection time leave extra FIFO entries, causing
-        // subsequent frames to be paired with stale dirty regions and garbling video.
-        //
-        // When drain_happened=false (EAGAIN, no frame consumed), keep the FIFO entry
-        // we just pushed and return None.
-        let effective_regions = if drain_happened {
-            let popped = self.pending_avc_regions_queue.pop_front();
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "[rdpgfx] decode_avc444: drain_happened — fifo_depth_after={} used_regions={:?} result={}",
-                self.pending_avc_regions_queue.len(),
-                popped.as_ref().map(|r| r.len()),
-                if result.is_some() { "frame" } else { "suppressed" }
-            );
-            popped.unwrap_or_else(|| regions.clone())
+        // Pop the FIFO once per drained frame — the returned frame corresponds to
+        // the *last* drained frame from this decode() call. If we only pop once
+        // after draining multiple frames, the queue stays offset and later packet
+        // regions get paired with stale decoded output.
+        let effective_regions = if drain_count > 0 {
+            if uses_region_fifo {
+                let mut popped = None;
+                for _ in 0..drain_count {
+                    popped = self.pending_avc_regions_queue.pop_front();
+                }
+                log::trace!(
+                    "[rdpgfx] decode_avc444: drain_happened — drained={} fifo_depth_after={} used_regions={:?} result={}",
+                    drain_count,
+                    self.pending_avc_regions_queue.len(),
+                    popped.as_ref().map(|r| r.len()),
+                    if result.is_some() { "frame" } else { "suppressed" }
+                );
+                popped.unwrap_or_else(|| regions.clone())
+            } else {
+                log::trace!(
+                    "[rdpgfx] decode_avc444: drain_happened — drained={} current packet regions={} result={}",
+                    drain_count,
+                    regions.len(),
+                    if result.is_some() {
+                        "frame"
+                    } else {
+                        "suppressed"
+                    }
+                );
+                regions.clone()
+            }
         } else {
-            #[cfg(debug_assertions)]
-            eprintln!(
+            log::trace!(
                 "[rdpgfx] decode_avc444: EAGAIN (lc={} h264_len={} regions={} fifo_depth={} mismatch_flag={})",
                 lc,
                 stream.h264_data.len(),
                 regions.len(),
-                self.pending_avc_regions_queue.len(),
+                if uses_region_fifo { self.pending_avc_regions_queue.len() } else { 0 },
                 is_mismatch
             );
             regions.clone()
@@ -964,17 +975,14 @@ impl RdpgfxHandler {
     fn decode_h264(&mut self, h264_data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         if let Some(ref mut dec) = self.avc_dec {
             let result = dec.decode(h264_data);
-            // Check unconditionally: needs_keyframe() returns true while
-            // pipeline_elevated=1 (C keeps request_refresh=1 after the
-            // first EAGAIN until the IDR flush).  Checking here (not just
-            // on EAGAIN) ensures force-refresh PDUs are retried every ~2 s
-            // while the pipeline stays elevated in steady-state drain mode.
+            // Check unconditionally: needs_keyframe() may stay true while
+            // VideoToolbox is silent. Checking here ensures force-refresh PDUs
+            // are retried by the caller's rate limiter until decoding resumes.
             if dec.needs_keyframe() {
-                #[cfg(debug_assertions)]
-                eprintln!("[rdpgfx] AVC decoder needs IDR — scheduling force refresh");
+                log::debug!("[rdpgfx] AVC decoder needs IDR — scheduling force refresh");
                 self.needs_force_refresh = true;
             }
-            log::info!(
+            log::trace!(
                 "[rdpgfx] AVC decode {} bytes → {}",
                 h264_data.len(),
                 if result.is_some() { "frame" } else { "none" }
@@ -1098,8 +1106,7 @@ fn blit_avc_frame(
     regions: &[AvcRect],
 ) {
     if force_regions && !regions.is_empty() {
-        #[cfg(debug_assertions)]
-        eprintln!(
+        log::trace!(
             "[rdpgfx] emit AVC forced regions surf={} surface=({},{} {}x{}) abs=({},{}) frame={}x{} regions={} region_area={} frame_area={} bounds={:?}",
             surf_id,
             dx,
@@ -1144,8 +1151,7 @@ fn blit_avc_frame(
             }
         }
     }
-    #[cfg(debug_assertions)]
-    eprintln!(
+    log::trace!(
         "[rdpgfx] emit AVC full surf={} surface=({},{} {}x{}) abs=({},{}) frame={}x{} regions={} region_area={} frame_area={} bounds={:?}",
         surf_id,
         dx,
@@ -1229,8 +1235,7 @@ fn blit_avc_regions(
             }
         }
 
-        #[cfg(debug_assertions)]
-        {
+        if log::log_enabled!(log::Level::Trace) {
             // Sample the first pixel of this region from the decoded frame (BGRA).
             let sample_off = ((ry * frame_stride) + rx * 4) as usize;
             let (fb, fg, fr) = if sample_off + 2 < pixels.len() {
@@ -1255,7 +1260,7 @@ fn blit_avc_regions(
             } else {
                 (0, 0, 0)
             };
-            eprintln!(
+            log::trace!(
                 "[rdpgfx] emit AVC region surf={} surface=({},{} {}x{}) abs=({},{}) frame_px0=RGB({},{},{}) frame_ctr=RGB({},{},{})",
                 surf_id,
                 dx + rx, dy + ry, rw, rh,
@@ -1343,8 +1348,7 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
     let lc = ((cb_field >> 30) & 0x03) as u8;
     let cb_stream1 = (cb_field & 0x3FFF_FFFF) as usize;
     let rest = &data[4..];
-    #[cfg(debug_assertions)]
-    eprintln!(
+    log::trace!(
         "[rdpgfx] parse_avc444: data={} lc={} cb_stream1={} rest={}",
         data.len(),
         lc,
@@ -1363,8 +1367,7 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
                 return None;
             }
             let s = parse_avc420(&rest[..cb_stream1])?;
-            #[cfg(debug_assertions)]
-            eprintln!(
+            log::trace!(
                 "[rdpgfx] parse_avc444: lc=0 stream1={} stream2={} regions={} h264_len={} bounds={:?}",
                 cb_stream1,
                 rest.len().saturating_sub(cb_stream1),
@@ -1382,8 +1385,7 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
                 &rest[..cb_stream1]
             };
             let s = parse_avc420(stream_data)?;
-            #[cfg(debug_assertions)]
-            eprintln!(
+            log::trace!(
                 "[rdpgfx] parse_avc444: lc=1 stream={} regions={} h264_len={} bounds={:?}",
                 stream_data.len(),
                 s.regions.len(),
@@ -1398,8 +1400,7 @@ fn parse_avc444(data: &[u8]) -> Option<(Avc420Stream, u8)> {
             // standalone YUV420 H.264 bitstream.  Feeding it to the H.264 decoder
             // would corrupt the decoder's reference-frame state.
             // Skip entirely — same behaviour as grdp v0.7.6.
-            #[cfg(debug_assertions)]
-            eprintln!(
+            log::trace!(
                 "[rdpgfx] parse_avc444: lc=2 auxiliary-only skipped aux_len={} cb_stream1={}",
                 rest.len(),
                 cb_stream1

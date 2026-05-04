@@ -6,26 +6,25 @@ use std::error::Error;
 
 use rdp_core::bitmap::Bitmap;
 
-struct DirtyTextureUpdate {
-    rect: Rect,
-    pixels: Vec<u8>,
-    pitch: usize,
-}
-
 // Fields are declared in drop order (first declared → first dropped).
 // Texture must be destroyed before the renderer (canvas), so it is declared first.
 pub struct RdpUI {
-    texture: Texture,                                // dropped 1st: SDL_DestroyTexture
-    texture_creator: TextureCreator<WindowContext>,  // dropped 2nd
-    canvas: Canvas<Window>,                          // dropped 3rd: SDL_DestroyRenderer
-    /// CPU-side RGBA back-buffer: compositing target for incremental bitmap tiles.
+    texture: Texture,                               // dropped 1st: SDL_DestroyTexture
+    texture_creator: TextureCreator<WindowContext>, // dropped 2nd
+    canvas: Canvas<Window>,                         // dropped 3rd: SDL_DestroyRenderer
+    /// CPU-side BGRA back-buffer: compositing target for incremental bitmap tiles.
     back_buf: Vec<u8>,
     width: u16,
     height: u16,
 }
 
 impl RdpUI {
-    pub fn new(sdl_context: &sdl2::Sdl, width: u16, height: u16, title: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn new(
+        sdl_context: &sdl2::Sdl,
+        width: u16,
+        height: u16,
+        title: &str,
+    ) -> Result<Self, Box<dyn Error>> {
         let video_subsystem = sdl_context.video()?;
         let window = video_subsystem
             .window(title, width as u32, height as u32)
@@ -35,7 +34,10 @@ impl RdpUI {
         let canvas = match window.into_canvas().accelerated().build() {
             Ok(canvas) => canvas,
             Err(err) => {
-                log::warn!("hardware renderer unavailable, falling back to software: {}", err);
+                log::warn!(
+                    "hardware renderer unavailable, falling back to software: {}",
+                    err
+                );
                 video_subsystem
                     .window(title, width as u32, height as u32)
                     .position_centered()
@@ -46,9 +48,10 @@ impl RdpUI {
             }
         };
         let texture_creator = canvas.texture_creator();
-        // Create one streaming texture and reuse it every frame.
+        // ARGB8888 = BGRA in memory on little-endian (macOS/Linux/Windows x86).
+        // AVC frames from VideoToolbox are already BGRA — no per-pixel swap needed.
         let texture = texture_creator.create_texture_streaming(
-            PixelFormatEnum::RGBA32,
+            PixelFormatEnum::ARGB8888,
             width as u32,
             height as u32,
         )?;
@@ -66,15 +69,18 @@ impl RdpUI {
 
     /// Composite bitmap tiles into the back-buffer, update dirty texture rects, then present.
     pub fn update_screen(&mut self, bitmaps: &[Bitmap]) -> Result<(), Box<dyn Error>> {
-        let mut dirty_updates = Vec::with_capacity(bitmaps.len());
+        let mut dirty = false;
         for bitmap in bitmaps {
-            if let Some(update) = self.blit_bitmap_to_buf(bitmap) {
-                dirty_updates.push(update);
-            }
+            dirty |= self.blit_bitmap_to_texture(bitmap)?;
         }
-        #[cfg(debug_assertions)]
-        self.log_back_buffer_sample(bitmaps);
-        self.present_dirty(&dirty_updates)
+        if log::log_enabled!(log::Level::Trace) {
+            self.log_back_buffer_sample(bitmaps);
+        }
+        if dirty {
+            self.canvas.copy(&self.texture, None, None)?;
+            self.canvas.present();
+        }
+        Ok(())
     }
 
     /// Re-present the current back-buffer without modifying it.
@@ -91,7 +97,7 @@ impl RdpUI {
             .window_mut()
             .set_size(width as u32, height as u32)?;
         self.texture = self.texture_creator.create_texture_streaming(
-            PixelFormatEnum::RGBA32,
+            PixelFormatEnum::ARGB8888,
             width as u32,
             height as u32,
         )?;
@@ -110,35 +116,21 @@ impl RdpUI {
         Ok(())
     }
 
-    /// Upload only the changed texture rectangles and flip.
-    fn present_dirty(&mut self, updates: &[DirtyTextureUpdate]) -> Result<(), Box<dyn Error>> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-        for update in updates {
-            self.texture
-                .update(Some(update.rect), &update.pixels, update.pitch)?;
-        }
-        self.canvas.copy(&self.texture, None, None)?;
-        self.canvas.present();
-        Ok(())
-    }
-
-    /// Blit one bitmap tile into the CPU back-buffer and return its dirty texture update.
-    fn blit_bitmap_to_buf(&mut self, bitmap: &Bitmap) -> Option<DirtyTextureUpdate> {
-        let rgba = bitmap.to_rgba();
-        let bw = bitmap.width as usize;   // source row stride
+    /// Blit one bitmap tile into the CPU back-buffer, then upload that rect to the SDL texture.
+    ///
+    /// Texture format is ARGB8888 (= BGRA byte order on little-endian).
+    /// 32-bpp bitmap data from RDPGFX/AVC is already BGRA, so bpp=32 uses a direct
+    /// `copy_from_slice` per row (pure memcpy — fast even in debug builds).
+    fn blit_bitmap_to_texture(&mut self, bitmap: &Bitmap) -> Result<bool, Box<dyn Error>> {
+        let bw = bitmap.width as usize; // source row stride
         let bh = bitmap.height as usize;
         if bw == 0 || bh == 0 {
-            return None;
+            return Ok(false);
         }
-        // Clamp to dest rect: bitmap Width may be padded wider than
-        // DestRight-DestLeft+1 (RDP bitmaps on Linux), or conversely
-        // DestRight-DestLeft+1 may exceed Width (surface-bits on Windows).
         let rect_w = (bitmap.dest_right - bitmap.dest_left + 1).max(0) as usize;
         let rect_h = (bitmap.dest_bottom - bitmap.dest_top + 1).max(0) as usize;
         if rect_w == 0 || rect_h == 0 {
-            return None;
+            return Ok(false);
         }
         let src_x = if bitmap.dest_left < 0 {
             (-bitmap.dest_left) as usize
@@ -155,7 +147,7 @@ impl RdpUI {
         let scr_w = self.width as usize;
         let scr_h = self.height as usize;
         if src_x >= bw || src_y >= bh || dest_x >= scr_w || dest_y >= scr_h {
-            return None;
+            return Ok(false);
         }
         let clip_w = bw
             .saturating_sub(src_x)
@@ -166,33 +158,80 @@ impl RdpUI {
             .min(rect_h.saturating_sub(src_y))
             .min(scr_h.saturating_sub(dest_y));
         if clip_w == 0 || clip_h == 0 {
-            return None;
+            return Ok(false);
         }
 
-        let pitch = clip_w * 4;
-        let mut dirty_pixels = vec![0u8; pitch * clip_h];
+        let rect = Rect::new(dest_x as i32, dest_y as i32, clip_w as u32, clip_h as u32);
+        let src_bpp = match bitmap.bits_per_pixel {
+            32 => 4usize,
+            24 => 3usize,
+            16 => 2usize,
+            _ => return Ok(false),
+        };
+        let src_data = &bitmap.data;
+        let back_pitch = scr_w * 4;
+
+        // Write pixels into the CPU back-buffer (BGRA format).
         for row in 0..clip_h {
-            let dy = dest_y + row;
-            let src_start = ((src_y + row) * bw + src_x) * 4;  // use stride (bw), not clip_w
-            let dst_start = (dy * scr_w + dest_x) * 4;
-            let src_end = src_start + pitch;
-            let dst_end = dst_start + pitch;
-            if src_end <= rgba.len() && dst_end <= self.back_buf.len() {
-                self.back_buf[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
-                let dirty_start = row * pitch;
-                dirty_pixels[dirty_start..dirty_start + pitch]
-                    .copy_from_slice(&rgba[src_start..src_end]);
+            let src_start = ((src_y + row) * bw + src_x) * src_bpp;
+            let back_start = ((dest_y + row) * scr_w + dest_x) * 4;
+            let back_row = &mut self.back_buf[back_start..back_start + clip_w * 4];
+            match bitmap.bits_per_pixel {
+                32 => {
+                    let src_end = src_start + clip_w * 4;
+                    if src_end > src_data.len() {
+                        return Ok(false);
+                    }
+                    // Source is BGRA; back-buffer is BGRA: direct memcpy, no per-pixel work.
+                    back_row.copy_from_slice(&src_data[src_start..src_end]);
+                }
+                24 => {
+                    let src_end = src_start + clip_w * 3;
+                    if src_end > src_data.len() {
+                        return Ok(false);
+                    }
+                    let src_row = &src_data[src_start..src_end];
+                    for col in 0..clip_w {
+                        let s = col * 3;
+                        let d = col * 4;
+                        // Source is BGR; BGRA back-buffer: add A=255, no swap.
+                        back_row[d] = src_row[s];
+                        back_row[d + 1] = src_row[s + 1];
+                        back_row[d + 2] = src_row[s + 2];
+                        back_row[d + 3] = 255;
+                    }
+                }
+                16 => {
+                    let src_end = src_start + clip_w * 2;
+                    if src_end > src_data.len() {
+                        return Ok(false);
+                    }
+                    let src_row = &src_data[src_start..src_end];
+                    for col in 0..clip_w {
+                        let s = col * 2;
+                        let d = col * 4;
+                        let v = u16::from_le_bytes([src_row[s], src_row[s + 1]]);
+                        let r5 = ((v >> 11) & 0x1f) as u8;
+                        let g6 = ((v >> 5) & 0x3f) as u8;
+                        let b5 = (v & 0x1f) as u8;
+                        // Expand to BGRA.
+                        back_row[d] = (b5 << 3) | (b5 >> 2);
+                        back_row[d + 1] = (g6 << 2) | (g6 >> 4);
+                        back_row[d + 2] = (r5 << 3) | (r5 >> 2);
+                        back_row[d + 3] = 255;
+                    }
+                }
+                _ => {}
             }
         }
 
-        Some(DirtyTextureUpdate {
-            rect: Rect::new(dest_x as i32, dest_y as i32, clip_w as u32, clip_h as u32),
-            pixels: dirty_pixels,
-            pitch,
-        })
+        // Upload the updated rect from back_buf to the SDL texture via SDL's C memcpy path.
+        let back_start = (dest_y * scr_w + dest_x) * 4;
+        self.texture
+            .update(Some(rect), &self.back_buf[back_start..], back_pitch)?;
+        Ok(true)
     }
 
-    #[cfg(debug_assertions)]
     fn log_back_buffer_sample(&self, bitmaps: &[Bitmap]) {
         if bitmaps.is_empty() || self.back_buf.is_empty() {
             return;
@@ -217,7 +256,11 @@ impl RdpUI {
             let pixel_rgba = |px: usize, py: usize| -> (u8, u8, u8) {
                 let off = (py * scr_w + px) * 4;
                 if off + 2 < self.back_buf.len() {
-                    (self.back_buf[off], self.back_buf[off + 1], self.back_buf[off + 2])
+                    (
+                        self.back_buf[off],
+                        self.back_buf[off + 1],
+                        self.back_buf[off + 2],
+                    )
                 } else {
                     (0, 0, 0)
                 }
@@ -225,7 +268,7 @@ impl RdpUI {
             let (r0, g0, b0) = pixel_rgba(0, 0);
             let (r1, g1, b1) = pixel_rgba(512.min(scr_w - 1), 128.min(self.height as usize - 1));
             let (r2, g2, b2) = pixel_rgba(scr_w / 2, self.height as usize / 2);
-            eprintln!(
+            log::trace!(
                 "[rdp-sdl2] backbuf avg_luma={} samples={} size={}x{} px(0,0)=RGB({},{},{}) px(512,128)=RGB({},{},{}) px(mid)=RGB({},{},{})",
                 sum / count,
                 count,

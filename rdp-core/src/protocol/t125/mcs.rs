@@ -1,9 +1,9 @@
-use crate::error::RdpError;
-use crate::protocol::Transport;
-use crate::protocol::x224::X224;
-use crate::core::io::*;
 use super::ber;
 use super::gcc::ServerData;
+use crate::core::io::*;
+use crate::error::RdpError;
+use crate::protocol::x224::X224;
+use crate::protocol::Transport;
 
 const MCS_CONNECT_INITIAL: u8 = 0x65;
 const MCS_CONNECT_RESPONSE: u8 = 0x66;
@@ -23,7 +23,16 @@ pub struct McsClient<T: Transport> {
     pub channels: Vec<u16>,
 }
 
-fn encode_domain_params(max_channels: i32, max_users: i32, max_tokens: i32, num_priorities: i32, min_throughput: i32, max_height: i32, max_pdu_size: i32, proto_ver: i32) -> Vec<u8> {
+fn encode_domain_params(
+    max_channels: i32,
+    max_users: i32,
+    max_tokens: i32,
+    num_priorities: i32,
+    min_throughput: i32,
+    max_height: i32,
+    max_pdu_size: i32,
+    proto_ver: i32,
+) -> Vec<u8> {
     let mut seq = Vec::new();
     seq.extend_from_slice(&ber::encode_integer(max_channels));
     seq.extend_from_slice(&ber::encode_integer(max_users));
@@ -86,7 +95,10 @@ impl<T: Transport> McsClient<T> {
 
         let result = ber::decode_integer(&data, &mut pos)?;
         if result != 0 {
-            return Err(RdpError::Protocol(format!("MCS Connect Response failed: {}", result)));
+            return Err(RdpError::Protocol(format!(
+                "MCS Connect Response failed: {}",
+                result
+            )));
         }
 
         let _connect_id = ber::decode_integer(&data, &mut pos)?;
@@ -180,7 +192,10 @@ impl<T: Transport> McsClient<T> {
             return Err(RdpError::Closed);
         }
         if pdu_type != MCS_SEND_DATA_INDICATION {
-            return Err(RdpError::Protocol(format!("MCS recv_data: unexpected type {}", pdu_type)));
+            return Err(RdpError::Protocol(format!(
+                "MCS recv_data: unexpected type {}",
+                pdu_type
+            )));
         }
         if data.len() < 7 {
             return Err(RdpError::Protocol("MCS recv_data: too short".into()));
@@ -189,7 +204,9 @@ impl<T: Transport> McsClient<T> {
         // PER length field at byte 6: if high bit set, two-byte length (skip byte 7 too)
         let payload_start = if data[6] & 0x80 != 0 { 8 } else { 7 };
         if payload_start > data.len() {
-            return Err(RdpError::Protocol("MCS recv_data: payload_start out of range".into()));
+            return Err(RdpError::Protocol(
+                "MCS recv_data: payload_start out of range".into(),
+            ));
         }
         let payload = data[payload_start..].to_vec();
         Ok((channel_id, payload))
@@ -209,7 +226,11 @@ fn parse_gcc_conference_response(data: &[u8]) -> Result<ServerData, RdpError> {
     let mut pos = 0;
     while pos + 4 <= data.len() {
         let block_type = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        if block_type == 0x0C01 || block_type == 0x0C02 || block_type == 0x0C03 || block_type == 0x0C04 {
+        if block_type == 0x0C01
+            || block_type == 0x0C02
+            || block_type == 0x0C03
+            || block_type == 0x0C04
+        {
             break;
         }
         pos += 1;

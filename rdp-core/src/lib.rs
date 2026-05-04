@@ -1,11 +1,11 @@
-pub mod error;
-pub mod bitmap;
-pub mod core;
-pub mod protocol;
-pub mod plugin;
-pub mod client;
 pub mod avc;
+pub mod bitmap;
+pub mod client;
+pub mod core;
+pub mod error;
+pub mod plugin;
+pub mod protocol;
 
-pub use error::RdpError;
-pub use client::{RdpSession, RdpEvent};
 pub use avc::AvcDecoder;
+pub use client::{RdpEvent, RdpSession};
+pub use error::RdpError;

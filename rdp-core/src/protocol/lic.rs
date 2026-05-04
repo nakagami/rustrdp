@@ -19,7 +19,10 @@ pub fn parse_license_pdu(data: &[u8]) -> Result<bool, RdpError> {
                     return Ok(true);
                 }
             }
-            Err(RdpError::Protocol(format!("License error type: {:02x}", msg_type)))
+            Err(RdpError::Protocol(format!(
+                "License error type: {:02x}",
+                msg_type
+            )))
         }
         NEW_LICENSE | UPGRADE_LICENSE => Ok(true),
         _ => Ok(false),

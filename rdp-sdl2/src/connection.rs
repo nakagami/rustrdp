@@ -1,18 +1,18 @@
-use rdp_core::client::RdpSession;
-use rdp_core::protocol::Transport;
-use rdp_core::error::RdpError;
 use async_trait::async_trait;
-use rustls::ClientConfig;
+use rdp_core::client::RdpSession;
+use rdp_core::error::RdpError;
+use rdp_core::protocol::Transport;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::client::danger::{ServerCertVerifier, HandshakeSignatureValid, ServerCertVerified};
+use rustls::ClientConfig;
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
 use std::error::Error;
 use std::net::IpAddr;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
 
 use crate::config::RdpConfig;
 
@@ -112,8 +112,12 @@ impl Transport for SimpleTransport {
 
     async fn close(&mut self) {
         match self.stream.take() {
-            Some(Stream::Plain(mut s)) => { let _ = s.shutdown().await; }
-            Some(Stream::Tls(mut s)) => { let _ = s.shutdown().await; }
+            Some(Stream::Plain(mut s)) => {
+                let _ = s.shutdown().await;
+            }
+            Some(Stream::Tls(mut s)) => {
+                let _ = s.shutdown().await;
+            }
             None => {}
         }
     }
@@ -121,17 +125,20 @@ impl Transport for SimpleTransport {
     async fn start_tls(&mut self) -> Result<Vec<u8>, RdpError> {
         let plain = match self.stream.take() {
             Some(Stream::Plain(s)) => s,
-            _ => return Err(RdpError::Unsupported("start_tls called in invalid state".to_string())),
+            _ => {
+                return Err(RdpError::Unsupported(
+                    "start_tls called in invalid state".to_string(),
+                ))
+            }
         };
 
-        let config = ClientConfig::builder_with_provider(
-            Arc::new(rustls::crypto::ring::default_provider()),
-        )
-        .with_safe_default_protocol_versions()
-        .map_err(|e| RdpError::Io(e.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-        .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| RdpError::Io(e.to_string()))?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+                .with_no_client_auth();
 
         let server_name: ServerName<'static> = match self.host.parse::<IpAddr>() {
             Ok(ip) => ServerName::IpAddress(ip.into()),
@@ -140,11 +147,15 @@ impl Transport for SimpleTransport {
         };
 
         let connector = TlsConnector::from(Arc::new(config));
-        let tls_stream = connector.connect(server_name, plain).await
+        let tls_stream = connector
+            .connect(server_name, plain)
+            .await
             .map_err(|e| RdpError::Io(format!("TLS handshake failed: {}", e)))?;
 
         // Extract server certificate RSA public key for NLA/CredSSP
-        let cert_der: Option<Vec<u8>> = tls_stream.get_ref().1
+        let cert_der: Option<Vec<u8>> = tls_stream
+            .get_ref()
+            .1
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|cert| cert.as_ref().to_vec());
@@ -176,13 +187,17 @@ fn extract_rsa_pubkey(cert_der: &[u8]) -> Option<Vec<u8>> {
     }
 
     for _ in 0..5 {
-        if pos >= tbs_end { return None; }
+        if pos >= tbs_end {
+            return None;
+        }
         pos += 1;
         let l = der_skip_length(cert_der, &mut pos)?;
         pos += l;
     }
 
-    if pos >= tbs_end || cert_der[pos] != 0x30 { return None; }
+    if pos >= tbs_end || cert_der[pos] != 0x30 {
+        return None;
+    }
     pos += 1;
     der_skip_length(cert_der, &mut pos)?;
     der_expect_tag(cert_der, &mut pos, 0x30)?;
@@ -190,28 +205,38 @@ fn extract_rsa_pubkey(cert_der: &[u8]) -> Option<Vec<u8>> {
     pos += alg_len;
     der_expect_tag(cert_der, &mut pos, 0x03)?;
     let bs_len = der_skip_length(cert_der, &mut pos)?;
-    if bs_len < 1 || pos >= cert_der.len() { return None; }
+    if bs_len < 1 || pos >= cert_der.len() {
+        return None;
+    }
     pos += 1; // skip unused-bits byte
     let rsa_len = bs_len - 1;
-    if pos + rsa_len > cert_der.len() { return None; }
+    if pos + rsa_len > cert_der.len() {
+        return None;
+    }
     Some(cert_der[pos..pos + rsa_len].to_vec())
 }
 
 fn der_expect_tag(data: &[u8], pos: &mut usize, expected: u8) -> Option<()> {
-    if *pos >= data.len() || data[*pos] != expected { return None; }
+    if *pos >= data.len() || data[*pos] != expected {
+        return None;
+    }
     *pos += 1;
     Some(())
 }
 
 fn der_skip_length(data: &[u8], pos: &mut usize) -> Option<usize> {
-    if *pos >= data.len() { return None; }
+    if *pos >= data.len() {
+        return None;
+    }
     let b = data[*pos];
     *pos += 1;
     if b & 0x80 == 0 {
         Some(b as usize)
     } else {
         let n = (b & 0x7F) as usize;
-        if *pos + n > data.len() { return None; }
+        if *pos + n > data.len() {
+            return None;
+        }
         let mut len = 0usize;
         for _ in 0..n {
             len = (len << 8) | data[*pos] as usize;
@@ -224,7 +249,9 @@ fn der_skip_length(data: &[u8], pos: &mut usize) -> Option<usize> {
 pub struct RdpConnection;
 
 impl RdpConnection {
-    pub async fn connect(config: &RdpConfig) -> Result<RdpSession<SimpleTransport>, Box<dyn Error>> {
+    pub async fn connect(
+        config: &RdpConfig,
+    ) -> Result<RdpSession<SimpleTransport>, Box<dyn Error>> {
         log::info!(
             "Connecting to {}:{} as {}",
             config.host,

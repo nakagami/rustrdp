@@ -24,46 +24,286 @@ struct ZgfxTokenDef {
 }
 
 static TOKEN_TABLE: &[ZgfxTokenDef] = &[
-    ZgfxTokenDef { prefix_len: 1, prefix_code: 0,   value_bits: 8,  token_type: TOKEN_LITERAL, value_base: 0 },
-    ZgfxTokenDef { prefix_len: 5, prefix_code: 17,  value_bits: 5,  token_type: TOKEN_MATCH,   value_base: 0 },
-    ZgfxTokenDef { prefix_len: 5, prefix_code: 18,  value_bits: 7,  token_type: TOKEN_MATCH,   value_base: 32 },
-    ZgfxTokenDef { prefix_len: 5, prefix_code: 19,  value_bits: 9,  token_type: TOKEN_MATCH,   value_base: 160 },
-    ZgfxTokenDef { prefix_len: 5, prefix_code: 20,  value_bits: 10, token_type: TOKEN_MATCH,   value_base: 672 },
-    ZgfxTokenDef { prefix_len: 5, prefix_code: 21,  value_bits: 12, token_type: TOKEN_MATCH,   value_base: 1696 },
-    ZgfxTokenDef { prefix_len: 5, prefix_code: 24,  value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x00 },
-    ZgfxTokenDef { prefix_len: 5, prefix_code: 25,  value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x01 },
-    ZgfxTokenDef { prefix_len: 6, prefix_code: 44,  value_bits: 14, token_type: TOKEN_MATCH,   value_base: 5792 },
-    ZgfxTokenDef { prefix_len: 6, prefix_code: 45,  value_bits: 15, token_type: TOKEN_MATCH,   value_base: 22176 },
-    ZgfxTokenDef { prefix_len: 6, prefix_code: 52,  value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x02 },
-    ZgfxTokenDef { prefix_len: 6, prefix_code: 53,  value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x03 },
-    ZgfxTokenDef { prefix_len: 6, prefix_code: 54,  value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0xFF },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 92,  value_bits: 18, token_type: TOKEN_MATCH,   value_base: 54944 },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 93,  value_bits: 20, token_type: TOKEN_MATCH,   value_base: 317088 },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 110, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x04 },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 111, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x05 },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 112, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x06 },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 113, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x07 },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 114, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x08 },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 115, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x09 },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 116, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x0A },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 117, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x0B },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 118, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x3A },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 119, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x3B },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 120, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x3C },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 121, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x3D },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 122, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x3E },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 123, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x3F },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 124, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x40 },
-    ZgfxTokenDef { prefix_len: 7, prefix_code: 125, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x80 },
-    ZgfxTokenDef { prefix_len: 8, prefix_code: 188, value_bits: 20, token_type: TOKEN_MATCH,   value_base: 1365664 },
-    ZgfxTokenDef { prefix_len: 8, prefix_code: 189, value_bits: 21, token_type: TOKEN_MATCH,   value_base: 2414240 },
-    ZgfxTokenDef { prefix_len: 8, prefix_code: 252, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x0C },
-    ZgfxTokenDef { prefix_len: 8, prefix_code: 253, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x38 },
-    ZgfxTokenDef { prefix_len: 8, prefix_code: 254, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x39 },
-    ZgfxTokenDef { prefix_len: 8, prefix_code: 255, value_bits: 0,  token_type: TOKEN_LITERAL, value_base: 0x66 },
-    ZgfxTokenDef { prefix_len: 9, prefix_code: 380, value_bits: 22, token_type: TOKEN_MATCH,   value_base: 4511392 },
-    ZgfxTokenDef { prefix_len: 9, prefix_code: 381, value_bits: 23, token_type: TOKEN_MATCH,   value_base: 8705696 },
-    ZgfxTokenDef { prefix_len: 9, prefix_code: 382, value_bits: 24, token_type: TOKEN_MATCH,   value_base: 17094304 },
+    ZgfxTokenDef {
+        prefix_len: 1,
+        prefix_code: 0,
+        value_bits: 8,
+        token_type: TOKEN_LITERAL,
+        value_base: 0,
+    },
+    ZgfxTokenDef {
+        prefix_len: 5,
+        prefix_code: 17,
+        value_bits: 5,
+        token_type: TOKEN_MATCH,
+        value_base: 0,
+    },
+    ZgfxTokenDef {
+        prefix_len: 5,
+        prefix_code: 18,
+        value_bits: 7,
+        token_type: TOKEN_MATCH,
+        value_base: 32,
+    },
+    ZgfxTokenDef {
+        prefix_len: 5,
+        prefix_code: 19,
+        value_bits: 9,
+        token_type: TOKEN_MATCH,
+        value_base: 160,
+    },
+    ZgfxTokenDef {
+        prefix_len: 5,
+        prefix_code: 20,
+        value_bits: 10,
+        token_type: TOKEN_MATCH,
+        value_base: 672,
+    },
+    ZgfxTokenDef {
+        prefix_len: 5,
+        prefix_code: 21,
+        value_bits: 12,
+        token_type: TOKEN_MATCH,
+        value_base: 1696,
+    },
+    ZgfxTokenDef {
+        prefix_len: 5,
+        prefix_code: 24,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x00,
+    },
+    ZgfxTokenDef {
+        prefix_len: 5,
+        prefix_code: 25,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x01,
+    },
+    ZgfxTokenDef {
+        prefix_len: 6,
+        prefix_code: 44,
+        value_bits: 14,
+        token_type: TOKEN_MATCH,
+        value_base: 5792,
+    },
+    ZgfxTokenDef {
+        prefix_len: 6,
+        prefix_code: 45,
+        value_bits: 15,
+        token_type: TOKEN_MATCH,
+        value_base: 22176,
+    },
+    ZgfxTokenDef {
+        prefix_len: 6,
+        prefix_code: 52,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x02,
+    },
+    ZgfxTokenDef {
+        prefix_len: 6,
+        prefix_code: 53,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x03,
+    },
+    ZgfxTokenDef {
+        prefix_len: 6,
+        prefix_code: 54,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0xFF,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 92,
+        value_bits: 18,
+        token_type: TOKEN_MATCH,
+        value_base: 54944,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 93,
+        value_bits: 20,
+        token_type: TOKEN_MATCH,
+        value_base: 317088,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 110,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x04,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 111,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x05,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 112,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x06,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 113,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x07,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 114,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x08,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 115,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x09,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 116,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x0A,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 117,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x0B,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 118,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x3A,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 119,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x3B,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 120,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x3C,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 121,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x3D,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 122,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x3E,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 123,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x3F,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 124,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x40,
+    },
+    ZgfxTokenDef {
+        prefix_len: 7,
+        prefix_code: 125,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x80,
+    },
+    ZgfxTokenDef {
+        prefix_len: 8,
+        prefix_code: 188,
+        value_bits: 20,
+        token_type: TOKEN_MATCH,
+        value_base: 1365664,
+    },
+    ZgfxTokenDef {
+        prefix_len: 8,
+        prefix_code: 189,
+        value_bits: 21,
+        token_type: TOKEN_MATCH,
+        value_base: 2414240,
+    },
+    ZgfxTokenDef {
+        prefix_len: 8,
+        prefix_code: 252,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x0C,
+    },
+    ZgfxTokenDef {
+        prefix_len: 8,
+        prefix_code: 253,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x38,
+    },
+    ZgfxTokenDef {
+        prefix_len: 8,
+        prefix_code: 254,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x39,
+    },
+    ZgfxTokenDef {
+        prefix_len: 8,
+        prefix_code: 255,
+        value_bits: 0,
+        token_type: TOKEN_LITERAL,
+        value_base: 0x66,
+    },
+    ZgfxTokenDef {
+        prefix_len: 9,
+        prefix_code: 380,
+        value_bits: 22,
+        token_type: TOKEN_MATCH,
+        value_base: 4511392,
+    },
+    ZgfxTokenDef {
+        prefix_len: 9,
+        prefix_code: 381,
+        value_bits: 23,
+        token_type: TOKEN_MATCH,
+        value_base: 8705696,
+    },
+    ZgfxTokenDef {
+        prefix_len: 9,
+        prefix_code: 382,
+        value_bits: 24,
+        token_type: TOKEN_MATCH,
+        value_base: 17094304,
+    },
 ];
 
 fn build_lut() -> Box<[TokenLutEntry; 512]> {
@@ -90,18 +330,27 @@ fn build_lut() -> Box<[TokenLutEntry; 512]> {
 struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
-    bit_pos: u8,       // bits remaining in current byte (8..1)
+    bit_pos: u8, // bits remaining in current byte (8..1)
     bits_remaining: u32,
 }
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
         if data.len() < 2 {
-            return BitReader { data: &[], byte_pos: 0, bit_pos: 8, bits_remaining: 0 };
+            return BitReader {
+                data: &[],
+                byte_pos: 0,
+                bit_pos: 8,
+                bits_remaining: 0,
+            };
         }
         let padding_bits = data[data.len() - 1] as u32;
         let total_bits = (data.len() as u32 - 1) * 8;
-        let bits_remaining = if padding_bits > total_bits { 0 } else { total_bits - padding_bits };
+        let bits_remaining = if padding_bits > total_bits {
+            0
+        } else {
+            total_bits - padding_bits
+        };
         BitReader {
             data: &data[..data.len() - 1],
             byte_pos: 0,
@@ -173,7 +422,9 @@ impl<'a> BitReader<'a> {
     }
 
     fn get_bits(&mut self, n: u8) -> u32 {
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         // Fast path: enough bits in current byte
         if n <= self.bit_pos && self.byte_pos < self.data.len() {
             self.bit_pos -= n;
@@ -209,7 +460,9 @@ impl ZgfxContext {
 
     pub fn history_write(&mut self, data: &[u8]) {
         let n = data.len();
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         if n >= HISTORY_SIZE {
             let start = n - HISTORY_SIZE;
             self.history.copy_from_slice(&data[start..]);
@@ -241,7 +494,9 @@ impl ZgfxContext {
     }
 
     fn output_match(&mut self, distance: usize, count: usize, out: &mut Vec<u8>) {
-        if distance == 0 || count == 0 { return; }
+        if distance == 0 || count == 0 {
+            return;
+        }
         let base = out.len();
         out.resize(base + count, 0);
 
@@ -267,7 +522,8 @@ impl ZgfxContext {
             } else {
                 let first = HISTORY_SIZE - src_idx;
                 out[base..base + first].copy_from_slice(&self.history[src_idx..]);
-                out[base + first..base + distance].copy_from_slice(&self.history[..distance - first]);
+                out[base + first..base + distance]
+                    .copy_from_slice(&self.history[..distance - first]);
             }
             for i in distance..count {
                 out[base + i] = out[base + i - distance];
@@ -280,7 +536,9 @@ impl ZgfxContext {
     fn decode_match_count(&self, br: &mut BitReader) -> usize {
         let bit = br.get_bit();
         br.bits_remaining = br.bits_remaining.saturating_sub(1);
-        if bit == 0 { return 3; }
+        if bit == 0 {
+            return 3;
+        }
 
         let mut count: usize = 4;
         let mut extra: u8 = 2;
@@ -294,33 +552,45 @@ impl ZgfxContext {
             br.bits_remaining = br.bits_remaining.saturating_sub(1);
         }
 
-        if br.bits_remaining < extra as u32 { return count; }
+        if br.bits_remaining < extra as u32 {
+            return count;
+        }
         count += br.get_bits(extra) as usize;
         br.bits_remaining = br.bits_remaining.saturating_sub(extra as u32);
         count
     }
 
     fn decompress_raw(&mut self, data: &[u8]) -> Vec<u8> {
-        if data.len() < 2 { return vec![]; }
+        if data.len() < 2 {
+            return vec![];
+        }
         let mut br = BitReader::new(data);
         let mut out = Vec::with_capacity(data.len() * 3);
 
         while br.has_bits_remaining() {
             let (val, avail) = br.peek9();
-            if avail == 0 { break; }
+            if avail == 0 {
+                break;
+            }
 
             let e = self.lut[val as usize];
-            if e.prefix_len == 0 || avail < e.prefix_len { break; }
+            if e.prefix_len == 0 || avail < e.prefix_len {
+                break;
+            }
 
             br.consume_bits(e.prefix_len);
 
             if e.token_type == TOKEN_LITERAL {
-                if br.bits_remaining < e.value_bits as u32 { break; }
+                if br.bits_remaining < e.value_bits as u32 {
+                    break;
+                }
                 let value = e.value_base + br.get_bits(e.value_bits);
                 br.bits_remaining = br.bits_remaining.saturating_sub(e.value_bits as u32);
                 self.output_literal(value as u8, &mut out);
             } else {
-                if br.bits_remaining < e.value_bits as u32 { break; }
+                if br.bits_remaining < e.value_bits as u32 {
+                    break;
+                }
                 let distance = (e.value_base + br.get_bits(e.value_bits)) as usize;
                 br.bits_remaining = br.bits_remaining.saturating_sub(e.value_bits as u32);
 
@@ -329,7 +599,9 @@ impl ZgfxContext {
                     self.output_match(distance, count, &mut out);
                 } else {
                     // Raw unencoded block
-                    if br.bits_remaining < 15 { break; }
+                    if br.bits_remaining < 15 {
+                        break;
+                    }
                     let raw_count = br.get_bits(15) as usize;
                     br.bits_remaining = br.bits_remaining.saturating_sub(15);
                     // Byte-align
@@ -338,8 +610,12 @@ impl ZgfxContext {
                         br.byte_pos += 1;
                         br.bit_pos = 8;
                     }
-                    if br.byte_pos + raw_count > br.data.len() { break; }
-                    if (raw_count as u32) * 8 > br.bits_remaining { break; }
+                    if br.byte_pos + raw_count > br.data.len() {
+                        break;
+                    }
+                    if (raw_count as u32) * 8 > br.bits_remaining {
+                        break;
+                    }
                     let raw = br.data[br.byte_pos..br.byte_pos + raw_count].to_vec();
                     br.byte_pos += raw_count;
                     br.bits_remaining = br.bits_remaining.saturating_sub(raw_count as u32 * 8);
@@ -353,7 +629,9 @@ impl ZgfxContext {
     }
 
     fn decompress_segment(&mut self, seg: &[u8]) -> Vec<u8> {
-        if seg.is_empty() { return vec![]; }
+        if seg.is_empty() {
+            return vec![];
+        }
         let header = seg[0];
         let payload = &seg[1..];
         if header & 0x20 != 0 {
@@ -365,18 +643,27 @@ impl ZgfxContext {
     }
 
     fn decompress_multipart(&mut self, data: &[u8]) -> Vec<u8> {
-        if data.len() < 6 { return vec![]; }
+        if data.len() < 6 {
+            return vec![];
+        }
         let seg_count = u16::from_le_bytes([data[0], data[1]]) as usize;
         let _uncomp_size = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
         let mut offset = 6;
         let mut result = Vec::new();
         for _ in 0..seg_count {
-            if offset + 4 > data.len() { break; }
+            if offset + 4 > data.len() {
+                break;
+            }
             let seg_size = u32::from_le_bytes([
-                data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
             ]) as usize;
             offset += 4;
-            if offset + seg_size > data.len() { break; }
+            if offset + seg_size > data.len() {
+                break;
+            }
             let decompressed = self.decompress_segment(&data[offset..offset + seg_size]);
             offset += seg_size;
             result.extend_from_slice(&decompressed);
@@ -387,18 +674,27 @@ impl ZgfxContext {
     /// Decompress a full ZGFX payload (including the descriptor byte).
     /// Returns decompressed bytes.
     pub fn decompress(&mut self, data: &[u8]) -> Vec<u8> {
-        if data.is_empty() { return vec![]; }
+        if data.is_empty() {
+            return vec![];
+        }
         match data[0] {
             0xE0 => {
-                if data.len() < 2 { return vec![]; }
+                if data.len() < 2 {
+                    return vec![];
+                }
                 self.decompress_segment(&data[1..])
             }
             0xE1 => {
-                if data.len() < 7 { return vec![]; }
+                if data.len() < 7 {
+                    return vec![];
+                }
                 self.decompress_multipart(&data[1..])
             }
             _ => {
-                log::warn!("[zgfx] unknown descriptor 0x{:02X}, passing through", data[0]);
+                log::warn!(
+                    "[zgfx] unknown descriptor 0x{:02X}, passing through",
+                    data[0]
+                );
                 data.to_vec()
             }
         }
@@ -410,8 +706,10 @@ mod tests {
     use super::*;
     #[test]
     fn test_caps_confirm_decompress() {
-        let input = [0xE0u8, 0x24, 0x09, 0xE3, 0x18, 0x0A, 0x44, 0x8C,
-                     0xF1, 0xE9, 0x8D, 0xD1, 0x43, 0x4C, 0x63, 0x00, 0x05];
+        let input = [
+            0xE0u8, 0x24, 0x09, 0xE3, 0x18, 0x0A, 0x44, 0x8C, 0xF1, 0xE9, 0x8D, 0xD1, 0x43, 0x4C,
+            0x63, 0x00, 0x05,
+        ];
         let mut ctx = ZgfxContext::new();
         let result = ctx.decompress(&input);
         assert_eq!(result[0], 0x13);

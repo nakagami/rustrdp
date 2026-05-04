@@ -91,7 +91,11 @@ impl InputHandler {
         (x as u16, y as u16)
     }
 
-    pub fn handle_mouse_button(&self, button: sdl2::mouse::MouseButton, down: bool) -> Option<(u8, bool)> {
+    pub fn handle_mouse_button(
+        &self,
+        button: sdl2::mouse::MouseButton,
+        down: bool,
+    ) -> Option<(u8, bool)> {
         let btn = match button {
             sdl2::mouse::MouseButton::Left => 1,
             sdl2::mouse::MouseButton::Right => 2,

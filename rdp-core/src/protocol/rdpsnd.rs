@@ -61,10 +61,16 @@ impl WaveFormat {
         let tag = u16::from_le_bytes([data[offset], data[offset + 1]]);
         let channels = u16::from_le_bytes([data[offset + 2], data[offset + 3]]);
         let samples_per_sec = u32::from_le_bytes([
-            data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
         ]);
         let avg_bytes_per_sec = u32::from_le_bytes([
-            data[offset + 8], data[offset + 9], data[offset + 10], data[offset + 11],
+            data[offset + 8],
+            data[offset + 9],
+            data[offset + 10],
+            data[offset + 11],
         ]);
         let block_align = u16::from_le_bytes([data[offset + 12], data[offset + 13]]);
         let bits_per_sample = u16::from_le_bytes([data[offset + 14], data[offset + 15]]);
@@ -75,7 +81,15 @@ impl WaveFormat {
         }
         let extra_data = data[offset + 18..end].to_vec();
         Some((
-            WaveFormat { tag, channels, samples_per_sec, avg_bytes_per_sec, block_align, bits_per_sample, extra_data },
+            WaveFormat {
+                tag,
+                channels,
+                samples_per_sec,
+                avg_bytes_per_sec,
+                block_align,
+                bits_per_sample,
+                extra_data,
+            },
             end,
         ))
     }
@@ -125,7 +139,11 @@ impl RdpsndHandler {
         let body_end = (4 + body_size).min(data.len());
         let body = &data[4..body_end];
 
-        log::debug!("[rdpsnd] recv msgType=0x{:02x} bodySize={}", msg_type, body_size);
+        log::debug!(
+            "[rdpsnd] recv msgType=0x{:02x} bodySize={}",
+            msg_type,
+            body_size
+        );
 
         match msg_type {
             SNDC_FORMATS => self.process_server_formats(body),
@@ -154,7 +172,11 @@ impl RdpsndHandler {
         let num_formats = u16::from_le_bytes([body[14], body[15]]) as usize;
         let server_version = u16::from_le_bytes([body[17], body[18]]);
 
-        log::debug!("[rdpsnd] Server Formats: version={} numFormats={}", server_version, num_formats);
+        log::debug!(
+            "[rdpsnd] Server Formats: version={} numFormats={}",
+            server_version,
+            num_formats
+        );
 
         let mut offset = 20;
         self.server_formats.clear();
@@ -163,7 +185,11 @@ impl RdpsndHandler {
                 Some((fmt, new_offset)) => {
                     log::debug!(
                         "[rdpsnd] server format[{}]: tag=0x{:04x} {}Hz {}ch {}bit",
-                        i, fmt.tag, fmt.samples_per_sec, fmt.channels, fmt.bits_per_sample
+                        i,
+                        fmt.tag,
+                        fmt.samples_per_sec,
+                        fmt.channels,
+                        fmt.bits_per_sample
                     );
                     self.server_formats.push(fmt);
                     offset = new_offset;
@@ -203,13 +229,13 @@ impl RdpsndHandler {
         //         +cLastBlockConfirmed(1)+wVersion(2)+bPad(1)
         let mut hdr = Vec::new();
         hdr.extend_from_slice(&TSSNDCAPS_ALIVE.to_le_bytes()); // dwFlags
-        hdr.extend_from_slice(&0u32.to_le_bytes());            // dwVolume
-        hdr.extend_from_slice(&0u32.to_le_bytes());            // dwPitch
-        hdr.extend_from_slice(&0u16.to_le_bytes());            // wDGramPort
+        hdr.extend_from_slice(&0u32.to_le_bytes()); // dwVolume
+        hdr.extend_from_slice(&0u32.to_le_bytes()); // dwPitch
+        hdr.extend_from_slice(&0u16.to_le_bytes()); // wDGramPort
         hdr.extend_from_slice(&(self.client_format_indices.len() as u16).to_le_bytes());
-        hdr.push(0);                                           // cLastBlockConfirmed
-        hdr.extend_from_slice(&version.to_le_bytes());        // wVersion
-        hdr.push(0);                                           // bPad
+        hdr.push(0); // cLastBlockConfirmed
+        hdr.extend_from_slice(&version.to_le_bytes()); // wVersion
+        hdr.push(0); // bPad
 
         let body: Vec<u8> = hdr.iter().chain(format_data.iter()).cloned().collect();
 
@@ -219,7 +245,11 @@ impl RdpsndHandler {
         pdu.extend_from_slice(&(body.len() as u16).to_le_bytes());
         pdu.extend_from_slice(&body);
 
-        log::debug!("[rdpsnd] sending Client Formats: version={} numFormats={}", version, self.client_format_indices.len());
+        log::debug!(
+            "[rdpsnd] sending Client Formats: version={} numFormats={}",
+            version,
+            self.client_format_indices.len()
+        );
 
         // Also append Quality Mode PDU (Windows waits ~10s without it)
         let quality_pdu = self.build_quality_mode();
@@ -274,18 +304,33 @@ impl RdpsndHandler {
         if format_no < self.client_format_indices.len() {
             self.active_format_index = Some(self.client_format_indices[format_no]);
         } else {
-            log::warn!("[rdpsnd] WaveInfo format index {} out of range (max {})", format_no, self.client_format_indices.len());
+            log::warn!(
+                "[rdpsnd] WaveInfo format index {} out of range (max {})",
+                format_no,
+                self.client_format_indices.len()
+            );
         }
 
         self.expecting_wave = true;
-        log::debug!("[rdpsnd] WaveInfo: ts={} fmt={} block={}", timestamp, format_no, block_no);
+        log::debug!(
+            "[rdpsnd] WaveInfo: ts={} fmt={} block={}",
+            timestamp,
+            format_no,
+            block_no
+        );
     }
 
     fn process_wave_body(&mut self, data: &[u8]) -> (Vec<u8>, Option<AudioEvent>) {
         self.expecting_wave = false;
         // First 4 bytes of wave body duplicate the WaveInfo header (padding); skip them.
-        let audio_data: Vec<u8> = self.pending_wave.iter()
-            .chain(if data.len() > 4 { data[4..].iter() } else { [].iter() })
+        let audio_data: Vec<u8> = self
+            .pending_wave
+            .iter()
+            .chain(if data.len() > 4 {
+                data[4..].iter()
+            } else {
+                [].iter()
+            })
             .cloned()
             .collect();
         self.pending_wave.clear();
@@ -313,7 +358,13 @@ impl RdpsndHandler {
             log::warn!("[rdpsnd] Wave2 format index {} out of range", format_no);
         }
 
-        log::debug!("[rdpsnd] Wave2: ts={} fmt={} block={} dataLen={}", timestamp, format_no, block_no, audio_data.len());
+        log::debug!(
+            "[rdpsnd] Wave2: ts={} fmt={} block={} dataLen={}",
+            timestamp,
+            format_no,
+            block_no,
+            audio_data.len()
+        );
 
         let confirm = self.build_wave_confirm(timestamp, block_no);
         let event = self.make_audio_event(audio_data);

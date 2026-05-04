@@ -1,6 +1,6 @@
+use super::ntlm::Ntlm;
 use crate::error::RdpError;
 use crate::protocol::Transport;
-use super::ntlm::Ntlm;
 
 const APP_0: u8 = 0xA0;
 const APP_1: u8 = 0xA1;
@@ -26,7 +26,10 @@ impl<T: Transport> Cssp<T> {
     pub async fn authenticate(&mut self, pub_key: &[u8]) -> Result<(), RdpError> {
         let negotiate = self.ntlm.get_negotiate_message();
         #[cfg(debug_assertions)]
-        eprintln!("[CredSSP] sending NTLM NEGOTIATE ({} bytes)", negotiate.len());
+        eprintln!(
+            "[CredSSP] sending NTLM NEGOTIATE ({} bytes)",
+            negotiate.len()
+        );
         let token1 = build_ts_request(2, &negotiate, &[], &[]);
         self.transport.send(&token1).await?;
 
@@ -40,8 +43,11 @@ impl<T: Transport> Cssp<T> {
         let (authenticate, mut security) = self.ntlm.get_authenticate_message(&challenge)?;
         let pub_key_auth = security.gss_encrypt(pub_key);
         #[cfg(debug_assertions)]
-        eprintln!("[CredSSP] sending NTLM AUTHENTICATE ({} bytes), pubKeyAuth ({} bytes)",
-            authenticate.len(), pub_key_auth.len());
+        eprintln!(
+            "[CredSSP] sending NTLM AUTHENTICATE ({} bytes), pubKeyAuth ({} bytes)",
+            authenticate.len(),
+            pub_key_auth.len()
+        );
         let token3 = build_ts_request(2, &authenticate, &pub_key_auth, &[]);
         self.transport.send(&token3).await?;
 
@@ -51,7 +57,8 @@ impl<T: Transport> Cssp<T> {
         #[cfg(debug_assertions)]
         eprintln!("[CredSSP] server pub key verified, sending credentials");
 
-        let credentials = build_ts_credentials(&self.ntlm.domain, &self.ntlm.user, &self.ntlm.password);
+        let credentials =
+            build_ts_credentials(&self.ntlm.domain, &self.ntlm.user, &self.ntlm.password);
         let auth_info = security.gss_encrypt(&credentials);
         let token5 = build_ts_request(2, &[], &[], &auth_info);
         self.transport.send(&token5).await?;
@@ -64,9 +71,10 @@ impl<T: Transport> Cssp<T> {
     async fn recv_ts_request(&mut self) -> Result<Vec<u8>, RdpError> {
         let tag = self.transport.recv_exact(1).await?[0];
         if tag != SEQ {
-            return Err(RdpError::Protocol(
-                format!("CredSSP: expected SEQUENCE (0x30), got 0x{:02x}", tag),
-            ));
+            return Err(RdpError::Protocol(format!(
+                "CredSSP: expected SEQUENCE (0x30), got 0x{:02x}",
+                tag
+            )));
         }
         let b0 = self.transport.recv_exact(1).await?[0];
         let (total_len, mut header) = if b0 & 0x80 == 0 {
@@ -86,7 +94,10 @@ impl<T: Transport> Cssp<T> {
         };
         let body = self.transport.recv_exact(total_len).await?;
         #[cfg(debug_assertions)]
-        eprintln!("[CredSSP] recv_ts_request: total={} bytes", header.len() + body.len());
+        eprintln!(
+            "[CredSSP] recv_ts_request: total={} bytes",
+            header.len() + body.len()
+        );
         header.extend_from_slice(&body);
         Ok(header)
     }

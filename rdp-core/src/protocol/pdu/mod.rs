@@ -1,8 +1,8 @@
 pub mod caps;
 pub mod input;
 
-use crate::error::RdpError;
 use crate::core::io::*;
+use crate::error::RdpError;
 
 pub const PDUTYPE_DEMANDACTIVEPDU: u16 = 0x1;
 pub const PDUTYPE_CONFIRMACTIVEPDU: u16 = 0x3;

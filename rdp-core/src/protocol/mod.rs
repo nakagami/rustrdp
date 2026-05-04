@@ -1,14 +1,14 @@
+pub mod drdynvc;
+pub mod lic;
+pub mod nla;
+pub mod pdu;
+pub mod rdpgfx;
+pub mod rdpsnd;
+pub mod sec;
+pub mod t125;
 pub mod tpkt;
 pub mod x224;
-pub mod t125;
-pub mod nla;
-pub mod sec;
-pub mod lic;
-pub mod pdu;
-pub mod rdpsnd;
 pub mod zgfx;
-pub mod drdynvc;
-pub mod rdpgfx;
 
 use crate::error::RdpError;
 use async_trait::async_trait;

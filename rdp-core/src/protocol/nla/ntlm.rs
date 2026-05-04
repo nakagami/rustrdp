@@ -1,13 +1,12 @@
 use crate::error::RdpError;
-use md4::{Md4, Digest as Md4Digest};
 use hmac::{Hmac, Mac};
+use md4::{Digest as Md4Digest, Md4};
 use md5::Md5;
 
 type HmacMd5 = Hmac<Md5>;
 
 // Flags matching grdp's GetNegotiateMessage() (no NEGOTIATE_56, no NEGOTIATE_VERSION)
-const NTLM_NEGOTIATE_FLAGS: u32 =
-    0x40000000 | // NEGOTIATE_KEY_EXCH
+const NTLM_NEGOTIATE_FLAGS: u32 = 0x40000000 | // NEGOTIATE_KEY_EXCH
     0x20000000 | // NEGOTIATE_128
     0x00080000 | // NEGOTIATE_EXTENDED_SESSIONSECURITY
     0x00008000 | // NEGOTIATE_ALWAYS_SIGN
@@ -15,7 +14,7 @@ const NTLM_NEGOTIATE_FLAGS: u32 =
     0x00000020 | // NEGOTIATE_SEAL
     0x00000010 | // NEGOTIATE_SIGN
     0x00000004 | // REQUEST_TARGET
-    0x00000001;  // NEGOTIATE_UNICODE
+    0x00000001; // NEGOTIATE_UNICODE
 
 /// Stateful RC4 cipher that maintains state across process() calls.
 pub struct Rc4Cipher {
@@ -59,11 +58,21 @@ impl NtlmSecurity {
     pub fn new(exported_session_key: &[u8]) -> Self {
         use md5::Digest;
         let sealing_key = Md5::digest(
-            [exported_session_key, b"session key to client-to-server sealing key magic constant\0" as &[u8]].concat()
-        ).to_vec();
+            [
+                exported_session_key,
+                b"session key to client-to-server sealing key magic constant\0" as &[u8],
+            ]
+            .concat(),
+        )
+        .to_vec();
         let signing_key = Md5::digest(
-            [exported_session_key, b"session key to client-to-server signing key magic constant\0" as &[u8]].concat()
-        ).to_vec();
+            [
+                exported_session_key,
+                b"session key to client-to-server signing key magic constant\0" as &[u8],
+            ]
+            .concat(),
+        )
+        .to_vec();
         NtlmSecurity {
             encrypt_rc4: Rc4Cipher::new(&sealing_key),
             signing_key,
@@ -126,16 +135,22 @@ impl Ntlm {
 
     /// Build NTLM AUTHENTICATE message, returning (message_bytes, NtlmSecurity).
     /// Matches grdp's GetAuthenticateMessage closely.
-    pub fn get_authenticate_message(&self, challenge: &[u8]) -> Result<(Vec<u8>, NtlmSecurity), RdpError> {
+    pub fn get_authenticate_message(
+        &self,
+        challenge: &[u8],
+    ) -> Result<(Vec<u8>, NtlmSecurity), RdpError> {
         if challenge.len() < 56 {
             return Err(RdpError::Auth("NTLM challenge too short".into()));
         }
 
-        let challenge_flags = u32::from_le_bytes([challenge[20], challenge[21], challenge[22], challenge[23]]);
+        let challenge_flags =
+            u32::from_le_bytes([challenge[20], challenge[21], challenge[22], challenge[23]]);
         let server_challenge = &challenge[24..32];
 
         let target_info_len = u16::from_le_bytes([challenge[40], challenge[41]]) as usize;
-        let target_info_offset = u32::from_le_bytes([challenge[44], challenge[45], challenge[46], challenge[47]]) as usize;
+        let target_info_offset =
+            u32::from_le_bytes([challenge[44], challenge[45], challenge[46], challenge[47]])
+                as usize;
         let target_info = if target_info_offset + target_info_len <= challenge.len() {
             challenge[target_info_offset..target_info_offset + target_info_len].to_vec()
         } else {
@@ -213,9 +228,12 @@ impl Ntlm {
 
         // Version (8 bytes): Windows 6.0.6002 if NTLMSSP_NEGOTIATE_VERSION is set
         if challenge_flags & 0x02000000 != 0 {
-            msg.push(6); msg.push(0);
+            msg.push(6);
+            msg.push(0);
             msg.extend_from_slice(&6002u16.to_le_bytes());
-            msg.push(0); msg.push(0); msg.push(0);
+            msg.push(0);
+            msg.push(0);
+            msg.push(0);
             msg.push(0x0F);
         } else {
             msg.extend_from_slice(&[0u8; 8]);

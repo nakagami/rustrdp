@@ -19,8 +19,9 @@ impl<T: Transport> Tpkt<T> {
         let mut buf = vec![0x03, 0x00, (len >> 8) as u8, len as u8];
         buf.extend_from_slice(data);
 
-        #[cfg(debug_assertions)]
-        eprintln!("[TPKT] send total={} hex={}", buf.len(), hex_dump(&buf));
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!("[TPKT] send total={} hex={}", buf.len(), hex_dump(&buf));
+        }
 
         self.transport.send(&buf).await
     }
@@ -40,10 +41,9 @@ impl<T: Transport> Tpkt<T> {
             self.ensure_recv_buf(len).await?;
             let payload = self.recv_buf[4..len].to_vec();
 
-            #[cfg(debug_assertions)]
-            {
+            if log::log_enabled!(log::Level::Trace) {
                 let full = &self.recv_buf[..len];
-                eprintln!("[TPKT] recv total={} hex={}", full.len(), hex_dump(full));
+                log::trace!("[TPKT] recv total={} hex={}", full.len(), hex_dump(full));
             }
 
             self.recv_buf.drain(..len);
@@ -67,8 +67,7 @@ impl<T: Transport> Tpkt<T> {
             self.ensure_recv_buf(length).await?;
             let payload = self.recv_buf[extra..length].to_vec();
 
-            #[cfg(debug_assertions)]
-            eprintln!("[TPKT] recv FastPath total={}", length);
+            log::trace!("[TPKT] recv FastPath total={}", length);
 
             self.recv_buf.drain(..length);
             Ok((true, payload))
@@ -93,7 +92,6 @@ impl<T: Transport> Tpkt<T> {
     }
 }
 
-#[cfg(debug_assertions)]
 fn hex_dump(data: &[u8]) -> String {
     let limit = data.len().min(64);
     let hex: Vec<String> = data[..limit].iter().map(|b| format!("{:02x}", b)).collect();
