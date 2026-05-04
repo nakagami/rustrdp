@@ -39,6 +39,7 @@ const SURFCMD_FRAMEACTION_END: u16 = 0x0001;
 pub enum RdpEvent {
     Ready,
     Bitmap(Vec<Bitmap>),
+    NV12Frame(Vec<crate::avc::NV12Frame>),
     Resize { width: u16, height: u16 },
     Deactivated,
     Audio { format: AudioFormat, data: Vec<u8> },
@@ -492,7 +493,7 @@ impl<T: Transport> RdpSession<T> {
 
             // Dispatch drdynvc static virtual channel data
             if Some(ch) == self.drdynvc_channel {
-                let (bitmaps, audio_events, reset_size) = self.handle_drdynvc_data(&data).await;
+                let (bitmaps, nv12_frames, audio_events, reset_size) = self.handle_drdynvc_data(&data).await;
                 for ev in audio_events {
                     self.pending_audio.push_back(ev);
                 }
@@ -500,6 +501,9 @@ impl<T: Transport> RdpSession<T> {
                     self.width = width;
                     self.height = height;
                     return Ok(RdpEvent::Resize { width, height });
+                }
+                if !nv12_frames.is_empty() {
+                    return Ok(RdpEvent::NV12Frame(nv12_frames));
                 }
                 if !bitmaps.is_empty() {
                     return Ok(RdpEvent::Bitmap(bitmaps));
@@ -646,6 +650,7 @@ impl<T: Transport> RdpSession<T> {
         data: &[u8],
     ) -> (
         Vec<Bitmap>,
+        Vec<crate::avc::NV12Frame>,
         Vec<crate::protocol::rdpsnd::AudioEvent>,
         Option<(u16, u16)>,
     ) {
@@ -654,7 +659,7 @@ impl<T: Transport> RdpSession<T> {
 
         if data.len() < 8 {
             log::warn!("[drdynvc] channel data too short: {} bytes", data.len());
-            return (vec![], vec![], None);
+            return (vec![], vec![], vec![], None);
         }
         let total_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
@@ -667,11 +672,11 @@ impl<T: Transport> RdpSession<T> {
         self.drdynvc_frag.extend_from_slice(payload);
 
         if flags & CHANNEL_FLAG_LAST == 0 {
-            return (vec![], vec![], None);
+            return (vec![], vec![], vec![], None);
         }
 
         let assembled = std::mem::take(&mut self.drdynvc_frag);
-        let (bitmaps, responses, audio_events, needs_force_refresh, reset_size) =
+        let (bitmaps, nv12_frames, responses, audio_events, needs_force_refresh, reset_size) =
             self.drdynvc_handler.process(&assembled);
 
         // Send any outgoing DRDYNVC PDUs (CAPS response, FRAME_ACK, audio replies, etc.)
@@ -708,7 +713,7 @@ impl<T: Transport> RdpSession<T> {
             }
         }
 
-        (bitmaps, audio_events, reset_size)
+        (bitmaps, nv12_frames, audio_events, reset_size)
     }
 
     pub async fn send_key_down(&mut self, flags: u16, scancode: u8) -> Result<(), RdpError> {

@@ -3,19 +3,45 @@ use sdl2::rect::Rect;
 use sdl2::render::{Canvas, Texture, TextureCreator};
 use sdl2::video::{Window, WindowContext};
 use std::error::Error;
+use std::os::raw::c_int;
 
 use rdp_core::bitmap::Bitmap;
 
+extern "C" {
+    fn SDL_UpdateNVTexture(
+        texture: *mut sdl2::sys::SDL_Texture,
+        rect: *const sdl2::sys::SDL_Rect,
+        Yplane: *const u8,
+        Ypitch: c_int,
+        UVplane: *const u8,
+        UVpitch: c_int,
+    ) -> c_int;
+}
+
 // Fields are declared in drop order (first declared → first dropped).
-// Texture must be destroyed before the renderer (canvas), so it is declared first.
+// nv12_tex must drop before canvas (SDL_DestroyTexture before SDL_DestroyRenderer).
 pub struct RdpUI {
-    texture: Texture,                               // dropped 1st: SDL_DestroyTexture
-    texture_creator: TextureCreator<WindowContext>, // dropped 2nd
-    canvas: Canvas<Window>,                         // dropped 3rd: SDL_DestroyRenderer
+    /// Raw NV12 texture for direct hardware-decoded frame overlay.
+    nv12_tex: *mut sdl2::sys::SDL_Texture,
+    nv12_tex_w: u32,
+    nv12_tex_h: u32,
+    nv12_last_rect: Option<Rect>,
+    texture: Texture,                               // dropped after nv12_tex
+    texture_creator: TextureCreator<WindowContext>,
+    canvas: Canvas<Window>,                         // dropped last: SDL_DestroyRenderer
     /// CPU-side BGRA back-buffer: compositing target for incremental bitmap tiles.
     back_buf: Vec<u8>,
     width: u16,
     height: u16,
+}
+
+impl Drop for RdpUI {
+    fn drop(&mut self) {
+        if !self.nv12_tex.is_null() {
+            unsafe { sdl2::sys::SDL_DestroyTexture(self.nv12_tex); }
+            self.nv12_tex = std::ptr::null_mut();
+        }
+    }
 }
 
 impl RdpUI {
@@ -58,6 +84,10 @@ impl RdpUI {
         let back_buf = vec![0u8; width as usize * height as usize * 4];
 
         Ok(RdpUI {
+            nv12_tex: std::ptr::null_mut(),
+            nv12_tex_w: 0,
+            nv12_tex_h: 0,
+            nv12_last_rect: None,
             texture,
             texture_creator,
             canvas,
@@ -77,8 +107,7 @@ impl RdpUI {
             self.log_back_buffer_sample(bitmaps);
         }
         if dirty {
-            self.canvas.copy(&self.texture, None, None)?;
-            self.canvas.present();
+            self.present_composed()?;
         }
         Ok(())
     }
@@ -86,7 +115,9 @@ impl RdpUI {
     /// Re-present the current back-buffer without modifying it.
     /// Call this on SDL Exposed / Restored events so the window redraws itself.
     pub fn repaint(&mut self) -> Result<(), Box<dyn Error>> {
-        self.present_full()
+        let row_bytes = self.width as usize * 4;
+        self.texture.update(None, &self.back_buf, row_bytes)?;
+        self.present_composed()
     }
 
     pub fn resize(&mut self, width: u16, height: u16) -> Result<(), Box<dyn Error>> {
@@ -104,16 +135,115 @@ impl RdpUI {
         self.back_buf = vec![0u8; width as usize * height as usize * 4];
         self.width = width;
         self.height = height;
+        // Clear NV12 state on resize
+        self.nv12_last_rect = None;
+        if !self.nv12_tex.is_null() {
+            unsafe { sdl2::sys::SDL_DestroyTexture(self.nv12_tex); }
+            self.nv12_tex = std::ptr::null_mut();
+            self.nv12_tex_w = 0;
+            self.nv12_tex_h = 0;
+        }
         Ok(())
     }
 
-    /// Upload the full back-buffer to the persistent streaming texture and flip.
-    fn present_full(&mut self) -> Result<(), Box<dyn Error>> {
-        let row_bytes = self.width as usize * 4;
-        self.texture.update(None, &self.back_buf, row_bytes)?;
+    /// Compose the BGRA background texture with the NV12 overlay and present.
+    fn present_composed(&mut self) -> Result<(), Box<dyn Error>> {
         self.canvas.copy(&self.texture, None, None)?;
+        if let Some(rect) = self.nv12_last_rect {
+            if !self.nv12_tex.is_null() {
+                let dst = sdl2::sys::SDL_Rect {
+                    x: rect.x(),
+                    y: rect.y(),
+                    w: rect.width() as c_int,
+                    h: rect.height() as c_int,
+                };
+                unsafe {
+                    sdl2::sys::SDL_RenderCopy(
+                        self.canvas.raw(),
+                        self.nv12_tex,
+                        std::ptr::null(),
+                        &dst,
+                    );
+                }
+            }
+        }
         self.canvas.present();
         Ok(())
+    }
+
+    /// Upload a raw NV12 frame from the hardware decoder and display it as an overlay.
+    pub fn render_nv12_frame(&mut self, frame: &rdp_core::avc::NV12Frame) -> Result<(), Box<dyn Error>> {
+        let w = frame.width;
+        let h = frame.height;
+
+        // (Re)create NV12 streaming texture if dimensions changed
+        if self.nv12_tex.is_null() || self.nv12_tex_w != w || self.nv12_tex_h != h {
+            if !self.nv12_tex.is_null() {
+                unsafe { sdl2::sys::SDL_DestroyTexture(self.nv12_tex); }
+            }
+            self.nv12_tex = unsafe {
+                sdl2::sys::SDL_CreateTexture(
+                    self.canvas.raw(),
+                    0x3231_564E_u32, // SDL_PIXELFORMAT_NV12 = FOURCC('N','V','1','2')
+                    sdl2::sys::SDL_TextureAccess::SDL_TEXTUREACCESS_STREAMING as c_int,
+                    w as c_int,
+                    h as c_int,
+                )
+            };
+            if self.nv12_tex.is_null() {
+                let err_msg = unsafe {
+                    let s = sdl2::sys::SDL_GetError();
+                    if s.is_null() {
+                        "SDL_CreateTexture NV12 failed".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
+                    }
+                };
+                return Err(err_msg.into());
+            }
+            self.nv12_tex_w = w;
+            self.nv12_tex_h = h;
+            log::debug!("[ui] created NV12 texture {}x{}", w, h);
+        }
+
+        // Upload Y and UV planes to the NV12 texture
+        let ret = unsafe {
+            SDL_UpdateNVTexture(
+                self.nv12_tex,
+                std::ptr::null(),
+                frame.y.as_ptr(),
+                frame.y_stride as c_int,
+                frame.uv.as_ptr(),
+                frame.uv_stride as c_int,
+            )
+        };
+        if ret < 0 {
+            let err_msg = unsafe {
+                let s = sdl2::sys::SDL_GetError();
+                if s.is_null() {
+                    format!("SDL_UpdateNVTexture failed: {}", ret)
+                } else {
+                    std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
+                }
+            };
+            return Err(err_msg.into());
+        }
+
+        // Compute destination rect: clamp frame to screen
+        let scr_w = self.width as i32;
+        let scr_h = self.height as i32;
+        let dst_w = (w as i32).min(scr_w - frame.screen_x).max(0);
+        let dst_h = (h as i32).min(scr_h - frame.screen_y).max(0);
+        if dst_w > 0 && dst_h > 0 {
+            self.nv12_last_rect = Some(Rect::new(
+                frame.screen_x,
+                frame.screen_y,
+                dst_w as u32,
+                dst_h as u32,
+            ));
+        }
+
+        self.present_composed()
     }
 
     /// Blit one bitmap tile into the CPU back-buffer, then upload that rect to the SDL texture.

@@ -1,4 +1,5 @@
 use crate::bitmap::Bitmap;
+use crate::avc::NV12Frame;
 use crate::protocol::rdpgfx::RdpgfxHandler;
 use crate::protocol::rdpsnd::{AudioEvent, RdpsndHandler};
 /// DRDYNVC (MS-RDPEDYC) dynamic virtual channel handler.
@@ -74,13 +75,14 @@ impl DrdynvcHandler {
         data: &[u8],
     ) -> (
         Vec<Bitmap>,
+        Vec<NV12Frame>,
         Vec<Vec<u8>>,
         Vec<AudioEvent>,
         bool,
         Option<(u16, u16)>,
     ) {
         if data.is_empty() {
-            return (vec![], vec![], vec![], false, None);
+            return (vec![], vec![], vec![], vec![], false, None);
         }
         let header = data[0];
         let cmd = (header >> 4) & 0x0F;
@@ -88,6 +90,7 @@ impl DrdynvcHandler {
         let cb_ch_id = header & 0x03;
 
         let mut bitmaps = Vec::new();
+        let mut nv12_frames = Vec::new();
         let mut outgoing = Vec::new();
         let mut audio = Vec::new();
         let mut force_refresh = false;
@@ -106,6 +109,7 @@ impl DrdynvcHandler {
                     cb_ch_id,
                     sp,
                     &mut bitmaps,
+                    &mut nv12_frames,
                     &mut outgoing,
                     &mut audio,
                     &mut force_refresh,
@@ -117,6 +121,7 @@ impl DrdynvcHandler {
                     data,
                     cb_ch_id,
                     &mut bitmaps,
+                    &mut nv12_frames,
                     &mut outgoing,
                     &mut audio,
                     &mut force_refresh,
@@ -137,7 +142,7 @@ impl DrdynvcHandler {
             }
         }
 
-        (bitmaps, outgoing, audio, force_refresh, reset_size)
+        (bitmaps, nv12_frames, outgoing, audio, force_refresh, reset_size)
     }
 
     /// Called when a large/full-screen raw Bitmap Update arrives, indicating
@@ -241,6 +246,7 @@ impl DrdynvcHandler {
         cb_ch_id: u8,
         sp: u8,
         bitmaps: &mut Vec<Bitmap>,
+        nv12_frames: &mut Vec<NV12Frame>,
         out: &mut Vec<Vec<u8>>,
         audio: &mut Vec<AudioEvent>,
         force_refresh: &mut bool,
@@ -263,6 +269,7 @@ impl DrdynvcHandler {
                 ch_id,
                 payload,
                 bitmaps,
+                nv12_frames,
                 out,
                 audio,
                 force_refresh,
@@ -285,6 +292,7 @@ impl DrdynvcHandler {
         data: &[u8],
         cb_ch_id: u8,
         bitmaps: &mut Vec<Bitmap>,
+        nv12_frames: &mut Vec<NV12Frame>,
         out: &mut Vec<Vec<u8>>,
         audio: &mut Vec<AudioEvent>,
         force_refresh: &mut bool,
@@ -307,6 +315,7 @@ impl DrdynvcHandler {
                 ch_id,
                 payload,
                 bitmaps,
+                nv12_frames,
                 out,
                 audio,
                 force_refresh,
@@ -317,7 +326,7 @@ impl DrdynvcHandler {
 
         if complete {
             let buf = self.fragments.remove(&ch_id).unwrap().buf;
-            self.dispatch_channel_data(ch_id, &buf, bitmaps, out, audio, force_refresh, reset_size);
+            self.dispatch_channel_data(ch_id, &buf, bitmaps, nv12_frames, out, audio, force_refresh, reset_size);
         }
     }
 
@@ -328,6 +337,7 @@ impl DrdynvcHandler {
         ch_id: u32,
         data: &[u8],
         bitmaps: &mut Vec<Bitmap>,
+        nv12_frames: &mut Vec<NV12Frame>,
         out: &mut Vec<Vec<u8>>,
         audio: &mut Vec<AudioEvent>,
         force_refresh: &mut bool,
@@ -336,8 +346,9 @@ impl DrdynvcHandler {
         let cb_ch_id = ch_id_size(ch_id);
         match self.channels.get_mut(&ch_id) {
             Some(DvcChannel::Gfx(gfx)) => {
-                let (new_bitmaps, replies, fr, rs) = gfx.process(data);
+                let (new_bitmaps, new_nv12, replies, fr, rs) = gfx.process(data);
                 bitmaps.extend(new_bitmaps);
+                nv12_frames.extend(new_nv12);
                 if fr {
                     *force_refresh = true;
                 }

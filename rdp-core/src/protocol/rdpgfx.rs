@@ -3,6 +3,7 @@
 /// Receives raw RDPGFX payload bytes (already ZGFX-decompressed),
 /// dispatches PDU commands, and returns decoded bitmap tiles.
 use crate::bitmap::Bitmap;
+use crate::avc::NV12Frame;
 use crate::protocol::zgfx::ZgfxContext;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -129,18 +130,18 @@ impl RdpgfxHandler {
     pub fn process(
         &mut self,
         data: &[u8],
-    ) -> (Vec<Bitmap>, Vec<Vec<u8>>, bool, Option<(u16, u16)>) {
+    ) -> (Vec<Bitmap>, Vec<NV12Frame>, Vec<Vec<u8>>, bool, Option<(u16, u16)>) {
         // ZGFX decompress
         let decompressed = self.zgfx.decompress(data);
         if decompressed.is_empty() {
-            return (vec![], vec![], false, None);
+            return (vec![], vec![], vec![], false, None);
         }
         self.last_reset_size = None;
-        let (bitmaps, responses) = self.dispatch_pdus(&decompressed);
+        let (bitmaps, nv12_frames, responses) = self.dispatch_pdus(&decompressed);
         let force_refresh = self.needs_force_refresh;
         self.needs_force_refresh = false;
         let reset_size = self.last_reset_size.take();
-        (bitmaps, responses, force_refresh, reset_size)
+        (bitmaps, nv12_frames, responses, force_refresh, reset_size)
     }
 
     /// Called when the DVC channel was just created.
@@ -173,8 +174,9 @@ impl RdpgfxHandler {
 
     // ── PDU dispatcher ─────────────────────────────────────────────────────────
 
-    fn dispatch_pdus(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<Vec<u8>>) {
+    fn dispatch_pdus(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<NV12Frame>, Vec<Vec<u8>>) {
         let mut bitmaps = Vec::new();
+        let mut nv12_frames = Vec::new();
         let mut outgoing = Vec::new();
         let mut offset = 0;
 
@@ -192,11 +194,11 @@ impl RdpgfxHandler {
                 break;
             }
             let body = &data[offset + GFX_HEADER_SIZE..offset + pdu_len];
-            self.dispatch_one(cmd_id, body, &mut bitmaps, &mut outgoing);
+            self.dispatch_one(cmd_id, body, &mut bitmaps, &mut nv12_frames, &mut outgoing);
             offset += pdu_len;
         }
 
-        (bitmaps, outgoing)
+        (bitmaps, nv12_frames, outgoing)
     }
 
     fn dispatch_one(
@@ -204,6 +206,7 @@ impl RdpgfxHandler {
         cmd_id: u16,
         data: &[u8],
         bitmaps: &mut Vec<Bitmap>,
+        nv12_frames: &mut Vec<NV12Frame>,
         outgoing: &mut Vec<Vec<u8>>,
     ) {
         log::trace!("[rdpgfx] cmd 0x{:04X} len={}", cmd_id, data.len());
@@ -240,10 +243,10 @@ impl RdpgfxHandler {
                 }
             }
             CMDID_WIRE_TO_SURFACE_1 => {
-                self.on_wire_to_surface_1(data, bitmaps);
+                self.on_wire_to_surface_1(data, bitmaps, nv12_frames);
             }
             CMDID_WIRE_TO_SURFACE_2 => {
-                self.on_wire_to_surface_2(data, bitmaps);
+                self.on_wire_to_surface_2(data, bitmaps, nv12_frames);
             }
             CMDID_SOLID_FILL => {
                 self.on_solid_fill(data, bitmaps);
@@ -399,7 +402,7 @@ impl RdpgfxHandler {
         }
     }
 
-    fn on_wire_to_surface_1(&mut self, data: &[u8], bitmaps: &mut Vec<Bitmap>) {
+    fn on_wire_to_surface_1(&mut self, data: &[u8], bitmaps: &mut Vec<Bitmap>, nv12_frames: &mut Vec<NV12Frame>) {
         // MS-RDPEGFX §2.2.2.1: surfaceId(2)+codecId(2)+pixelFormat(1)+destRect(8)+bitmapDataLength(4) = 17 bytes
         if data.len() < 17 {
             return;
@@ -469,7 +472,13 @@ impl RdpgfxHandler {
                 }
             }
             CODEC_AVC420 => {
-                if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
+                if self.avc_supports_nv12() {
+                    if let Some(mut nv12) = self.decode_avc420_nv12(bmp_data) {
+                        nv12.screen_x = abs_x;
+                        nv12.screen_y = abs_y;
+                        nv12_frames.push(nv12);
+                    }
+                } else if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     let mut discard = Vec::new();
@@ -493,8 +502,13 @@ impl RdpgfxHandler {
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
-                if let Some((pixels, fw, fh, regions, force_regions)) = self.decode_avc444(bmp_data)
-                {
+                if self.avc_supports_nv12() {
+                    if let Some(mut nv12) = self.decode_avc444_nv12(bmp_data) {
+                        nv12.screen_x = abs_x;
+                        nv12.screen_y = abs_y;
+                        nv12_frames.push(nv12);
+                    }
+                } else if let Some((pixels, fw, fh, regions, force_regions)) = self.decode_avc444(bmp_data) {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!("[rdpgfx] AVC444 decoded {}x{} → blit {}x{} regions={} at ({},{}) abs=({},{}) mapped={}",
@@ -531,7 +545,7 @@ impl RdpgfxHandler {
         }
     }
 
-    fn on_wire_to_surface_2(&mut self, data: &[u8], bitmaps: &mut Vec<Bitmap>) {
+    fn on_wire_to_surface_2(&mut self, data: &[u8], bitmaps: &mut Vec<Bitmap>, nv12_frames: &mut Vec<NV12Frame>) {
         // MS-RDPEGFX §2.2.2.2: surfaceId(2)+codecId(2)+codecCtxId(4)+pixelFormat(1)+bitmapDataLength(4) = 13 bytes
         if data.len() < 13 {
             return;
@@ -594,7 +608,13 @@ impl RdpgfxHandler {
                 }
             }
             CODEC_AVC420 => {
-                if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
+                if self.avc_supports_nv12() {
+                    if let Some(mut nv12) = self.decode_avc420_nv12(bmp_data) {
+                        nv12.screen_x = abs_x;
+                        nv12.screen_y = abs_y;
+                        nv12_frames.push(nv12);
+                    }
+                } else if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!(
@@ -626,8 +646,13 @@ impl RdpgfxHandler {
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
-                if let Some((pixels, fw, fh, regions, force_regions)) = self.decode_avc444(bmp_data)
-                {
+                if self.avc_supports_nv12() {
+                    if let Some(mut nv12) = self.decode_avc444_nv12(bmp_data) {
+                        nv12.screen_x = abs_x;
+                        nv12.screen_y = abs_y;
+                        nv12_frames.push(nv12);
+                    }
+                } else if let Some((pixels, fw, fh, regions, force_regions)) = self.decode_avc444(bmp_data) {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!("[rdpgfx] WTS2 AVC444 decoded {}x{} → blit {}x{} regions={} abs=({},{}) mapped={}",
@@ -970,6 +995,47 @@ impl RdpgfxHandler {
             return dec.take_full_blit();
         }
         false
+    }
+
+    fn avc_supports_nv12(&self) -> bool {
+        self.avc_dec.as_ref().map(|d| d.supports_nv12()).unwrap_or(false)
+    }
+
+    fn decode_h264_nv12(&mut self, h264_data: &[u8]) -> Option<NV12Frame> {
+        if let Some(ref mut dec) = self.avc_dec {
+            let result = dec.decode_nv12(h264_data);
+            let _ = dec.take_decoder_flushed();
+            let _ = dec.take_drain_count();
+            let _ = dec.take_full_blit();
+            if dec.needs_keyframe() {
+                log::debug!("[rdpgfx] AVC decoder needs IDR — scheduling force refresh");
+                self.needs_force_refresh = true;
+            }
+            return result;
+        }
+        None
+    }
+
+    fn decode_avc420_nv12(&mut self, data: &[u8]) -> Option<NV12Frame> {
+        let stream = parse_avc420(data)?;
+        if let Some(ref mut dec) = self.avc_dec {
+            let hints: Vec<(u16, u16, u16, u16)> = stream.regions.iter()
+                .map(|r| (r.left, r.top, r.right, r.bottom))
+                .collect();
+            dec.set_region_hint(&hints);
+        }
+        self.decode_h264_nv12(&stream.h264_data)
+    }
+
+    fn decode_avc444_nv12(&mut self, data: &[u8]) -> Option<NV12Frame> {
+        let (stream, _lc) = parse_avc444(data)?;
+        if let Some(ref mut dec) = self.avc_dec {
+            let hints: Vec<(u16, u16, u16, u16)> = stream.regions.iter()
+                .map(|r| (r.left, r.top, r.right, r.bottom))
+                .collect();
+            dec.set_region_hint(&hints);
+        }
+        self.decode_h264_nv12(&stream.h264_data)
     }
 
     fn decode_h264(&mut self, h264_data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {

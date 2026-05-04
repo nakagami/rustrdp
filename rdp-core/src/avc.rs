@@ -4,6 +4,19 @@
 /// codec library.  The concrete implementation lives in rdp-sdl2 (or any
 /// other frontend that wants H.264 support).  Frontends that do not need
 /// H.264 simply pass `None` when calling `RdpSession::login`.
+
+/// A raw NV12 video frame produced by the hardware decoder, with screen coordinates for direct SDL overlay rendering.
+pub struct NV12Frame {
+    pub y: Vec<u8>,
+    pub uv: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub y_stride: usize,
+    pub uv_stride: usize,
+    pub screen_x: i32,
+    pub screen_y: i32,
+}
+
 pub trait AvcDecoder {
     /// Hint to the decoder about the dirty regions that will be blitted from the
     /// next decoded frame, as `(left, top, right, bottom)` tuples in frame pixels.
@@ -51,4 +64,17 @@ pub trait AvcDecoder {
     /// Reset the decoder to a clean state.  Called after RDPGFX RESET_GRAPHICS
     /// to discard buffered frames from the previous surface configuration.
     fn reset(&mut self);
+
+    /// Decode one H.264 NAL packet, returning a raw NV12 frame.
+    /// Only valid when `supports_nv12()` returns true.
+    /// Default implementation returns None.
+    fn decode_nv12(&mut self, _data: &[u8]) -> Option<NV12Frame> {
+        None
+    }
+
+    /// Returns true when this decoder supports direct NV12 output.
+    /// NV12 output bypasses swscale and surface compositing.
+    fn supports_nv12(&self) -> bool {
+        false
+    }
 }

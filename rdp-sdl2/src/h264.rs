@@ -360,7 +360,7 @@ impl H264Decoder {
                 Pixel::BGRA,
                 width,
                 height,
-                ScalingFlags::BILINEAR,
+                ScalingFlags::FAST_BILINEAR,
             )?);
             self.scaler_src_format = src_format;
             self.scaler_width = width;
@@ -381,46 +381,49 @@ impl H264Decoder {
         self.ensure_scaler(decoded)?;
         let width = decoded.width() as usize;
         let height = decoded.height() as usize;
-        let mut bgra = VideoFrame::new(Pixel::BGRA, decoded.width(), decoded.height());
-        self.scaler
-            .as_mut()
-            .expect("scaler must exist after ensure_scaler")
-            .run(decoded, &mut bgra)?;
-        let src = bgra.data(0);
-        let stride = bgra.stride(0);
         let row_bytes = width * 4;
         let mut out = vec![0u8; row_bytes * height];
-        for row in 0..height {
-            let src_off = row * stride;
-            let dst_off = row * row_bytes;
-            out[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+        // Write directly into `out` via sws_scale, bypassing the intermediate
+        // stride-padded VideoFrame allocation and the subsequent row-copy loop.
+        // This saves ~8 MB allocation + copy per frame at 1080p.
+        let ret = unsafe {
+            let scaler = self.scaler.as_mut().unwrap().as_mut_ptr();
+            let src = decoded.as_ptr();
+            let dst_ptrs = [out.as_mut_ptr()];
+            let dst_strides = [row_bytes as i32];
+            ffi::sws_scale(
+                scaler,
+                (*src).data.as_ptr() as *const *const u8,
+                (*src).linesize.as_ptr(),
+                0,
+                height as i32,
+                dst_ptrs.as_ptr() as *const *mut u8,
+                dst_strides.as_ptr(),
+            )
+        };
+        if ret < 0 {
+            return Err(ffmpeg::Error::from(ret));
         }
         Ok(out)
     }
 
-    fn take_decoded_frame(&mut self) -> Option<(Vec<u8>, u32, u32)> {
-        let mut latest = None;
+    /// Drain all available decoded frames from the decoder.
+    /// Performs av_hwframe_transfer_data for VideoToolbox frames (GPU→CPU NV12).
+    /// Returns the latest CPU-side sw_frame, or None if nothing is ready.
+    fn take_decoded_frame_raw(&mut self) -> Option<VideoFrame> {
+        let mut latest: Option<VideoFrame> = None;
         loop {
             let mut decoded = VideoFrame::empty();
             match self.decoder.receive_frame(&mut decoded) {
                 Ok(()) => {
-                    let width = decoded.width();
-                    let height = decoded.height();
-
-                    // VideoToolbox frames live in GPU/IOSurface memory.
-                    // Transfer them to a CPU-accessible NV12 frame first.
-                    let result = if self.use_hw
-                        && decoded.format() == Pixel::VIDEOTOOLBOX
-                    {
+                    let sw = if self.use_hw && decoded.format() == Pixel::VIDEOTOOLBOX {
                         log::trace!(
                             "[h264] VT frame received ({}x{}), transferring to CPU",
-                            width,
-                            height
+                            decoded.width(),
+                            decoded.height()
                         );
                         let mut sw_frame = VideoFrame::empty();
                         unsafe {
-                            // dst->format = AV_PIX_FMT_NONE lets FFmpeg choose
-                            // the best transfer format (typically NV12 for VT).
                             (*sw_frame.as_mut_ptr()).format =
                                 ffi::AVPixelFormat::AV_PIX_FMT_NONE as i32;
                             let ret = ffi::av_hwframe_transfer_data(
@@ -434,28 +437,21 @@ impl H264Decoder {
                                     ret
                                 );
                                 self.recreate_decoder();
-                                return None;
+                                return latest;
                             }
                         }
-                        self.frame_to_bgra(&sw_frame)
+                        sw_frame
                     } else {
                         if self.use_hw {
-                            log::debug!("[h264] unexpected SW frame format={:?} (use_hw=true, expected VIDEOTOOLBOX)", decoded.format());
+                            log::debug!(
+                                "[h264] unexpected SW frame format={:?} (use_hw=true)",
+                                decoded.format()
+                            );
                         }
-                        self.frame_to_bgra(&decoded)
+                        decoded
                     };
-
-                    match result {
-                        Ok(pixels) => {
-                            self.drain_count += 1;
-                            latest = Some((pixels, width, height));
-                        }
-                        Err(e) => {
-                            log::warn!("[h264] failed to convert frame to BGRA: {}", e);
-                            self.recreate_decoder();
-                            return None;
-                        }
-                    }
+                    self.drain_count += 1;
+                    latest = Some(sw);
                 }
                 Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::ffi::EAGAIN => {
                     return latest;
@@ -469,6 +465,58 @@ impl H264Decoder {
             }
         }
     }
+
+    fn take_decoded_frame(&mut self) -> Option<(Vec<u8>, u32, u32)> {
+        let sw = self.take_decoded_frame_raw()?;
+        let width = sw.width();
+        let height = sw.height();
+        match self.frame_to_bgra(&sw) {
+            Ok(pixels) => Some((pixels, width, height)),
+            Err(e) => {
+                log::warn!("[h264] failed to convert frame to BGRA: {}", e);
+                self.recreate_decoder();
+                None
+            }
+        }
+    }
+
+    fn take_decoded_frame_nv12(&mut self) -> Option<rdp_core::avc::NV12Frame> {
+        let sw = self.take_decoded_frame_raw()?;
+        let width = sw.width();
+        let height = sw.height();
+        let (y, uv, y_stride, uv_stride) = extract_nv12_planes(&sw)?;
+        Some(rdp_core::avc::NV12Frame {
+            y,
+            uv,
+            width,
+            height,
+            y_stride,
+            uv_stride,
+            screen_x: 0,
+            screen_y: 0,
+        })
+    }
+}
+
+fn extract_nv12_planes(frame: &VideoFrame) -> Option<(Vec<u8>, Vec<u8>, usize, usize)> {
+    let height = frame.height() as usize;
+    let y_stride = frame.stride(0);
+    let uv_stride = frame.stride(1);
+    if y_stride == 0 || uv_stride == 0 || height == 0 {
+        return None;
+    }
+    let y_data = frame.data(0);
+    let uv_data = frame.data(1);
+    let y_size = y_stride * height;
+    let uv_size = uv_stride * (height / 2);
+    if y_data.len() < y_size || uv_data.len() < uv_size {
+        log::warn!(
+            "[h264] NV12 frame data too small: y={}/{} uv={}/{}",
+            y_data.len(), y_size, uv_data.len(), uv_size
+        );
+        return None;
+    }
+    Some((y_data[..y_size].to_vec(), uv_data[..uv_size].to_vec(), y_stride, uv_stride))
 }
 
 impl AvcDecoder for H264Decoder {
@@ -685,6 +733,109 @@ impl AvcDecoder for H264Decoder {
     /// Reset the decoder to a clean state after RDPGFX RESET_GRAPHICS.
     fn reset(&mut self) {
         self.recreate_decoder();
+    }
+
+    fn decode_nv12(&mut self, data: &[u8]) -> Option<rdp_core::avc::NV12Frame> {
+        self.drain_count = 0;
+        let needs_flush = packet_needs_decoder_flush(data);
+
+        if needs_flush {
+            self.consecutive_eagain = 0;
+            self.keyframe_wait_count = 0;
+            self.request_keyframe = false;
+            self.decoder.flush();
+            self.decoder_flushed = true;
+            log::debug!("[h264] DPB flush triggered before IDR/SPS packet");
+        }
+
+        if self.needs_keyframe && !needs_flush {
+            self.keyframe_wait_count += 1;
+            if self.keyframe_wait_count < KEYFRAME_WAIT_LIMIT {
+                return None;
+            }
+            log::debug!(
+                "[h264] no IDR after {} packets; proceeding without keyframe (error concealment)",
+                KEYFRAME_WAIT_LIMIT
+            );
+            self.needs_keyframe = false;
+            self.keyframe_wait_count = 0;
+        }
+        if self.needs_keyframe {
+            self.needs_keyframe = false;
+            self.keyframe_wait_count = 0;
+        }
+
+        let early_frame = if self.use_hw && !needs_flush {
+            let saved_hint = std::mem::take(&mut self.region_hint);
+            let ef = self.take_decoded_frame_nv12();
+            self.region_hint = saved_hint;
+            ef
+        } else {
+            None
+        };
+
+        let packet = ffmpeg::Packet::copy(data);
+
+        match self.decoder.send_packet(&packet) {
+            Ok(()) => {}
+            Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::ffi::EAGAIN => {
+                if self.use_hw {
+                    log::debug!("[h264] VT send_packet EAGAIN — flushing decoder, waiting for IDR");
+                    self.decoder.flush();
+                    self.decoder_flushed = true;
+                    self.needs_keyframe = true;
+                    self.request_keyframe = false;
+                    self.keyframe_wait_count = 0;
+                    self.consecutive_eagain = 0;
+                    self.drain_count = 0;
+                    return None;
+                }
+                log::debug!("[h264] SW send_packet EAGAIN — draining and retrying");
+                let _ = self.take_decoded_frame_raw();
+                if let Err(e) = self.decoder.send_packet(&packet) {
+                    log::warn!("[h264] send_packet retry failed: {}", e);
+                    self.recreate_decoder();
+                    return None;
+                }
+            }
+            Err(e) => {
+                log::warn!("[h264] send_packet error: {}", e);
+                self.recreate_decoder();
+                return None;
+            }
+        }
+        let post_frame = self.take_decoded_frame_nv12();
+        self.region_hint.clear();
+
+        let frame = post_frame.or_else(|| {
+            if early_frame.is_some() {
+                self.full_blit = true;
+            }
+            early_frame
+        });
+
+        if let Some(frame) = frame {
+            self.consecutive_eagain = 0;
+            self.request_keyframe = false;
+            return Some(frame);
+        }
+
+        if self.use_hw {
+            self.consecutive_eagain += 1;
+            if self.consecutive_eagain >= EAGAIN_FLUSH_THRESHOLD && !self.request_keyframe {
+                log::debug!(
+                    "[h264] VT stalled ({} consecutive EAGAINs) — requesting IDR without flush",
+                    self.consecutive_eagain
+                );
+                self.request_keyframe = true;
+            }
+        }
+
+        None
+    }
+
+    fn supports_nv12(&self) -> bool {
+        self.use_hw
     }
 }
 

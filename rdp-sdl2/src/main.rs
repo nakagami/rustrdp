@@ -306,6 +306,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                     pending_bitmaps.extend(bitmaps);
                 }
+                Ok(RdpEvent::NV12Frame(frames)) => {
+                    // Flush accumulated BGRA bitmaps first (they form the background)
+                    if !pending_bitmaps.is_empty() {
+                        if let Err(e) = rdp_ui.update_screen(&pending_bitmaps) {
+                            log::error!("Failed to update screen: {}", e);
+                        }
+                        pending_bitmaps.clear();
+                    }
+                    // Render each NV12 frame as a hardware overlay
+                    for frame in frames {
+                        if let Err(e) = rdp_ui.render_nv12_frame(&frame) {
+                            log::error!("Failed to render NV12 frame: {}", e);
+                        }
+                    }
+                }
                 Ok(RdpEvent::Deactivated) => {
                     log::info!("RDP session deactivated");
                     running = false;
