@@ -1,9 +1,10 @@
+use rdp_core::bitmap::Bitmap;
+use rdp_core::client::RdpEvent;
+use rdp_core::protocol::rdpsnd::AudioFormat;
 use rdp_sdl2::config::RdpConfig;
 use rdp_sdl2::connection::RdpConnection;
 use rdp_sdl2::input::InputHandler;
 use rdp_sdl2::ui::RdpUI;
-use rdp_core::client::RdpEvent;
-use rdp_core::protocol::rdpsnd::AudioFormat;
 use sdl2::audio::{AudioQueue, AudioSpecDesired};
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::Keycode;
@@ -28,7 +29,7 @@ enum InputCmd {
 // RdpSession<SimpleTransport> is !Send because the Transport trait uses ?Send.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
     // LocalSet is required for spawn_local (non-Send futures on the current thread).
     tokio::task::LocalSet::new().run_until(run()).await
@@ -50,11 +51,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         e
     })?;
 
-    log::info!(
-        "Starting RDP client {}x{}",
-        config.width,
-        config.height
-    );
+    log::info!("Starting RDP client {}x{}", config.width, config.height);
 
     // Connect to RDP server
     let rdp_session = RdpConnection::connect(&config).await?;
@@ -62,12 +59,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // Initialize SDL2
     let sdl_context = sdl2::init()?;
     let audio_subsystem = sdl_context.audio()?;
-    let mut rdp_ui = RdpUI::new(
-        &sdl_context,
-        config.width,
-        config.height,
-        "RDP Client",
-    )?;
+    let mut rdp_ui = RdpUI::new(&sdl_context, config.width, config.height, "RDP Client")?;
 
     // Initialize input handler
     let input_handler = InputHandler::new(config.swap_alt_meta);
@@ -86,10 +78,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // input_tx  (SDL → RDP task): keyboard / mouse commands
     // event_rx  (RDP task → SDL): display updates, audio, resize, etc.
     //
-    // Buffer sizes: 64 input slots absorb a burst of fast typing; 32 event
-    // slots match the depth of grdpsdl2's bitmapCh (128 bitmaps / ~4 per PDU).
+    // Buffer sizes: 64 input slots absorb a burst of fast typing; 128 event
+    // slots match grdpsdl2's bitmapCh depth so display bursts don't stall the
+    // RDP I/O task while the SDL thread is presenting.
     let (input_tx, mut input_rx) = mpsc::channel::<InputCmd>(64);
-    let (event_tx, mut event_rx) = mpsc::channel::<RdpEvent>(32);
+    let (event_tx, mut event_rx) = mpsc::channel::<RdpEvent>(128);
 
     // --- RDP I/O task ---
     //
@@ -111,16 +104,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
             // to recv_event, matching grdpsdl2's "handle events then render" order.
             while let Ok(cmd) = input_rx.try_recv() {
                 let result = match cmd {
-                    InputCmd::KeyDown { flags, scancode } =>
-                        session.send_key_down(flags, scancode).await,
-                    InputCmd::KeyUp { scancode } =>
-                        session.send_key_up(scancode).await,
-                    InputCmd::MouseMove { x, y } =>
-                        session.send_mouse_move(x, y).await,
-                    InputCmd::MouseButton { btn, down, x, y } =>
-                        session.send_mouse_button(btn, down, x, y).await,
-                    InputCmd::MouseWheel { delta } =>
-                        session.send_mouse_wheel(delta).await,
+                    InputCmd::KeyDown { flags, scancode } => {
+                        session.send_key_down(flags, scancode).await
+                    }
+                    InputCmd::KeyUp { scancode } => session.send_key_up(scancode).await,
+                    InputCmd::MouseMove { x, y } => session.send_mouse_move(x, y).await,
+                    InputCmd::MouseButton { btn, down, x, y } => {
+                        session.send_mouse_button(btn, down, x, y).await
+                    }
+                    InputCmd::MouseWheel { delta } => session.send_mouse_wheel(delta).await,
                 };
                 if let Err(e) = result {
                     log::error!("Input send error: {}", e);
@@ -131,16 +123,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
             // Wait for the next RDP event (frame, audio, resize, etc.).
             // 8ms timeout matches grdpsdl2's WaitEventTimeout(8) and ensures the
             // input drain above runs regularly even on an idle desktop.
-            match tokio::time::timeout(
-                Duration::from_millis(8),
-                session.recv_event(),
-            ).await {
+            match tokio::time::timeout(Duration::from_millis(8), session.recv_event()).await {
                 Ok(Ok(event)) => {
                     let deactivated = matches!(event, RdpEvent::Deactivated);
                     if event_tx.send(event).await.is_err() {
                         break; // SDL side dropped — application is exiting
                     }
-                    if deactivated { break; }
+                    if deactivated {
+                        break;
+                    }
                 }
                 Ok(Err(e)) => {
                     log::error!("RDP session error: {}", e);
@@ -164,6 +155,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // never delayed by network back-pressure; the input channel absorbs bursts.
     while running {
         // Step 1: process SDL input events
+        // Accumulate mouse-wheel delta so that many rapid notches from a single
+        // poll batch are collapsed into one RDP event.  Sending one event per poll
+        // cycle (instead of one per notch) reduces the number of H.264 frames the
+        // server generates, which is the dominant CPU cost during fast scrolling.
+        let mut pending_wheel: i32 = 0;
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => {
@@ -176,15 +172,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 } => {
                     if keycode == Keycode::Escape {
                         running = false;
-                    } else if let Some((scancode, _)) = input_handler.handle_keyboard_event(keycode, true) {
-                        input_tx.send(InputCmd::KeyDown { flags: 0, scancode }).await.ok();
+                    } else if let Some((scancode, _)) =
+                        input_handler.handle_keyboard_event(keycode, true)
+                    {
+                        input_tx
+                            .send(InputCmd::KeyDown { flags: 0, scancode })
+                            .await
+                            .ok();
                     }
                 }
                 Event::KeyUp {
                     keycode: Some(keycode),
                     ..
                 } => {
-                    if let Some((scancode, _)) = input_handler.handle_keyboard_event(keycode, false) {
+                    if let Some((scancode, _)) = input_handler.handle_keyboard_event(keycode, false)
+                    {
                         input_tx.send(InputCmd::KeyUp { scancode }).await.ok();
                     }
                 }
@@ -194,35 +196,55 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     // Mouse moves are high-frequency: use try_send so that only
                     // the latest position is forwarded when the channel is full,
                     // rather than queuing many stale coordinates.
-                    input_tx.try_send(InputCmd::MouseMove { x: mouse_x, y: mouse_y }).ok();
+                    input_tx
+                        .try_send(InputCmd::MouseMove {
+                            x: mouse_x,
+                            y: mouse_y,
+                        })
+                        .ok();
                 }
-                Event::MouseButtonDown { mouse_btn, x, y, .. } => {
+                Event::MouseButtonDown {
+                    mouse_btn, x, y, ..
+                } => {
                     mouse_x = x as u16;
                     mouse_y = y as u16;
                     if let Some((btn, _)) = input_handler.handle_mouse_button(mouse_btn, true) {
-                        input_tx.send(InputCmd::MouseButton {
-                            btn, down: true, x: mouse_x, y: mouse_y,
-                        }).await.ok();
+                        input_tx
+                            .send(InputCmd::MouseButton {
+                                btn,
+                                down: true,
+                                x: mouse_x,
+                                y: mouse_y,
+                            })
+                            .await
+                            .ok();
                     }
                 }
-                Event::MouseButtonUp { mouse_btn, x, y, .. } => {
+                Event::MouseButtonUp {
+                    mouse_btn, x, y, ..
+                } => {
                     mouse_x = x as u16;
                     mouse_y = y as u16;
                     if let Some((btn, _)) = input_handler.handle_mouse_button(mouse_btn, false) {
-                        input_tx.send(InputCmd::MouseButton {
-                            btn, down: false, x: mouse_x, y: mouse_y,
-                        }).await.ok();
+                        input_tx
+                            .send(InputCmd::MouseButton {
+                                btn,
+                                down: false,
+                                x: mouse_x,
+                                y: mouse_y,
+                            })
+                            .await
+                            .ok();
                     }
                 }
                 Event::MouseWheel { x, y, .. } => {
                     if let Some(delta) = input_handler.handle_mouse_wheel(x, y) {
-                        input_tx.send(InputCmd::MouseWheel { delta }).await.ok();
+                        pending_wheel += delta as i32;
                     }
                 }
                 Event::Window {
-                    win_event: WindowEvent::Exposed
-                        | WindowEvent::Restored
-                        | WindowEvent::FocusGained,
+                    win_event:
+                        WindowEvent::Exposed | WindowEvent::Restored | WindowEvent::FocusGained,
                     ..
                 } => {
                     if let Err(e) = rdp_ui.repaint() {
@@ -233,24 +255,43 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        // Flush accumulated wheel delta as a single event.
+        if pending_wheel != 0 {
+            let clamped = pending_wheel.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+            input_tx.try_send(InputCmd::MouseWheel { delta: clamped }).ok();
+        }
+
         // Step 2: drain all available RDP display events (non-blocking).
         // Mirrors grdpsdl2: `for { select { case bs := <-bitmapCh: ... default: break } }`.
+        //
+        // Accumulate all Bitmap events so we can call canvas.present() just once
+        // per SDL loop iteration instead of once per decoded frame.  Multiple GPU
+        // flips per 4ms cycle are expensive and unnecessary — the back-buffer
+        // compositing already keeps only the latest content for each screen region.
+        let mut pending_bitmaps: Vec<Bitmap> = Vec::new();
         loop {
             match event_rx.try_recv() {
                 Ok(RdpEvent::Ready) => {
                     log::info!("RDP session ready");
                 }
                 Ok(RdpEvent::Resize { width, height }) => {
-                    #[cfg(debug_assertions)]
-                    eprintln!("[rdp-sdl2] Resize {}x{}", width, height);
+                    log::debug!("[rdp-sdl2] Resize {}x{}", width, height);
+                    // Flush any accumulated bitmaps before resizing so they
+                    // are rendered at the old dimensions.
+                    if !pending_bitmaps.is_empty() {
+                        if let Err(e) = rdp_ui.update_screen(&pending_bitmaps) {
+                            log::error!("Failed to update screen: {}", e);
+                        }
+                        pending_bitmaps.clear();
+                    }
                     if let Err(e) = rdp_ui.resize(width, height) {
                         log::error!("Failed to resize UI: {}", e);
                     }
                 }
                 Ok(RdpEvent::Bitmap(bitmaps)) => {
-                    #[cfg(debug_assertions)]
-                    if let Some(first) = bitmaps.first() {
-                        eprintln!(
+                    if log::log_enabled!(log::Level::Trace) {
+                        if let Some(first) = bitmaps.first() {
+                            log::trace!(
                             "[rdp-sdl2] Bitmap count={} first=({},{}-{},{} {}x{} bpp={})",
                             bitmaps.len(),
                             first.dest_left,
@@ -260,11 +301,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
                             first.width,
                             first.height,
                             first.bits_per_pixel
-                        );
+                            );
+                        }
                     }
-                    if let Err(e) = rdp_ui.update_screen(&bitmaps) {
-                        log::error!("Failed to update screen: {}", e);
-                    }
+                    pending_bitmaps.extend(bitmaps);
                 }
                 Ok(RdpEvent::Deactivated) => {
                     log::info!("RDP session deactivated");
@@ -287,7 +327,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                 q.resume();
                                 log::info!(
                                     "[audio] opened queue: {}Hz {}ch {}bit",
-                                    format.sample_rate, format.channels, format.bits_per_sample
+                                    format.sample_rate,
+                                    format.channels,
+                                    format.bits_per_sample
                                 );
                                 audio_queue = Some(q);
                                 audio_fmt = Some(format.clone());
@@ -298,7 +340,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     if let Some(q) = &audio_queue {
-                        let samples: Vec<i16> = data.chunks_exact(2)
+                        let samples: Vec<i16> = data
+                            .chunks_exact(2)
                             .map(|b| i16::from_le_bytes([b[0], b[1]]))
                             .collect();
                         if let Err(e) = q.queue_audio(&samples) {
@@ -312,6 +355,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     running = false;
                     break;
                 }
+            }
+        }
+        // Present accumulated bitmaps with a single GPU flip.
+        if !pending_bitmaps.is_empty() {
+            if let Err(e) = rdp_ui.update_screen(&pending_bitmaps) {
+                log::error!("Failed to update screen: {}", e);
             }
         }
 
