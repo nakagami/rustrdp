@@ -691,6 +691,16 @@ impl AvcDecoder for H264Decoder {
         self.needs_keyframe
     }
 
+    /// Returns `true` (and clears the flag) when a soft IDR request should be
+    /// sent to the server.  Set after `EAGAIN_FLUSH_THRESHOLD` consecutive
+    /// receive_frame EAGAINs.  Unlike `needs_keyframe`, P-frames continue to
+    /// be accepted — only a force-refresh PDU is sent, no decoder flush.
+    fn take_request_keyframe(&mut self) -> bool {
+        let v = self.request_keyframe;
+        self.request_keyframe = false;
+        v
+    }
+
     fn take_full_blit(&mut self) -> bool {
         let v = self.full_blit;
         self.full_blit = false;

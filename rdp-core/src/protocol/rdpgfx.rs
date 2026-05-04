@@ -1007,7 +1007,7 @@ impl RdpgfxHandler {
             let _ = dec.take_decoder_flushed();
             let _ = dec.take_drain_count();
             let _ = dec.take_full_blit();
-            if dec.needs_keyframe() {
+            if dec.needs_keyframe() || dec.take_request_keyframe() {
                 log::debug!("[rdpgfx] AVC decoder needs IDR — scheduling force refresh");
                 self.needs_force_refresh = true;
             }
@@ -1044,7 +1044,11 @@ impl RdpgfxHandler {
             // Check unconditionally: needs_keyframe() may stay true while
             // VideoToolbox is silent. Checking here ensures force-refresh PDUs
             // are retried by the caller's rate limiter until decoding resumes.
-            if dec.needs_keyframe() {
+            // Also check take_request_keyframe() for soft stalls (10 consecutive
+            // EAGAINs without a send_packet failure): VT keeps accepting P-frames
+            // but stops producing output.  A force-refresh triggers an IDR so
+            // VT can resync.  The 2-second rate limiter in client.rs prevents flooding.
+            if dec.needs_keyframe() || dec.take_request_keyframe() {
                 log::debug!("[rdpgfx] AVC decoder needs IDR — scheduling force refresh");
                 self.needs_force_refresh = true;
             }

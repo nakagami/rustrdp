@@ -39,6 +39,15 @@ pub trait AvcDecoder {
     /// blitted to the full surface, ignoring AVC dirty regions.
     fn take_full_blit(&mut self) -> bool;
 
+    /// Returns `true` (and clears the flag) when the decoder wants the server
+    /// to send an IDR keyframe as a soft hint — the decoder continues accepting
+    /// P-frames while waiting.  Set after `EAGAIN_FLUSH_THRESHOLD` consecutive
+    /// receive_frame EAGAINs.  Unlike `needs_keyframe()`, this does NOT drop
+    /// non-IDR packets; it only triggers a force-refresh PDU.
+    fn take_request_keyframe(&mut self) -> bool {
+        false
+    }
+
     /// Returns `true` (and clears the flag) if the decoder was flushed/reset
     /// during the last operation.  Callers use this to clear the dirty-region
     /// FIFO so stale region metadata is discarded.
