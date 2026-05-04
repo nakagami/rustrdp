@@ -556,14 +556,15 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
         }
         d->hw_eagain_count     = 0;
         d->keyframe_wait_count = 0;
-        /* Keep request_refresh=1 while pipeline_elevated so the Rust layer
-         * continues sending force-refresh PDUs every ~2 s until the server
-         * sends an IDR and the pre-IDR flush clears pipeline_elevated. */
-        if (d->pipeline_elevated) {
-            d->request_refresh = 1;
-        } else {
-            d->request_refresh = 0;
-        }
+        /* Do NOT re-arm request_refresh here.  Sending force-refresh PDUs
+         * asks the server to prepare a fresh I-frame of the current screen.
+         * This I-frame arrives at the client with a multi-frame delay; by
+         * then the scene has already changed (e.g. the new tab is visible)
+         * and the late I-frame overwrites fresh content → visible flicker.
+         * The stale_frames_remaining counter handles suppression without any
+         * IDR.  Force-refresh is only needed in the hard-reset path (30+
+         * consecutive EAGAINs) which sets request_refresh=1 explicitly. */
+        d->request_refresh = 0;
 
         /* Suppress stale frames: the decoded pixels belong to the scene that
          * was on screen BEFORE the EAGAIN burst (e.g. the previous Chrome tab).
@@ -592,9 +593,14 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
              * the force-refresh every ~2 s (rate-limited in client.rs) in case
              * the server (e.g. gnome-remote-desktop) ignored the first request. */
             if (d->hw_eagain_count == 1) {
-                fprintf(stderr, "[h264] HW decoder first EAGAIN (len=%d); requesting IDR\n", len);
+                /* Mark pipeline as elevated.  Do NOT set request_refresh here:
+                 * sending a force-refresh PDU causes the server to queue a
+                 * delayed I-frame of the current screen.  That frame arrives
+                 * after new-scene content is already displayed and overwrites
+                 * it, producing visible flicker.  stale_frames_remaining
+                 * suppresses the stale frames without any IDR. */
+                fprintf(stderr, "[h264] HW decoder first EAGAIN (len=%d); stale frames will be suppressed\n", len);
                 d->pipeline_elevated = 1;
-                d->request_refresh   = 1;
             }
             if (d->hw_eagain_count >= HW_EAGAIN_RESET_THRESHOLD) {
                 fprintf(stderr,
