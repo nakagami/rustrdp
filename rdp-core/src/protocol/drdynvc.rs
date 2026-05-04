@@ -174,8 +174,16 @@ impl DrdynvcHandler {
 
         if name == GFX_CHANNEL_NAME {
             // Take the AVC decoder (if any) and give it to the GFX handler.
-            // Only the first GFX channel creation gets the decoder; subsequent
-            // reopens (uncommon in practice) will run without H.264 decode.
+            // `take()` moves the decoder to the handler; any subsequent
+            // CREATE_REQ for the GFX channel (e.g. a server-initiated
+            // session reset) will create a new handler without a decoder.
+            // In practice this edge case is rare: the GFX channel lifecycle
+            // follows the RDP session lifecycle and the decoder holds no
+            // per-session state that cannot be recovered by the codec reset
+            // path (RESET_GRAPHICS → AvcDecoder::reset).  If future use
+            // cases require decoder reuse across channel recreations, the
+            // factory pattern (Box<dyn Fn() -> Box<dyn AvcDecoder>>) can be
+            // introduced here without changing the public API.
             let avc_dec = self.avc_dec.take();
             let mut gfx = RdpgfxHandler::with_avc(avc_dec);
             // Build CAPS_ADVERTISE and wrap it in a DATA PDU
