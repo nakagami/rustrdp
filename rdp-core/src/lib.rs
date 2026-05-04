@@ -4,7 +4,8 @@ pub mod core;
 pub mod protocol;
 pub mod plugin;
 pub mod client;
-pub(crate) mod h264;
+pub mod avc;
 
 pub use error::RdpError;
 pub use client::{RdpSession, RdpEvent};
+pub use avc::AvcDecoder;

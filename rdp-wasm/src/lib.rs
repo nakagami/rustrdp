@@ -209,7 +209,7 @@ pub async fn connect(
 
     spawn_local(async move {
         let mut session = match RdpSession::login(
-            transport, &domain, &user, &password, width, height, 0x0409,
+            transport, &domain, &user, &password, width, height, 0x0409, None,
         )
         .await
         {

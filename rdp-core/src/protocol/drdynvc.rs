@@ -47,6 +47,8 @@ pub struct DrdynvcHandler {
     channels:   HashMap<u32, DvcChannel>,
     fragments:  HashMap<u32, Fragment>,
     server_version: u16,
+    /// Optional AVC decoder plug-in, given away to the first GFX channel created.
+    avc_dec: Option<Box<dyn crate::avc::AvcDecoder>>,
 }
 
 impl DrdynvcHandler {
@@ -55,7 +57,14 @@ impl DrdynvcHandler {
             channels:  HashMap::new(),
             fragments: HashMap::new(),
             server_version: 1,
+            avc_dec: None,
         }
+    }
+
+    /// Inject an AVC decoder that will be passed to the RDPGFX channel handler
+    /// when the server creates the GFX dynamic virtual channel.
+    pub fn set_avc_decoder(&mut self, dec: Option<Box<dyn crate::avc::AvcDecoder>>) {
+        self.avc_dec = dec;
     }
 
     /// Process one DVC PDU.
@@ -164,7 +173,11 @@ impl DrdynvcHandler {
         out.push(build_create_rsp(ch_id, cb_ch_id, 0));
 
         if name == GFX_CHANNEL_NAME {
-            let mut gfx = RdpgfxHandler::new();
+            // Take the AVC decoder (if any) and give it to the GFX handler.
+            // Only the first GFX channel creation gets the decoder; subsequent
+            // reopens (uncommon in practice) will run without H.264 decode.
+            let avc_dec = self.avc_dec.take();
+            let mut gfx = RdpgfxHandler::with_avc(avc_dec);
             // Build CAPS_ADVERTISE and wrap it in a DATA PDU
             let caps_pdus = gfx.on_channel_created();
             self.channels.insert(ch_id, DvcChannel::Gfx(gfx));

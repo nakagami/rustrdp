@@ -249,6 +249,7 @@ impl RdpConnection {
             config.width,
             config.height,
             0x0409,
+            crate::h264::H264Decoder::new_boxed(),
         )
         .await?;
 

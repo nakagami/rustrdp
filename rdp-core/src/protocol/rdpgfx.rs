@@ -1,11 +1,10 @@
-use crate::bitmap::Bitmap;
-use crate::protocol::zgfx::ZgfxContext;
 /// RDPGFX (MS-RDPEGFX) protocol handler.
 ///
 /// Receives raw RDPGFX payload bytes (already ZGFX-decompressed),
 /// dispatches PDU commands, and returns decoded bitmap tiles.
+use crate::bitmap::Bitmap;
+use crate::protocol::zgfx::ZgfxContext;
 use std::collections::HashMap;
-#[cfg(feature = "h264")]
 use std::collections::VecDeque;
 
 // ── RDPGFX command IDs ────────────────────────────────────────────────────────
@@ -82,7 +81,7 @@ pub struct RdpgfxHandler {
     zgfx: ZgfxContext,
     frames_decoded: u32,
     last_reset_size: Option<(u16, u16)>,
-    /// Set when the H264 decoder is waiting for a keyframe (IDR) after failures.
+    /// Set when the AVC decoder is waiting for a keyframe (IDR) after failures.
     /// Signals to the caller that a force-refresh (suppress→allow) should be sent.
     needs_force_refresh: bool,
     /// FIFO queue of dirty regions, one entry pushed per H.264 packet sent to the
@@ -90,24 +89,27 @@ pub struct RdpgfxHandler {
     /// outputting (EAGAIN), we must pair each decoded frame with the dirty regions
     /// of the *original* packet — not the *current* one.  Pushing before sending
     /// and popping on each successful decode keeps content and regions in sync.
-    #[cfg(feature = "h264")]
     pending_avc_regions_queue: VecDeque<Vec<AvcRect>>,
-    #[cfg(feature = "h264")]
-    h264_dec: Option<crate::h264::H264Decoder>,
+    /// Injected AVC decoder.  `None` when no H.264 support is configured
+    /// (e.g. rdp-wasm, CLI tools that don't need video decode).
+    avc_dec: Option<Box<dyn crate::avc::AvcDecoder>>,
 }
 
 impl RdpgfxHandler {
+    /// Create a handler without an AVC decoder.
     pub fn new() -> Self {
-        #[cfg(feature = "h264")]
-        let h264_dec = {
-            let dec = crate::h264::H264Decoder::new();
-            if dec.is_none() {
-                log::warn!("[rdpgfx] H264Decoder::new() returned None — H.264 decode unavailable");
-            } else {
-                log::info!("[rdpgfx] H264Decoder initialized successfully");
-            }
-            dec
-        };
+        Self::with_avc(None)
+    }
+
+    /// Create a handler with an optional AVC decoder plug-in.
+    ///
+    /// Pass `Some(decoder)` when H.264/AVC decode support is desired.
+    pub fn with_avc(avc_dec: Option<Box<dyn crate::avc::AvcDecoder>>) -> Self {
+        if avc_dec.is_some() {
+            log::info!("[rdpgfx] AVC decoder configured");
+        } else {
+            log::debug!("[rdpgfx] no AVC decoder — H.264 frames will be skipped");
+        }
         RdpgfxHandler {
             surfaces: HashMap::new(),
             cache: HashMap::new(),
@@ -115,10 +117,8 @@ impl RdpgfxHandler {
             frames_decoded: 0,
             last_reset_size: None,
             needs_force_refresh: false,
-            #[cfg(feature = "h264")]
             pending_avc_regions_queue: VecDeque::new(),
-            #[cfg(feature = "h264")]
-            h264_dec,
+            avc_dec,
         }
     }
 
@@ -156,21 +156,18 @@ impl RdpgfxHandler {
     /// The decoder_flushed flag returned from the next decode() call will be
     /// true, causing the FIFO to be re-synced when AVC resumes with an IDR.
     pub fn signal_screen_refreshed(&mut self) {
-        #[cfg(feature = "h264")]
-        {
-            if let Some(dec) = &mut self.h264_dec {
-                dec.signal_screen_refreshed();
-                // If decoder_flushed is now set, clear the FIFO immediately
-                // (no need to wait for the next decode() call).
-                if dec.take_decoder_flushed() {
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[rdpgfx] signal_screen_refreshed: cleared FIFO (had {} entries)",
-                        self.pending_avc_regions_queue.len()
-                    );
-                    self.pending_avc_regions_queue.clear();
-                    self.needs_force_refresh = false;
-                }
+        if let Some(dec) = &mut self.avc_dec {
+            dec.signal_screen_refreshed();
+            // If decoder_flushed is now set, clear the FIFO immediately
+            // (no need to wait for the next decode() call).
+            if dec.take_decoder_flushed() {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[rdpgfx] signal_screen_refreshed: cleared FIFO (had {} entries)",
+                    self.pending_avc_regions_queue.len()
+                );
+                self.pending_avc_regions_queue.clear();
+                self.needs_force_refresh = false;
             }
         }
     }
@@ -403,13 +400,11 @@ impl RdpgfxHandler {
         }
         self.surfaces.clear();
         self.frames_decoded = 0;
-        #[cfg(feature = "h264")]
-        {
-            let dec = crate::h264::H264Decoder::new();
-            if dec.is_none() {
-                log::warn!("[rdpgfx] RESET_GRAPHICS: H264Decoder::new() failed");
-            }
-            self.h264_dec = dec;
+        // Reset the AVC decoder so stale pipeline frames do not bleed
+        // into the new surface configuration.
+        if let Some(dec) = &mut self.avc_dec {
+            dec.reset();
+            log::info!("[rdpgfx] RESET_GRAPHICS: AVC decoder reset");
         }
     }
 
@@ -889,8 +884,9 @@ impl RdpgfxHandler {
         // frame K finally drains, we need the dirty regions of packet K — not the
         // current (newer) packet's regions.  Maintaining a FIFO of per-packet regions
         // and popping the front on each successful decode preserves the mapping.
-        #[cfg(feature = "h264")]
-        self.pending_avc_regions_queue.push_back(regions.clone());
+        if self.avc_dec.is_some() {
+            self.pending_avc_regions_queue.push_back(regions.clone());
+        }
 
         let result = self.decode_h264(&stream.h264_data);
 
@@ -899,18 +895,12 @@ impl RdpgfxHandler {
         // discarded.  Clear the FIFO so the stale entries (from packets whose frames
         // were flushed away) are not used.  Then re-push the current packet's regions
         // so they are available when the packet's frame eventually drains.
-        #[cfg(feature = "h264")]
-        let (flushed, drain_happened) = {
-            if let Some(ref mut dec) = self.h264_dec {
-                (dec.take_decoder_flushed(), dec.take_drain_happened())
-            } else {
-                (false, false)
-            }
+        let (flushed, drain_happened) = if let Some(ref mut dec) = self.avc_dec {
+            (dec.take_decoder_flushed(), dec.take_drain_happened())
+        } else {
+            (false, false)
         };
-        #[cfg(not(feature = "h264"))]
-        let (flushed, drain_happened) = (false, false);
 
-        #[cfg(feature = "h264")]
         if flushed {
             let queue_len_before = self.pending_avc_regions_queue.len();
             self.pending_avc_regions_queue.clear();
@@ -922,7 +912,7 @@ impl RdpgfxHandler {
             );
         }
 
-        let is_mismatch = self.h264_dec_take_full_blit();
+        let is_mismatch = self.avc_dec_take_full_blit();
 
         // Pop the FIFO whenever the decoder drained a frame — even if the frame was
         // suppressed (dark-frame suppression) and C returned NULL.  Without this,
@@ -931,7 +921,6 @@ impl RdpgfxHandler {
         //
         // When drain_happened=false (EAGAIN, no frame consumed), keep the FIFO entry
         // we just pushed and return None.
-        #[cfg(feature = "h264")]
         let effective_regions = if drain_happened {
             let popped = self.pending_avc_regions_queue.pop_front();
             #[cfg(debug_assertions)]
@@ -954,8 +943,6 @@ impl RdpgfxHandler {
             );
             regions.clone()
         };
-        #[cfg(not(feature = "h264"))]
-        let effective_regions = regions;
 
         // No frame decoded (EAGAIN or dark-frame suppression with no result):
         // skip the blit; the display shows the previous frame.
@@ -967,46 +954,34 @@ impl RdpgfxHandler {
     }
 
     #[allow(dead_code)]
-    fn h264_dec_take_full_blit(&mut self) -> bool {
-        #[cfg(feature = "h264")]
-        if let Some(ref mut dec) = self.h264_dec {
+    fn avc_dec_take_full_blit(&mut self) -> bool {
+        if let Some(ref mut dec) = self.avc_dec {
             return dec.take_full_blit();
         }
         false
     }
 
-    #[allow(unused_variables)]
     fn decode_h264(&mut self, h264_data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-        #[cfg(feature = "h264")]
-        {
-            if let Some(ref mut dec) = self.h264_dec {
-                let result = dec.decode(h264_data);
-                // Check unconditionally: needs_keyframe() returns true while
-                // pipeline_elevated=1 (C keeps request_refresh=1 after the
-                // first EAGAIN until the IDR flush).  Checking here (not just
-                // on EAGAIN) ensures force-refresh PDUs are retried every ~2 s
-                // while the pipeline stays elevated in steady-state drain mode.
-                if dec.needs_keyframe() {
-                    #[cfg(debug_assertions)]
-                    eprintln!("[rdpgfx] H264 decoder needs IDR — scheduling force refresh");
-                    self.needs_force_refresh = true;
-                }
-                if result.is_none() {
-                    // No output is normal while the decoder buffers frames or waits
-                    // for VideoToolbox/FFmpeg to resume after an IDR.
-                }
-                log::info!(
-                    "[rdpgfx] H264 decode {} bytes → {}",
-                    h264_data.len(),
-                    if result.is_some() { "frame" } else { "none" }
-                );
-                return result;
-            } else {
-                log::warn!("[rdpgfx] H264 decoder is None (init failed) — frame dropped");
+        if let Some(ref mut dec) = self.avc_dec {
+            let result = dec.decode(h264_data);
+            // Check unconditionally: needs_keyframe() returns true while
+            // pipeline_elevated=1 (C keeps request_refresh=1 after the
+            // first EAGAIN until the IDR flush).  Checking here (not just
+            // on EAGAIN) ensures force-refresh PDUs are retried every ~2 s
+            // while the pipeline stays elevated in steady-state drain mode.
+            if dec.needs_keyframe() {
+                #[cfg(debug_assertions)]
+                eprintln!("[rdpgfx] AVC decoder needs IDR — scheduling force refresh");
+                self.needs_force_refresh = true;
             }
+            log::info!(
+                "[rdpgfx] AVC decode {} bytes → {}",
+                h264_data.len(),
+                if result.is_some() { "frame" } else { "none" }
+            );
+            return result;
         }
-        #[cfg(not(feature = "h264"))]
-        log::debug!("[rdpgfx] H.264 data received but h264 feature not enabled");
+        log::debug!("[rdpgfx] H.264 data received but no AVC decoder configured");
         None
     }
 

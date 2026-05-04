@@ -85,6 +85,9 @@ pub struct RdpSession<T: Transport> {
 
 impl<T: Transport> RdpSession<T> {
     /// Perform full RDP login and return a ready session.
+    ///
+    /// Pass `avc` to enable H.264/AVC video decode.  Use `None` for
+    /// environments that do not need hardware video decode (e.g. WASM, CLI).
     pub async fn login(
         transport: T,
         domain: &str,
@@ -93,6 +96,7 @@ impl<T: Transport> RdpSession<T> {
         width: u16,
         height: u16,
         kbd_layout: u32,
+        avc: Option<Box<dyn crate::avc::AvcDecoder>>,
     ) -> Result<Self, RdpError> {
         // Step 1: X.224 connection negotiation
         let tpkt = Tpkt::new(transport);
@@ -234,7 +238,11 @@ impl<T: Transport> RdpSession<T> {
             rdpsnd_frag: Vec::new(),
             rdpsnd_frag_total: 0,
             drdynvc_channel,
-            drdynvc_handler: DrdynvcHandler::new(),
+            drdynvc_handler: {
+                let mut h = DrdynvcHandler::new();
+                h.set_avc_decoder(avc);
+                h
+            },
             drdynvc_frag: Vec::new(),
             drdynvc_frag_total: 0,
             pending_audio: std::collections::VecDeque::new(),

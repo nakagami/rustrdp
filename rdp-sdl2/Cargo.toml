@@ -8,7 +8,7 @@ name = "rdp-sdl2"
 path = "src/main.rs"
 
 [dependencies]
-rdp-core = { path = "../rdp-core", features = ["h264"] }
+rdp-core = { path = "../rdp-core" }
 tokio = { version = "1", features = ["full"] }
 sdl2 = { version = "0.35", features = ["ttf", "unsafe_textures"] }
 clap = { version = "4", features = ["derive"] }
@@ -20,5 +20,6 @@ rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 
 [build-dependencies]
+cc = "1"
 pkg-config = "0.3"
 
