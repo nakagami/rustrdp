@@ -487,7 +487,6 @@ impl RdpgfxHandler {
                 if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
-                    let suppress_full = self.needs_force_refresh;
                     let mut discard = Vec::new();
                     let out = if mapped { bitmaps } else { &mut discard };
                     blit_avc_frame(
@@ -504,7 +503,6 @@ impl RdpgfxHandler {
                         abs_x,
                         abs_y,
                         false,
-                        suppress_full,
                         &regions,
                     );
                 }
@@ -517,7 +515,6 @@ impl RdpgfxHandler {
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!("[rdpgfx] AVC444 decoded {}x{} → blit {}x{} regions={} at ({},{}) abs=({},{}) mapped={}",
                         fw, fh, ew, eh, regions.len(), dest_left, dest_top, abs_x, abs_y, mapped);
-                    let suppress_full = self.needs_force_refresh;
                     let mut discard = Vec::new();
                     let out = if mapped { bitmaps } else { &mut discard };
                     blit_avc_frame(
@@ -534,7 +531,6 @@ impl RdpgfxHandler {
                         abs_x,
                         abs_y,
                         force_regions,
-                        suppress_full,
                         &regions,
                     );
                 }
@@ -626,7 +622,6 @@ impl RdpgfxHandler {
                         eh,
                         mapped
                     );
-                    let suppress_full = self.needs_force_refresh;
                     let mut discard = Vec::new();
                     let out = if mapped { bitmaps } else { &mut discard };
                     blit_avc_frame(
@@ -643,7 +638,6 @@ impl RdpgfxHandler {
                         abs_x,
                         abs_y,
                         false,
-                        suppress_full,
                         &regions,
                     );
                 }
@@ -656,7 +650,6 @@ impl RdpgfxHandler {
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!("[rdpgfx] WTS2 AVC444 decoded {}x{} → blit {}x{} regions={} abs=({},{}) mapped={}",
                         fw, fh, ew, eh, regions.len(), abs_x, abs_y, mapped);
-                    let suppress_full = self.needs_force_refresh;
                     let mut discard = Vec::new();
                     let out = if mapped { bitmaps } else { &mut discard };
                     blit_avc_frame(
@@ -673,7 +666,6 @@ impl RdpgfxHandler {
                         abs_x,
                         abs_y,
                         force_regions,
-                        suppress_full,
                         &regions,
                     );
                 }
@@ -1109,10 +1101,10 @@ fn avc_regions_bounds(regions: &[AvcRect]) -> Option<(i32, i32, i32, i32)> {
 /// overwrite unchanged desktop areas when the decoder output only contains the
 /// updated macroblocks for a window transition.
 ///
-/// When `suppress_full_frame` is true (VideoToolbox pipeline is elevated and
-/// frames are stale), full-frame blits are skipped entirely to avoid painting
-/// stale content over the whole screen.  Small region blits still proceed so
-/// cursor movement and minor UI updates remain visible.
+/// Blit a decoded AVC frame to the surface.
+/// Stale-frame suppression is handled entirely in C (`stale_frames_remaining`):
+/// the decoder returns NULL for stale frames so this function is only called
+/// with live content.
 #[allow(clippy::too_many_arguments)]
 fn blit_avc_frame(
     surf_id: u16,
@@ -1128,7 +1120,6 @@ fn blit_avc_frame(
     ax: i32,
     ay: i32, // absolute screen position
     force_regions: bool,
-    suppress_full_frame: bool,
     regions: &[AvcRect],
 ) {
     if force_regions && !regions.is_empty() {
@@ -1158,19 +1149,6 @@ fn blit_avc_frame(
     if should_use_avc_regions(regions, ew, eh) {
         blit_avc_regions(
             surf_id, surfaces, bitmaps, pixels, fw, fh, ew, eh, dx, dy, ax, ay, regions,
-        );
-        return;
-    }
-
-    // Full-frame blit: skip when the pipeline is stale (force-refresh pending).
-    // Painting a stale AVC frame over the entire screen would cause a visible
-    // flicker right before the server's fresh bitmap update overwrites it.
-    if suppress_full_frame {
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[rdpgfx] suppress AVC full blit (stale pipeline) surf={} surface=({},{} {}x{}) regions={} region_area={} frame_area={}",
-            surf_id, dx, dy, ew, eh,
-            regions.len(), avc_regions_area(regions), ew.saturating_mul(eh)
         );
         return;
     }
