@@ -38,33 +38,5 @@ fn main() {
     // Use pkg-config if available
     pkg_config::probe_library("sdl2").ok();
     pkg_config::probe_library("SDL2_ttf").ok();
-
-    // ── H.264 (FFmpeg) setup ──────────────────────────────────────────────────
-    // Compile the C helper that wraps libavcodec.
-    // Use `brew --prefix ffmpeg` to find the correct path on both Apple Silicon
-    // (/opt/homebrew) and Intel (/usr/local) Macs.
-    let brew_ffmpeg = Command::new("brew")
-        .args(["--prefix", "ffmpeg"])
-        .output()
-        .map(|o| {
-            String::from_utf8(o.stdout)
-                .unwrap_or_default()
-                .trim()
-                .to_string()
-        })
-        .unwrap_or_else(|_| "/opt/homebrew".to_string());
-
-    cc::Build::new()
-        .file("src/h264_helper.c")
-        .include(format!("{}/include", brew_ffmpeg))
-        .flag("-w") // suppress warnings from the C helper
-        .compile("h264_helper");
-
-    let lib_dir = format!("{}/lib", brew_ffmpeg);
-    println!("cargo:rustc-link-search=native={}", lib_dir);
-    println!("cargo:rustc-link-lib=dylib=avcodec");
-    println!("cargo:rustc-link-lib=dylib=avutil");
-    println!("cargo:rustc-link-lib=dylib=swscale");
-    println!("cargo:rerun-if-changed=src/h264_helper.c");
-    println!("cargo:rerun-if-changed=build.rs");
+    // H.264 decode is handled by the `openh264` Rust crate (no FFmpeg needed).
 }
