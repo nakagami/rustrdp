@@ -27,6 +27,7 @@ typedef struct RdpH264Dec {
     int                  drain_happened;  /* set when drain_count>=1 (frame decoded, possibly suppressed); taken by caller to sync region FIFO */
     int                  hw_eagain_count;    /* consecutive no-output packets from VideoToolbox */
     int                  pipeline_elevated;  /* set when hw_eagain_count first reaches 1; cleared only by IDR flush; while set, request_refresh=1 is re-armed every decode call so the server keeps receiving force-refresh PDUs every ~2 s */
+    int                  stale_frames_remaining; /* set to hw_eagain_count at the first drain after a burst; decremented on each subsequent drain; frames are suppressed (NULL returned, drain_happened=1) while > 0 */
     int                  keyframe_wait_count; /* packets dropped since last flush waiting for IDR */
     int                  log_frames_left;
 } RdpH264Dec;
@@ -426,11 +427,12 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
     if (idr) {
         fprintf(stderr, "[h264] pre-IDR/SPS flush: len=%d idr5=%d sps7=%d\n", len, idr5, sps7);
         avcodec_flush_buffers(d->ctx);
-        d->decoder_flushed   = 1;
-        d->just_flushed      = 1;
-        d->pipeline_elevated = 0;  /* IDR resets the VideoToolbox pipeline */
-        d->hw_eagain_count   = 0;
-        d->log_frames_left   = 8;  /* re-enable per-frame luma logging after each IDR */
+        d->decoder_flushed          = 1;
+        d->just_flushed             = 1;
+        d->pipeline_elevated        = 0;  /* IDR resets the VideoToolbox pipeline */
+        d->hw_eagain_count          = 0;
+        d->stale_frames_remaining   = 0;  /* IDR flush discards the stale pipeline */
+        d->log_frames_left          = 8;  /* re-enable per-frame luma logging after each IDR */
     }
 
     /* Helper: convert one AVFrame to malloc'd BGRA and accumulate into *result.
@@ -511,15 +513,17 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
         avcodec_flush_buffers(d->ctx);
         d->decoder_flushed = 1;
         if (d->use_hw && !idr) {
-            d->request_refresh = 1;
-            d->just_flushed = 0;
-            d->hw_eagain_count = 0;
+            d->request_refresh        = 1;
+            d->just_flushed           = 0;
+            d->hw_eagain_count        = 0;
+            d->stale_frames_remaining = 0;
         } else {
-            d->needs_keyframe    = 1;
-            d->request_refresh   = 1;
-            d->seen_idr5         = 0;
-            d->bright_frame_seen = 0;
-            d->just_flushed      = 0;
+            d->needs_keyframe         = 1;
+            d->request_refresh        = 1;
+            d->seen_idr5              = 0;
+            d->bright_frame_seen      = 0;
+            d->just_flushed           = 0;
+            d->stale_frames_remaining = 0;
         }
         free(result);
         return NULL;
@@ -540,6 +544,16 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
 
     if (drain_count >= 1) {
         d->drain_happened      = 1;
+        /* First drain after an EAGAIN burst: the decoder is now outputting
+         * frames that were buffered BEFORE the scene change.  Record the burst
+         * depth so we can suppress exactly that many stale frames.  After those
+         * N frames the pipeline contains the new-scene content and blits are
+         * safe again. */
+        if (d->hw_eagain_count > 0) {
+            d->stale_frames_remaining = d->hw_eagain_count;
+            fprintf(stderr, "[h264] EAGAIN burst ended (depth=%d): stale_frames_remaining=%d\n",
+                    d->hw_eagain_count, d->stale_frames_remaining);
+        }
         d->hw_eagain_count     = 0;
         d->keyframe_wait_count = 0;
         /* Keep request_refresh=1 while pipeline_elevated so the Rust layer
@@ -549,6 +563,19 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
             d->request_refresh = 1;
         } else {
             d->request_refresh = 0;
+        }
+
+        /* Suppress stale frames: the decoded pixels belong to the scene that
+         * was on screen BEFORE the EAGAIN burst (e.g. the previous Chrome tab).
+         * We return NULL so the Rust layer skips the blit, but drain_happened=1
+         * is already set so it still pops the region FIFO, keeping the FIFO
+         * in sync with the decoder pipeline. */
+        if (d->stale_frames_remaining > 0) {
+            d->stale_frames_remaining--;
+            fprintf(stderr, "[h264] suppressing stale frame (remaining after=%d)\n",
+                    d->stale_frames_remaining);
+            free(result);
+            return NULL;
         }
     }
 
@@ -579,13 +606,14 @@ uint8_t* rdp_h264_decode(RdpH264Dec *d,
                  * the Rust layer will send a SuppressOutput force-refresh PDU.
                  * If no IDR arrives within KEYFRAME_WAIT_LIMIT packets the
                  * keyframe-wait path above escalates to codec_hard_reset(). */
-                d->needs_keyframe    = 1;
-                d->request_refresh   = 1;
-                d->pipeline_elevated = 0;  /* hard flush resets everything */
-                d->keyframe_wait_count = 0;
-                d->decoder_flushed   = 1;
-                d->just_flushed      = 0;
-                d->hw_eagain_count   = 0;
+                d->needs_keyframe         = 1;
+                d->request_refresh        = 1;
+                d->pipeline_elevated      = 0;  /* hard flush resets everything */
+                d->keyframe_wait_count    = 0;
+                d->decoder_flushed        = 1;
+                d->just_flushed           = 0;
+                d->hw_eagain_count        = 0;
+                d->stale_frames_remaining = 0;
             }
         }
         /* EAGAIN: decoder has buffered this packet but not yet produced output.
@@ -790,10 +818,11 @@ void rdp_h264_signal_screen_refreshed(RdpH264Dec *d) {
     fprintf(stderr, "[h264] signal_screen_refreshed: flushing %d-deep pipeline, waiting for IDR\n",
             d->hw_eagain_count > 0 ? d->hw_eagain_count : 5);
     avcodec_flush_buffers(d->ctx);
-    d->decoder_flushed   = 1;
-    d->just_flushed      = 0;
-    d->needs_keyframe    = 1;
-    d->request_refresh   = 1;  /* keep requesting IDR until server sends one */
-    d->pipeline_elevated = 0;
-    d->hw_eagain_count   = 0;
+    d->decoder_flushed        = 1;
+    d->just_flushed           = 0;
+    d->needs_keyframe         = 1;
+    d->request_refresh        = 1;  /* keep requesting IDR until server sends one */
+    d->pipeline_elevated      = 0;
+    d->hw_eagain_count        = 0;
+    d->stale_frames_remaining = 0;
 }
