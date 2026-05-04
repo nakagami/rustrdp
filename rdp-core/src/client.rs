@@ -433,7 +433,10 @@ impl<T: Transport> RdpSession<T> {
         // recv_data() returning and send_frame_acknowledge() completing.
         // Without this, the server stops sending display updates after a few missed ACKs.
         while let Some(frame_id) = self.pending_acks.pop_front() {
-            log::debug!("[recv_event] sending deferred frame ack frame_id={}", frame_id);
+            log::debug!(
+                "[recv_event] sending deferred frame ack frame_id={}",
+                frame_id
+            );
             self.send_frame_acknowledge(frame_id).await?;
         }
 
@@ -641,7 +644,11 @@ impl<T: Transport> RdpSession<T> {
     async fn handle_drdynvc_data(
         &mut self,
         data: &[u8],
-    ) -> (Vec<Bitmap>, Vec<crate::protocol::rdpsnd::AudioEvent>, Option<(u16, u16)>) {
+    ) -> (
+        Vec<Bitmap>,
+        Vec<crate::protocol::rdpsnd::AudioEvent>,
+        Option<(u16, u16)>,
+    ) {
         const CHANNEL_FLAG_FIRST: u32 = 0x01;
         const CHANNEL_FLAG_LAST: u32 = 0x02;
 
@@ -690,14 +697,14 @@ impl<T: Transport> RdpSession<T> {
                 Some(t) => now.duration_since(t).as_secs() >= 2,
             };
             if should_send {
-                eprintln!("[client] sending force refresh (suppress→allow) to request IDR");
+                log::debug!("[client] sending force refresh (suppress→allow) to request IDR");
                 if let Err(e) = self.send_force_refresh().await {
-                    eprintln!("[client] force refresh failed: {:?}", e);
+                    log::warn!("[client] force refresh failed: {:?}", e);
                 } else {
                     self.last_force_refresh = Some(now);
                 }
             } else {
-                eprintln!("[client] force refresh skipped (rate-limited, last sent <2s ago)");
+                log::debug!("[client] force refresh skipped (rate-limited, last sent <2s ago)");
             }
         }
 
@@ -813,10 +820,10 @@ fn build_client_info(domain: &str, user: &str, password: &str) -> Vec<u8> {
     info.extend_from_slice(&[0, 0]);
     info.extend_from_slice(&[0u8; 172]); // clientTimeZone
     write_u32_le(&mut info, 0); // clientSessionId
-    // performanceFlags: match grdp 0x00000187
-    // PERF_DISABLE_WALLPAPER(0x01) | PERF_DISABLE_FULLWINDOWDRAG(0x02) |
-    // PERF_DISABLE_MENUANIMATIONS(0x04) | PERF_DISABLE_THEMING(0x80) |
-    // PERF_DISABLE_CURSOR_SHADOW(0x100)
+                                // performanceFlags: match grdp 0x00000187
+                                // PERF_DISABLE_WALLPAPER(0x01) | PERF_DISABLE_FULLWINDOWDRAG(0x02) |
+                                // PERF_DISABLE_MENUANIMATIONS(0x04) | PERF_DISABLE_THEMING(0x80) |
+                                // PERF_DISABLE_CURSOR_SHADOW(0x100)
     write_u32_le(&mut info, 0x00000187);
 
     info
@@ -1307,5 +1314,7 @@ fn clamp_i16_to_u8(v: i16) -> u8 {
 /// area) also flush the stale AVC FIFO.  The C-level guard on
 /// `pipeline_elevated` makes this a no-op when no pipeline stall is active.
 fn bitmaps_contain_large_refresh(bitmaps: &[crate::bitmap::Bitmap]) -> bool {
-    bitmaps.iter().any(|b| (b.width as i64) * (b.height as i64) > 60_000)
+    bitmaps
+        .iter()
+        .any(|b| (b.width as i64) * (b.height as i64) > 60_000)
 }
