@@ -31,18 +31,38 @@ const BITMAP_NO_PROCESSING: u16 = 0x8000;
 const PDUTYPE2_FRAME_ACKNOWLEDGE: u8 = 0x38;
 const FASTPATH_UPDATETYPE_BITMAP: u8 = 0x01;
 const FASTPATH_UPDATETYPE_SURFCMDS: u8 = 0x04;
+const FASTPATH_UPDATETYPE_PTR_NULL: u8 = 0x05;
+const FASTPATH_UPDATETYPE_CACHED: u8 = 0x0A;
+const FASTPATH_UPDATETYPE_POINTER: u8 = 0x0B;
 const CMDTYPE_SET_SURFACE_BITS: u16 = 0x0001;
 const CMDTYPE_FRAME_MARKER: u16 = 0x0004;
 const CMDTYPE_STREAM_SURFACE_BITS: u16 = 0x0006;
 const SURFCMD_FRAMEACTION_END: u16 = 0x0001;
 
+pub enum PointerEvent {
+    Hide,
+    Cached(u16),
+    Update {
+        idx: u16,
+        xor_bpp: u16,
+        hot_x: u16,
+        hot_y: u16,
+        width: u16,
+        height: u16,
+        and_mask: Vec<u8>,
+        xor_data: Vec<u8>,
+    },
+}
+
 pub enum RdpEvent {
     Ready,
     Bitmap(Vec<Bitmap>),
     NV12Frame(Vec<crate::avc::NV12Frame>),
+    H264Nal(Vec<crate::protocol::rdpgfx::H264NalEvent>),
     Resize { width: u16, height: u16 },
     Deactivated,
     Audio { format: AudioFormat, data: Vec<u8> },
+    Pointer(PointerEvent),
 }
 
 pub struct RdpSession<T: Transport> {
@@ -462,12 +482,12 @@ impl<T: Transport> RdpSession<T> {
                 // FastPath update
                 log::debug!("[recv_event] FastPath data_len={}", data.len());
                 let result = parse_fastpath_updates(&data, &mut self.frag_buf);
-                // Queue ACKs first so they survive cancellation, then send them.
-                // If cancelled mid-send, the remaining IDs stay in pending_acks and
-                // will be sent at the start of the next recv_event() call.
                 self.pending_acks.extend(result.frame_ids.iter().copied());
                 while let Some(frame_id) = self.pending_acks.pop_front() {
                     self.send_frame_acknowledge(frame_id).await?;
+                }
+                if let Some(ptr) = result.pointer {
+                    return Ok(RdpEvent::Pointer(ptr));
                 }
                 let bitmaps = result.bitmaps;
                 log::debug!("[recv_event] FastPath bitmaps={}", bitmaps.len());
@@ -493,7 +513,7 @@ impl<T: Transport> RdpSession<T> {
 
             // Dispatch drdynvc static virtual channel data
             if Some(ch) == self.drdynvc_channel {
-                let (bitmaps, nv12_frames, audio_events, reset_size) = self.handle_drdynvc_data(&data).await;
+                let (bitmaps, nv12_frames, h264_nals, audio_events, reset_size) = self.handle_drdynvc_data(&data).await;
                 for ev in audio_events {
                     self.pending_audio.push_back(ev);
                 }
@@ -504,6 +524,9 @@ impl<T: Transport> RdpSession<T> {
                 }
                 if !nv12_frames.is_empty() {
                     return Ok(RdpEvent::NV12Frame(nv12_frames));
+                }
+                if !h264_nals.is_empty() {
+                    return Ok(RdpEvent::H264Nal(h264_nals));
                 }
                 if !bitmaps.is_empty() {
                     return Ok(RdpEvent::Bitmap(bitmaps));
@@ -651,6 +674,7 @@ impl<T: Transport> RdpSession<T> {
     ) -> (
         Vec<Bitmap>,
         Vec<crate::avc::NV12Frame>,
+        Vec<crate::protocol::rdpgfx::H264NalEvent>,
         Vec<crate::protocol::rdpsnd::AudioEvent>,
         Option<(u16, u16)>,
     ) {
@@ -659,7 +683,7 @@ impl<T: Transport> RdpSession<T> {
 
         if data.len() < 8 {
             log::warn!("[drdynvc] channel data too short: {} bytes", data.len());
-            return (vec![], vec![], vec![], None);
+            return (vec![], vec![], vec![], vec![], None);
         }
         let total_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         let flags = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
@@ -672,11 +696,11 @@ impl<T: Transport> RdpSession<T> {
         self.drdynvc_frag.extend_from_slice(payload);
 
         if flags & CHANNEL_FLAG_LAST == 0 {
-            return (vec![], vec![], vec![], None);
+            return (vec![], vec![], vec![], vec![], None);
         }
 
         let assembled = std::mem::take(&mut self.drdynvc_frag);
-        let (bitmaps, nv12_frames, responses, audio_events, needs_force_refresh, reset_size) =
+        let (bitmaps, nv12_frames, h264_nals, responses, audio_events, needs_force_refresh, reset_size) =
             self.drdynvc_handler.process(&assembled);
 
         // Send any outgoing DRDYNVC PDUs (CAPS response, FRAME_ACK, audio replies, etc.)
@@ -713,7 +737,7 @@ impl<T: Transport> RdpSession<T> {
             }
         }
 
-        (bitmaps, nv12_frames, audio_events, reset_size)
+        (bitmaps, nv12_frames, h264_nals, audio_events, reset_size)
     }
 
     pub async fn send_key_down(&mut self, flags: u16, scancode: u8) -> Result<(), RdpError> {
@@ -925,12 +949,14 @@ fn flip_vertical(data: &[u8], width: usize, height: usize, bpp: usize) -> Vec<u8
 struct FastPathUpdateResult {
     bitmaps: Vec<Bitmap>,
     frame_ids: Vec<u32>,
+    pointer: Option<PointerEvent>,
 }
 
 fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> FastPathUpdateResult {
     let mut result = FastPathUpdateResult {
         bitmaps: Vec::new(),
         frame_ids: Vec::new(),
+        pointer: None,
     };
     let mut pos = 0;
 
@@ -975,7 +1001,11 @@ fn parse_fastpath_updates(data: &[u8], frag_buf: &mut Vec<u8>) -> FastPathUpdate
             size
         );
 
-        if update_code != FASTPATH_UPDATETYPE_BITMAP && update_code != FASTPATH_UPDATETYPE_SURFCMDS
+        if update_code != FASTPATH_UPDATETYPE_BITMAP
+            && update_code != FASTPATH_UPDATETYPE_SURFCMDS
+            && update_code != FASTPATH_UPDATETYPE_PTR_NULL
+            && update_code != FASTPATH_UPDATETYPE_CACHED
+            && update_code != FASTPATH_UPDATETYPE_POINTER
         {
             continue;
         }
@@ -1026,8 +1056,44 @@ fn parse_fastpath_update_payload(
             result.bitmaps.append(&mut rects);
             result.frame_ids.append(&mut frame_ids);
         }
+        FASTPATH_UPDATETYPE_PTR_NULL => {
+            result.pointer = Some(PointerEvent::Hide);
+        }
+        FASTPATH_UPDATETYPE_CACHED => {
+            if payload.len() >= 2 {
+                let idx = u16::from_le_bytes([payload[0], payload[1]]);
+                result.pointer = Some(PointerEvent::Cached(idx));
+            }
+        }
+        FASTPATH_UPDATETYPE_POINTER => {
+            result.pointer = parse_pointer_update(payload);
+        }
         _ => {}
     }
+}
+
+fn parse_pointer_update(data: &[u8]) -> Option<PointerEvent> {
+    // XorBpp(2) + CacheIdx(2) + HotX(2) + HotY(2) + Width(2) + Height(2) + MaskLen(2) + DataLen(2) = 16
+    if data.len() < 16 {
+        return None;
+    }
+    let mut pos = 0;
+    let xor_bpp  = u16::from_le_bytes([data[pos], data[pos+1]]); pos += 2;
+    let idx      = u16::from_le_bytes([data[pos], data[pos+1]]); pos += 2;
+    let hot_x    = u16::from_le_bytes([data[pos], data[pos+1]]); pos += 2;
+    let hot_y    = u16::from_le_bytes([data[pos], data[pos+1]]); pos += 2;
+    let width    = u16::from_le_bytes([data[pos], data[pos+1]]); pos += 2;
+    let height   = u16::from_le_bytes([data[pos], data[pos+1]]); pos += 2;
+    let mask_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize; pos += 2;
+    let data_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize; pos += 2;
+
+    if pos + data_len + mask_len > data.len() {
+        return None;
+    }
+    let xor_data = data[pos..pos + data_len].to_vec(); pos += data_len;
+    let and_mask = data[pos..pos + mask_len].to_vec();
+
+    Some(PointerEvent::Update { idx, xor_bpp, hot_x, hot_y, width, height, and_mask, xor_data })
 }
 
 fn parse_surface_commands(data: &[u8]) -> (Vec<Bitmap>, Vec<u32>) {

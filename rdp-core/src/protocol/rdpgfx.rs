@@ -61,6 +61,15 @@ const CAP_FLAG_AVC_DISABLED: u32 = 0x00000020;
 
 const GFX_HEADER_SIZE: usize = 8;
 
+/// Raw H.264 NAL packet with screen position, emitted when no AVC decoder is
+/// configured (e.g. in the WASM frontend which uses WebCodecs instead).
+pub struct H264NalEvent {
+    pub dest_left: i32,
+    pub dest_top: i32,
+    pub is_key: bool,
+    pub data: Vec<u8>,
+}
+
 struct Surface {
     width: u16,
     height: u16,
@@ -124,24 +133,24 @@ impl RdpgfxHandler {
     }
 
     /// Process a raw RDPGFX payload (ZGFX-compressed).
-    /// Returns (decoded bitmaps, outgoing PDUs to send back via DVC, needs_force_refresh).
+    /// Returns (decoded bitmaps, nv12 frames, raw H264 NAL events, outgoing PDUs to send back via DVC, needs_force_refresh).
     /// `needs_force_refresh` is true when the H264 decoder wants an IDR keyframe;
     /// the caller should send a SuppressOutput (suppress→allow) PDU to request one.
     pub fn process(
         &mut self,
         data: &[u8],
-    ) -> (Vec<Bitmap>, Vec<NV12Frame>, Vec<Vec<u8>>, bool, Option<(u16, u16)>) {
+    ) -> (Vec<Bitmap>, Vec<NV12Frame>, Vec<H264NalEvent>, Vec<Vec<u8>>, bool, Option<(u16, u16)>) {
         // ZGFX decompress
         let decompressed = self.zgfx.decompress(data);
         if decompressed.is_empty() {
-            return (vec![], vec![], vec![], false, None);
+            return (vec![], vec![], vec![], vec![], false, None);
         }
         self.last_reset_size = None;
-        let (bitmaps, nv12_frames, responses) = self.dispatch_pdus(&decompressed);
+        let (bitmaps, nv12_frames, h264_nals, responses) = self.dispatch_pdus(&decompressed);
         let force_refresh = self.needs_force_refresh;
         self.needs_force_refresh = false;
         let reset_size = self.last_reset_size.take();
-        (bitmaps, nv12_frames, responses, force_refresh, reset_size)
+        (bitmaps, nv12_frames, h264_nals, responses, force_refresh, reset_size)
     }
 
     /// Called when the DVC channel was just created.
@@ -174,9 +183,10 @@ impl RdpgfxHandler {
 
     // ── PDU dispatcher ─────────────────────────────────────────────────────────
 
-    fn dispatch_pdus(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<NV12Frame>, Vec<Vec<u8>>) {
+    fn dispatch_pdus(&mut self, data: &[u8]) -> (Vec<Bitmap>, Vec<NV12Frame>, Vec<H264NalEvent>, Vec<Vec<u8>>) {
         let mut bitmaps = Vec::new();
         let mut nv12_frames = Vec::new();
+        let mut h264_nals = Vec::new();
         let mut outgoing = Vec::new();
         let mut offset = 0;
 
@@ -194,11 +204,11 @@ impl RdpgfxHandler {
                 break;
             }
             let body = &data[offset + GFX_HEADER_SIZE..offset + pdu_len];
-            self.dispatch_one(cmd_id, body, &mut bitmaps, &mut nv12_frames, &mut outgoing);
+            self.dispatch_one(cmd_id, body, &mut bitmaps, &mut nv12_frames, &mut h264_nals, &mut outgoing);
             offset += pdu_len;
         }
 
-        (bitmaps, nv12_frames, outgoing)
+        (bitmaps, nv12_frames, h264_nals, outgoing)
     }
 
     fn dispatch_one(
@@ -207,6 +217,7 @@ impl RdpgfxHandler {
         data: &[u8],
         bitmaps: &mut Vec<Bitmap>,
         nv12_frames: &mut Vec<NV12Frame>,
+        h264_nals: &mut Vec<H264NalEvent>,
         outgoing: &mut Vec<Vec<u8>>,
     ) {
         log::trace!("[rdpgfx] cmd 0x{:04X} len={}", cmd_id, data.len());
@@ -243,10 +254,10 @@ impl RdpgfxHandler {
                 }
             }
             CMDID_WIRE_TO_SURFACE_1 => {
-                self.on_wire_to_surface_1(data, bitmaps, nv12_frames);
+                self.on_wire_to_surface_1(data, bitmaps, nv12_frames, h264_nals);
             }
             CMDID_WIRE_TO_SURFACE_2 => {
-                self.on_wire_to_surface_2(data, bitmaps, nv12_frames);
+                self.on_wire_to_surface_2(data, bitmaps, nv12_frames, h264_nals);
             }
             CMDID_SOLID_FILL => {
                 self.on_solid_fill(data, bitmaps);
@@ -402,7 +413,7 @@ impl RdpgfxHandler {
         }
     }
 
-    fn on_wire_to_surface_1(&mut self, data: &[u8], bitmaps: &mut Vec<Bitmap>, nv12_frames: &mut Vec<NV12Frame>) {
+    fn on_wire_to_surface_1(&mut self, data: &[u8], bitmaps: &mut Vec<Bitmap>, nv12_frames: &mut Vec<NV12Frame>, h264_nals: &mut Vec<H264NalEvent>) {
         // MS-RDPEGFX §2.2.2.1: surfaceId(2)+codecId(2)+pixelFormat(1)+destRect(8)+bitmapDataLength(4) = 17 bytes
         if data.len() < 17 {
             return;
@@ -499,6 +510,15 @@ impl RdpgfxHandler {
                         false,
                         &regions,
                     );
+                } else if self.avc_dec.is_none() && mapped {
+                    if let Some(stream) = parse_avc420(bmp_data) {
+                        h264_nals.push(H264NalEvent {
+                            dest_left: abs_x,
+                            dest_top: abs_y,
+                            is_key: is_h264_keyframe(&stream.h264_data),
+                            data: stream.h264_data,
+                        });
+                    }
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
@@ -531,6 +551,15 @@ impl RdpgfxHandler {
                         force_regions,
                         &regions,
                     );
+                } else if self.avc_dec.is_none() && mapped {
+                    if let Some((stream, _lc)) = parse_avc444(bmp_data) {
+                        h264_nals.push(H264NalEvent {
+                            dest_left: abs_x,
+                            dest_top: abs_y,
+                            is_key: is_h264_keyframe(&stream.h264_data),
+                            data: stream.h264_data,
+                        });
+                    }
                 }
             }
             _ => {
@@ -545,7 +574,7 @@ impl RdpgfxHandler {
         }
     }
 
-    fn on_wire_to_surface_2(&mut self, data: &[u8], bitmaps: &mut Vec<Bitmap>, nv12_frames: &mut Vec<NV12Frame>) {
+    fn on_wire_to_surface_2(&mut self, data: &[u8], bitmaps: &mut Vec<Bitmap>, nv12_frames: &mut Vec<NV12Frame>, h264_nals: &mut Vec<H264NalEvent>) {
         // MS-RDPEGFX §2.2.2.2: surfaceId(2)+codecId(2)+codecCtxId(4)+pixelFormat(1)+bitmapDataLength(4) = 13 bytes
         if data.len() < 13 {
             return;
@@ -619,11 +648,7 @@ impl RdpgfxHandler {
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!(
                         "[rdpgfx] WTS2 AVC420 decoded {}x{} → blit {}x{} mapped={}",
-                        fw,
-                        fh,
-                        ew,
-                        eh,
-                        mapped
+                        fw, fh, ew, eh, mapped
                     );
                     let mut discard = Vec::new();
                     let out = if mapped { bitmaps } else { &mut discard };
@@ -643,6 +668,15 @@ impl RdpgfxHandler {
                         false,
                         &regions,
                     );
+                } else if self.avc_dec.is_none() && mapped {
+                    if let Some(stream) = parse_avc420(bmp_data) {
+                        h264_nals.push(H264NalEvent {
+                            dest_left: abs_x,
+                            dest_top: abs_y,
+                            is_key: is_h264_keyframe(&stream.h264_data),
+                            data: stream.h264_data,
+                        });
+                    }
                 }
             }
             CODEC_AVC444 | CODEC_AVC444V2 => {
@@ -675,6 +709,15 @@ impl RdpgfxHandler {
                         force_regions,
                         &regions,
                     );
+                } else if self.avc_dec.is_none() && mapped {
+                    if let Some((stream, _lc)) = parse_avc444(bmp_data) {
+                        h264_nals.push(H264NalEvent {
+                            dest_left: abs_x,
+                            dest_top: abs_y,
+                            is_key: is_h264_keyframe(&stream.h264_data),
+                            data: stream.h264_data,
+                        });
+                    }
                 }
             }
             _ => {
@@ -1597,4 +1640,21 @@ fn build_cache_import_reply() -> Vec<u8> {
     pdu.extend_from_slice(&pdu_len.to_le_bytes());
     pdu.extend_from_slice(&payload);
     pdu
+}
+
+/// Returns true when the H.264 Annex-B bitstream contains an IDR (keyframe) slice.
+fn is_h264_keyframe(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i < data.len() {
+        if i + 4 < data.len() && data[i] == 0 && data[i+1] == 0 && data[i+2] == 0 && data[i+3] == 1 {
+            if data[i+4] & 0x1F == 5 { return true; }
+            i += 4;
+        } else if i + 3 < data.len() && data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 {
+            if data[i+3] & 0x1F == 5 { return true; }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }

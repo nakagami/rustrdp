@@ -3,49 +3,124 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>rdpwasm – WebAssembly RDP Client</title>
+  <title>rdpwasm — Web RDP Client</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #1e1e1e; color: #ccc; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; padding: 20px; }
-    h1 { margin-bottom: 16px; color: #fff; }
-    form { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; justify-content: center; }
-    input { padding: 6px 10px; border: 1px solid #555; background: #2d2d2d; color: #eee; border-radius: 4px; }
-    button { padding: 6px 16px; background: #0066cc; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
-    button:hover { background: #0055bb; }
-    #status { margin-bottom: 8px; font-size: 0.9em; color: #aaa; min-height: 1.2em; }
-    #status.error { color: #f88; }
-    #status.ok { color: #8f8; }
-    canvas { border: 1px solid #444; background: #000; cursor: crosshair; }
+    body { background: #1a1a2e; color: #eee; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
+
+    #toolbar {
+      background: #16213e;
+      padding: 8px 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      border-bottom: 1px solid #0f3460;
+    }
+    #toolbar label { font-size: 12px; color: #aaa; }
+    #toolbar input {
+      background: #0f3460;
+      border: 1px solid #444;
+      color: #eee;
+      padding: 4px 6px;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    #toolbar input[type=number] { width: 70px; }
+    #toolbar input[type=text], #toolbar input[type=password] { width: 130px; }
+    #connectBtn {
+      background: #e94560;
+      color: white;
+      border: none;
+      padding: 5px 14px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: bold;
+    }
+    #connectBtn:hover { background: #c73652; }
+    #connectBtn.connected { background: #2ecc71; }
+    #connectBtn.connected:hover { background: #27ae60; }
+    #status { font-size: 12px; color: #aaa; margin-left: 8px; }
+
+    #canvasWrapper {
+      flex: 1;
+      overflow: auto;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      background: #000;
+    }
+    #rdp-canvas {
+      display: block;
+      cursor: crosshair;
+      outline: none;
+    }
   </style>
 </head>
 <body>
-  <h1>rdpwasm</h1>
-  <form id="connect-form">
-    <input id="host"   type="text"     placeholder="RDP host"  value="localhost" />
-    <input id="port"   type="number"   placeholder="Port"      value="3389" />
-    <input id="user"   type="text"     placeholder="Username"  value="" />
-    <input id="pass"   type="password" placeholder="Password"  value="" />
-    <input id="domain" type="text"     placeholder="Domain"    value="" />
-    <button type="submit">Connect</button>
-    <button type="button" id="disconnect-btn">Disconnect</button>
-  </form>
-  <div id="status">Not connected</div>
-  <canvas id="rdp-canvas" width="1280" height="720"></canvas>
+  <div id="toolbar">
+    <label>Host</label>
+    <input type="text"     id="host"   value="localhost" placeholder="RDP host" />
+    <label>Port</label>
+    <input type="number"   id="port"   value="3389" />
+    <label>Domain</label>
+    <input type="text"     id="domain" value="" placeholder="(optional)" />
+    <label>User</label>
+    <input type="text"     id="user"   value="" />
+    <label>Password</label>
+    <input type="password" id="pass"   value="" />
+    <label>Width</label>
+    <input type="number"   id="width"  value="1280" />
+    <label>Height</label>
+    <input type="number"   id="height" value="800" />
+    <button id="connectBtn" onclick="toggleConnect()">Connect</button>
+    <span id="status">Not connected</span>
+  </div>
+  <div id="canvasWrapper">
+    <canvas id="rdp-canvas" tabindex="0"></canvas>
+  </div>
 
   <script type="module">
     import init, { connect } from './pkg/rdp_wasm.js';
 
-    const canvas  = document.getElementById('rdp-canvas');
-    const ctx     = canvas.getContext('2d');
+    const canvas = document.getElementById('rdp-canvas');
+    const ctx    = canvas.getContext('2d');
     let controller = null;
 
     await init();
 
+    // ── Cookie helpers ────────────────────────────────────────────────────────
+    function setCookie(name, value) {
+      document.cookie = encodeURIComponent(name) + '=' + encodeURIComponent(value) +
+        '; max-age=31536000; SameSite=Strict';
+    }
+    function getCookie(name) {
+      const key = encodeURIComponent(name) + '=';
+      for (const part of document.cookie.split(';')) {
+        const s = part.trim();
+        if (s.startsWith(key)) return decodeURIComponent(s.slice(key.length));
+      }
+      return null;
+    }
+    function loadCookies() {
+      for (const id of ['host', 'port', 'domain', 'width', 'height']) {
+        const v = getCookie('rdp_' + id);
+        if (v !== null) document.getElementById(id).value = v;
+      }
+    }
+    function saveCookies() {
+      for (const id of ['host', 'port', 'domain', 'width', 'height']) {
+        setCookie('rdp_' + id, document.getElementById(id).value.trim());
+      }
+    }
+    loadCookies();
+
     // Draw a bitmap update from the server.
     // bpp is bits-per-pixel; data is a Uint8Array in RGB(A) order.
     function onBitmap(x, y, w, h, bpp, data) {
-      const imageData = ctx.createImageData(w, h);
-      const pixels    = imageData.data;
+      const imageData  = ctx.createImageData(w, h);
+      const pixels     = imageData.data;
       const bytesPerPx = bpp === 32 ? 4 : bpp === 24 ? 3 : 2;
 
       for (let i = 0; i < w * h; i++) {
@@ -68,39 +143,240 @@
       ctx.putImageData(imageData, x, y);
     }
 
+    // ── Server-side mouse pointer ─────────────────────────────────────────────
+    const pointerCache = new Map();
+
+    function onPointerHide() { canvas.style.cursor = 'none'; }
+
+    function onPointerCached(idx) {
+      const css = pointerCache.get(idx);
+      if (css) canvas.style.cursor = css;
+    }
+
+    function onPointerUpdate(idx, xorBpp, hotX, hotY, w, h, andMask, xorData) {
+      const css = buildCursorCss(xorBpp, hotX, hotY, w, h, andMask, xorData);
+      if (!css) return;
+      pointerCache.set(idx, css);
+      canvas.style.cursor = css;
+    }
+
+    function buildCursorCss(xorBpp, hotX, hotY, w, h, andMask, xorData) {
+      if (w <= 0 || h <= 0) return null;
+      const off = ('OffscreenCanvas' in window)
+        ? new OffscreenCanvas(w, h)
+        : Object.assign(document.createElement('canvas'), { width: w, height: h });
+      const octx = off.getContext('2d');
+      const img = octx.createImageData(w, h);
+      const px = img.data;
+
+      const andStride = (((w + 15) >> 4) << 1);
+      const andBit = (x, y) => {
+        const srcY = h - 1 - y; // bottom-up storage
+        const o = srcY * andStride + (x >> 3);
+        if (o >= andMask.length) return 1;
+        return (andMask[o] >> (7 - (x & 7))) & 1;
+      };
+
+      if (xorBpp === 1) {
+        const xorStride = andStride;
+        for (let y = 0; y < h; y++) {
+          const srcY = h - 1 - y;
+          for (let x = 0; x < w; x++) {
+            const a = andBit(x, y);
+            const xo = xorStride * srcY + (x >> 3);
+            const xb = xo < xorData.length ? (xorData[xo] >> (7 - (x & 7))) & 1 : 0;
+            const o = (y * w + x) << 2;
+            if      (a === 0 && xb === 0) { px[o]=0;   px[o+1]=0;   px[o+2]=0;   px[o+3]=255; }
+            else if (a === 0 && xb === 1) { px[o]=255; px[o+1]=255; px[o+2]=255; px[o+3]=255; }
+            else if (a === 1 && xb === 0) { px[o]=0;   px[o+1]=0;   px[o+2]=0;   px[o+3]=0;   }
+            else                          { px[o]=0;   px[o+1]=0;   px[o+2]=0;   px[o+3]=255; }
+          }
+        }
+      } else if (xorBpp === 32) {
+        const stride = w * 4;
+        for (let y = 0; y < h; y++) {
+          const srcY = h - 1 - y;
+          for (let x = 0; x < w; x++) {
+            const s = srcY * stride + x * 4;
+            const o = (y * w + x) << 2;
+            if (s + 3 >= xorData.length) { px[o]=px[o+1]=px[o+2]=px[o+3]=0; continue; }
+            const b = xorData[s], g = xorData[s+1], r = xorData[s+2], a = xorData[s+3];
+            if (a !== 0) { px[o]=r; px[o+1]=g; px[o+2]=b; px[o+3]=a; }
+            else if (andBit(x, y) === 0) { px[o]=r; px[o+1]=g; px[o+2]=b; px[o+3]=255; }
+            else { px[o]=px[o+1]=px[o+2]=px[o+3]=0; }
+          }
+        }
+      } else if (xorBpp === 24) {
+        const stride = ((w * 3 + 1) >> 1) << 1;
+        for (let y = 0; y < h; y++) {
+          const srcY = h - 1 - y;
+          for (let x = 0; x < w; x++) {
+            const s = srcY * stride + x * 3;
+            const o = (y * w + x) << 2;
+            if (s + 2 >= xorData.length) { px[o]=px[o+1]=px[o+2]=px[o+3]=0; continue; }
+            if (andBit(x, y) === 0) { px[o]=xorData[s+2]; px[o+1]=xorData[s+1]; px[o+2]=xorData[s]; px[o+3]=255; }
+            else { px[o]=px[o+1]=px[o+2]=px[o+3]=0; }
+          }
+        }
+      } else {
+        console.warn('Unsupported cursor xorBpp:', xorBpp);
+      }
+
+      octx.putImageData(img, 0, 0);
+      let dataUrl;
+      if (off instanceof HTMLCanvasElement) {
+        dataUrl = off.toDataURL('image/png');
+      } else {
+        const tmp = document.createElement('canvas');
+        tmp.width = w; tmp.height = h;
+        tmp.getContext('2d').drawImage(off, 0, 0);
+        dataUrl = tmp.toDataURL('image/png');
+      }
+      const hx = Math.max(0, Math.min(w - 1, hotX|0));
+      const hy = Math.max(0, Math.min(h - 1, hotY|0));
+      return `url("${dataUrl}") ${hx} ${hy}, default`;
+    }
+
+    // ── Web Audio PCM scheduler ───────────────────────────────────────────────
+    let audioCtx = null;
+    let audioNextAt = 0;
+    const AUDIO_LOOKAHEAD = 0.15;
+    const AUDIO_MAX_QUEUE  = 2.0;
+
+    function onAudio(sampleRate, channels, bitsPerSample, uint8Data) {
+      if (!audioCtx || audioCtx.state === 'closed') return;
+      const bytesPerSample = bitsPerSample >> 3;
+      const numSamples = uint8Data.byteLength / (channels * bytesPerSample);
+      if (numSamples === 0) return;
+
+      const audioBuf = audioCtx.createBuffer(channels, numSamples, sampleRate);
+      if (bitsPerSample === 16) {
+        const int16 = new Int16Array(uint8Data.buffer, uint8Data.byteOffset, uint8Data.byteLength >> 1);
+        for (let ch = 0; ch < channels; ch++) {
+          const out = audioBuf.getChannelData(ch);
+          for (let i = 0; i < numSamples; i++) out[i] = int16[i * channels + ch] / 32768.0;
+        }
+      } else if (bitsPerSample === 8) {
+        for (let ch = 0; ch < channels; ch++) {
+          const out = audioBuf.getChannelData(ch);
+          for (let i = 0; i < numSamples; i++) out[i] = (uint8Data[i * channels + ch] - 128) / 128.0;
+        }
+      }
+
+      const src = audioCtx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(audioCtx.destination);
+      const now = audioCtx.currentTime;
+      if (audioNextAt < now + AUDIO_LOOKAHEAD) audioNextAt = now + AUDIO_LOOKAHEAD;
+      if (audioNextAt > now + AUDIO_MAX_QUEUE)  audioNextAt = now + AUDIO_LOOKAHEAD;
+      src.start(audioNextAt);
+      audioNextAt += audioBuf.duration;
+    }
+
+    // ── WebCodecs H.264 decoder ───────────────────────────────────────────────
+    let h264Dec = null;
+    let h264Timestamp = 0;
+    const h264FramePos = new Map();
+
+    function h264Supported() {
+      return typeof VideoDecoder !== 'undefined' && typeof EncodedVideoChunk !== 'undefined';
+    }
+
+    function createH264Decoder(width, height) {
+      if (!h264Supported()) return null;
+      const decoder = new VideoDecoder({
+        output(frame) {
+          const pos = h264FramePos.get(frame.timestamp);
+          h264FramePos.delete(frame.timestamp);
+          const x = pos ? pos.x : 0;
+          const y = pos ? pos.y : 0;
+          ctx.drawImage(frame, x, y);
+          frame.close();
+        },
+        error(e) {
+          console.warn('WebCodecs H.264 decoder error:', e);
+        }
+      });
+      decoder.configure({
+        codec: 'avc1.42E01E',
+        codedWidth: width,
+        codedHeight: height,
+        optimizeForLatency: true,
+      });
+      return decoder;
+    }
+
+    function onH264(destX, destY, isKey, uint8Data) {
+      if (!h264Dec || h264Dec.state === 'closed') return;
+      h264Timestamp += 1000;
+      h264FramePos.set(h264Timestamp, { x: destX, y: destY });
+      try {
+        h264Dec.decode(new EncodedVideoChunk({
+          type: isKey ? 'key' : 'delta',
+          timestamp: h264Timestamp,
+          data: uint8Data,
+        }));
+      } catch (e) {
+        console.warn('onH264 decode error:', e);
+      }
+    }
+
     const statusEl = document.getElementById('status');
 
-    document.getElementById('connect-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const host   = document.getElementById('host').value;
-      const port   = document.getElementById('port').value;
-      const user   = document.getElementById('user').value;
+    window.toggleConnect = function() {
+      if (controller) {
+        if (h264Dec) { h264Dec.close(); h264Dec = null; }
+        if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; audioNextAt = 0; }
+        controller = null;
+        document.getElementById('connectBtn').textContent = 'Connect';
+        document.getElementById('connectBtn').classList.remove('connected');
+        statusEl.textContent = 'Disconnected';
+      } else {
+        doConnect();
+      }
+    };
+
+    async function doConnect() {
+      const host   = document.getElementById('host').value.trim();
+      const port   = document.getElementById('port').value.trim();
+      const user   = document.getElementById('user').value.trim();
       const pass   = document.getElementById('pass').value;
-      const domain = document.getElementById('domain').value;
+      const domain = document.getElementById('domain').value.trim();
+      const width  = parseInt(document.getElementById('width').value)  || 1280;
+      const height = parseInt(document.getElementById('height').value) || 720;
+
+      saveCookies();
+
+      canvas.width  = width;
+      canvas.height = height;
+
+      h264Timestamp = 0;
+      h264FramePos.clear();
+      h264Dec = createH264Decoder(width, height);
+
+      if (audioCtx) { try { audioCtx.close(); } catch (_) {} }
+      audioCtx = new AudioContext({ latencyHint: 'playback' });
+      audioNextAt = 0;
+
+      pointerCache.clear();
+      canvas.style.cursor = 'default';
+
       const target = `${host}:${port}`;
       const wsUrl  = `ws://${location.host}/ws?target=${encodeURIComponent(target)}`;
-      const width  = canvas.width;
-      const height = canvas.height;
 
       statusEl.textContent = 'Connecting…';
-      statusEl.className = '';
 
       try {
-        controller = await connect(wsUrl, domain, user, pass, width, height, onBitmap);
+        controller = await connect(wsUrl, domain, user, pass, width, height, onBitmap, onH264, onAudio, onPointerHide, onPointerCached, onPointerUpdate);
         statusEl.textContent = 'Connected';
-        statusEl.className = 'ok';
-        console.log('RDP session started');
+        document.getElementById('connectBtn').textContent = 'Disconnect';
+        document.getElementById('connectBtn').classList.add('connected');
+        canvas.focus();
       } catch (err) {
-        const msg = 'Connection failed: ' + err;
-        statusEl.textContent = msg;
-        statusEl.className = 'error';
-        console.error('RDP connect failed:', err);
+        statusEl.textContent = 'Connection failed: ' + err;
+        controller = null;
       }
-    });
-
-    document.getElementById('disconnect-btn').addEventListener('click', () => {
-      controller = null;
-    });
+    }
 
     // Keyboard input
     canvas.addEventListener('keydown', (e) => {
@@ -115,7 +391,6 @@
     });
 
     // Mouse input
-    canvas.setAttribute('tabindex', '0');
     canvas.addEventListener('mousemove', (e) => {
       if (!controller) return;
       const rect = canvas.getBoundingClientRect();
@@ -123,6 +398,7 @@
     });
     canvas.addEventListener('mousedown', (e) => {
       if (!controller) return;
+      e.preventDefault();
       canvas.focus();
       const rect = canvas.getBoundingClientRect();
       const btn  = e.button === 0 ? 1 : e.button === 1 ? 3 : 2;

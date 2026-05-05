@@ -1,6 +1,6 @@
 use crate::bitmap::Bitmap;
 use crate::avc::NV12Frame;
-use crate::protocol::rdpgfx::RdpgfxHandler;
+use crate::protocol::rdpgfx::{RdpgfxHandler, H264NalEvent};
 use crate::protocol::rdpsnd::{AudioEvent, RdpsndHandler};
 /// DRDYNVC (MS-RDPEDYC) dynamic virtual channel handler.
 ///
@@ -68,7 +68,7 @@ impl DrdynvcHandler {
     }
 
     /// Process one DVC PDU.
-    /// Returns (bitmaps produced, raw DRDYNVC PDUs to send back to server, audio events, needs_force_refresh, reset_size).
+    /// Returns (bitmaps produced, nv12 frames, raw H264 NAL events, raw DRDYNVC PDUs to send back to server, audio events, needs_force_refresh, reset_size).
     /// `needs_force_refresh` is true when the H264 decoder needs an IDR keyframe.
     pub fn process(
         &mut self,
@@ -76,13 +76,14 @@ impl DrdynvcHandler {
     ) -> (
         Vec<Bitmap>,
         Vec<NV12Frame>,
+        Vec<H264NalEvent>,
         Vec<Vec<u8>>,
         Vec<AudioEvent>,
         bool,
         Option<(u16, u16)>,
     ) {
         if data.is_empty() {
-            return (vec![], vec![], vec![], vec![], false, None);
+            return (vec![], vec![], vec![], vec![], vec![], false, None);
         }
         let header = data[0];
         let cmd = (header >> 4) & 0x0F;
@@ -91,6 +92,7 @@ impl DrdynvcHandler {
 
         let mut bitmaps = Vec::new();
         let mut nv12_frames = Vec::new();
+        let mut h264_nals = Vec::new();
         let mut outgoing = Vec::new();
         let mut audio = Vec::new();
         let mut force_refresh = false;
@@ -110,6 +112,7 @@ impl DrdynvcHandler {
                     sp,
                     &mut bitmaps,
                     &mut nv12_frames,
+                    &mut h264_nals,
                     &mut outgoing,
                     &mut audio,
                     &mut force_refresh,
@@ -122,6 +125,7 @@ impl DrdynvcHandler {
                     cb_ch_id,
                     &mut bitmaps,
                     &mut nv12_frames,
+                    &mut h264_nals,
                     &mut outgoing,
                     &mut audio,
                     &mut force_refresh,
@@ -142,7 +146,7 @@ impl DrdynvcHandler {
             }
         }
 
-        (bitmaps, nv12_frames, outgoing, audio, force_refresh, reset_size)
+        (bitmaps, nv12_frames, h264_nals, outgoing, audio, force_refresh, reset_size)
     }
 
     /// Called when a large/full-screen raw Bitmap Update arrives, indicating
@@ -247,6 +251,7 @@ impl DrdynvcHandler {
         sp: u8,
         bitmaps: &mut Vec<Bitmap>,
         nv12_frames: &mut Vec<NV12Frame>,
+        h264_nals: &mut Vec<H264NalEvent>,
         out: &mut Vec<Vec<u8>>,
         audio: &mut Vec<AudioEvent>,
         force_refresh: &mut bool,
@@ -270,6 +275,7 @@ impl DrdynvcHandler {
                 payload,
                 bitmaps,
                 nv12_frames,
+                h264_nals,
                 out,
                 audio,
                 force_refresh,
@@ -293,6 +299,7 @@ impl DrdynvcHandler {
         cb_ch_id: u8,
         bitmaps: &mut Vec<Bitmap>,
         nv12_frames: &mut Vec<NV12Frame>,
+        h264_nals: &mut Vec<H264NalEvent>,
         out: &mut Vec<Vec<u8>>,
         audio: &mut Vec<AudioEvent>,
         force_refresh: &mut bool,
@@ -316,6 +323,7 @@ impl DrdynvcHandler {
                 payload,
                 bitmaps,
                 nv12_frames,
+                h264_nals,
                 out,
                 audio,
                 force_refresh,
@@ -326,7 +334,7 @@ impl DrdynvcHandler {
 
         if complete {
             let buf = self.fragments.remove(&ch_id).unwrap().buf;
-            self.dispatch_channel_data(ch_id, &buf, bitmaps, nv12_frames, out, audio, force_refresh, reset_size);
+            self.dispatch_channel_data(ch_id, &buf, bitmaps, nv12_frames, h264_nals, out, audio, force_refresh, reset_size);
         }
     }
 
@@ -338,6 +346,7 @@ impl DrdynvcHandler {
         data: &[u8],
         bitmaps: &mut Vec<Bitmap>,
         nv12_frames: &mut Vec<NV12Frame>,
+        h264_nals: &mut Vec<H264NalEvent>,
         out: &mut Vec<Vec<u8>>,
         audio: &mut Vec<AudioEvent>,
         force_refresh: &mut bool,
@@ -346,9 +355,10 @@ impl DrdynvcHandler {
         let cb_ch_id = ch_id_size(ch_id);
         match self.channels.get_mut(&ch_id) {
             Some(DvcChannel::Gfx(gfx)) => {
-                let (new_bitmaps, new_nv12, replies, fr, rs) = gfx.process(data);
+                let (new_bitmaps, new_nv12, new_h264, replies, fr, rs) = gfx.process(data);
                 bitmaps.extend(new_bitmaps);
                 nv12_frames.extend(new_nv12);
+                h264_nals.extend(new_h264);
                 if fr {
                     *force_refresh = true;
                 }

@@ -9,7 +9,7 @@ proxy:
 	cargo build -p proxy --release
 
 serve:
-	./target/release/proxy --listen 0.0.0.0:8080 --static static
+	./target/release/proxy --listen 0.0.0.0:8081 --static static
 
 clean:
 	cargo clean

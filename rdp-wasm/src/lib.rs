@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use futures_channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures_channel::oneshot;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use js_sys::{ArrayBuffer, Uint8Array};
 use rdp_core::bitmap::Bitmap;
 use rdp_core::protocol::Transport;
-use rdp_core::{RdpError, RdpEvent, RdpSession};
+use rdp_core::{H264NalEvent, PointerEvent, RdpError, RdpEvent, RdpSession};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -221,6 +221,11 @@ pub async fn connect(
     width: u16,
     height: u16,
     on_bitmap: js_sys::Function,
+    on_h264: js_sys::Function,
+    on_audio: js_sys::Function,
+    on_pointer_hide: js_sys::Function,
+    on_pointer_cached: js_sys::Function,
+    on_pointer_update: js_sys::Function,
 ) -> Result<RdpController, JsValue> {
     let transport = WsTransport::connect(&proxy_url).await?;
 
@@ -250,47 +255,70 @@ pub async fn connect(
         let _ = login_tx.send(Ok(()));
 
         loop {
-            // Drain pending input events (non-blocking)
-            loop {
-                match input_rx.try_recv() {
-                    Ok(event) => {
-                        let result = match event {
-                            InputEvent::KeyDown { flags, scancode } => {
-                                session.send_key_down(flags, scancode).await
+            futures_util::select! {
+                // Process one input event if available
+                maybe_input = input_rx.next() => {
+                    match maybe_input {
+                        Some(event) => {
+                            let result = match event {
+                                InputEvent::KeyDown { flags, scancode } => {
+                                    session.send_key_down(flags, scancode).await
+                                }
+                                InputEvent::KeyUp { scancode } => session.send_key_up(scancode).await,
+                                InputEvent::MouseMove { x, y } => session.send_mouse_move(x, y).await,
+                                InputEvent::MouseButton { button, down, x, y } => {
+                                    session.send_mouse_button(button, down, x, y).await
+                                }
+                                InputEvent::MouseWheel { delta } => {
+                                    session.send_mouse_wheel(delta).await
+                                }
+                            };
+                            if let Err(e) = result {
+                                log::error!("Input send error: {:?}", e);
                             }
-                            InputEvent::KeyUp { scancode } => session.send_key_up(scancode).await,
-                            InputEvent::MouseMove { x, y } => session.send_mouse_move(x, y).await,
-                            InputEvent::MouseButton { button, down, x, y } => {
-                                session.send_mouse_button(button, down, x, y).await
+                        }
+                        None => break, // input channel closed
+                    }
+                }
+
+                // Process one display event from the server
+                result = session.recv_event().fuse() => {
+                    match result {
+                        Ok(RdpEvent::Bitmap(bitmaps)) => {
+                            for bmp in bitmaps {
+                                deliver_bitmap(&on_bitmap, &bmp);
                             }
-                            InputEvent::MouseWheel { delta } => {
-                                session.send_mouse_wheel(delta).await
+                        }
+                        Ok(RdpEvent::Deactivated) => {
+                            log::info!("RDP session deactivated");
+                            break;
+                        }
+                        Ok(RdpEvent::Ready) => {}
+                        Ok(RdpEvent::Resize { .. }) => {}
+                        Ok(RdpEvent::NV12Frame(_)) => {}
+                        Ok(RdpEvent::H264Nal(nals)) => {
+                            for nal in nals {
+                                deliver_h264(&on_h264, &nal);
                             }
-                        };
-                        if let Err(e) = result {
-                            log::error!("Input send error: {:?}", e);
+                        }
+                        Ok(RdpEvent::Audio { format, data }) => {
+                            let pcm = Uint8Array::from(data.as_slice());
+                            let _ = on_audio.call4(
+                                &JsValue::NULL,
+                                &JsValue::from(format.sample_rate),
+                                &JsValue::from(format.channels as u32),
+                                &JsValue::from(format.bits_per_sample as u32),
+                                &pcm.into(),
+                            );
+                        }
+                        Ok(RdpEvent::Pointer(ptr)) => {
+                            deliver_pointer(&on_pointer_hide, &on_pointer_cached, &on_pointer_update, ptr);
+                        }
+                        Err(e) => {
+                            log::error!("RDP event error: {:?}", e);
+                            break;
                         }
                     }
-                    Err(_) => break,
-                }
-            }
-
-            // Wait for next display event
-            match session.recv_event().await {
-                Ok(RdpEvent::Bitmap(bitmaps)) => {
-                    for bmp in bitmaps {
-                        deliver_bitmap(&on_bitmap, &bmp);
-                    }
-                }
-                Ok(RdpEvent::Deactivated) => {
-                    log::info!("RDP session deactivated");
-                    break;
-                }
-                Ok(RdpEvent::Ready) => {}
-                Ok(RdpEvent::Resize { .. }) => {}
-                Err(e) => {
-                    log::error!("RDP event error: {:?}", e);
-                    break;
                 }
             }
         }
@@ -315,4 +343,46 @@ fn deliver_bitmap(callback: &js_sys::Function, bmp: &Bitmap) {
         &JsValue::from(bmp.bits_per_pixel as u32),
         &data_js.into(),
     );
+}
+
+fn deliver_h264(callback: &js_sys::Function, nal: &H264NalEvent) {
+    let data_js = Uint8Array::from(nal.data.as_slice());
+    let _ = callback.call4(
+        &JsValue::NULL,
+        &JsValue::from(nal.dest_left),
+        &JsValue::from(nal.dest_top),
+        &JsValue::from(nal.is_key),
+        &data_js.into(),
+    );
+}
+
+fn deliver_pointer(
+    on_hide: &js_sys::Function,
+    on_cached: &js_sys::Function,
+    on_update: &js_sys::Function,
+    ptr: PointerEvent,
+) {
+    match ptr {
+        PointerEvent::Hide => {
+            let _ = on_hide.call0(&JsValue::NULL);
+        }
+        PointerEvent::Cached(idx) => {
+            let _ = on_cached.call1(&JsValue::NULL, &JsValue::from(idx as u32));
+        }
+        PointerEvent::Update { idx, xor_bpp, hot_x, hot_y, width, height, and_mask, xor_data } => {
+            let and_js = Uint8Array::from(and_mask.as_slice());
+            let xor_js = Uint8Array::from(xor_data.as_slice());
+            let _ = on_update.call8(
+                &JsValue::NULL,
+                &JsValue::from(idx as u32),
+                &JsValue::from(xor_bpp as u32),
+                &JsValue::from(hot_x as u32),
+                &JsValue::from(hot_y as u32),
+                &JsValue::from(width as u32),
+                &JsValue::from(height as u32),
+                &and_js.into(),
+                &xor_js.into(),
+            );
+        }
+    }
 }
