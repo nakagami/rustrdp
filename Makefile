@@ -68,7 +68,7 @@ sdl2_debug: $(SDL2_DEBUG_OUT)
 	RUST_LOG=debug $(SDL2_DEBUG_OUT) 2>&1 | tee /tmp/rustrdp-debug.log
 
 publish: $(WASM_OUT) $(PROXY_ASSETS)
-	cargo publish -p rustrdp-proxy
+	cargo publish -p rustrdp-proxy --allow-dirty
 
 clean:
 	cargo clean
