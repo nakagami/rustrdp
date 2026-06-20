@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>rdpwasm — Web RDP Client</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #1a1a2e; color: #eee; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
+
+    #toolbar {
+      background: #16213e;
+      padding: 8px 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      border-bottom: 1px solid #0f3460;
+    }
+    #toolbar label { font-size: 12px; color: #aaa; }
+    #toolbar input {
+      background: #0f3460;
+      border: 1px solid #444;
+      color: #eee;
+      padding: 4px 6px;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    #toolbar input[type=number] { width: 70px; }
+    #toolbar input[type=text], #toolbar input[type=password] { width: 130px; }
+    #connectBtn {
+      background: #e94560;
+      color: white;
+      border: none;
+      padding: 5px 14px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: bold;
+    }
+    #connectBtn:hover { background: #c73652; }
+    #connectBtn.connected { background: #2ecc71; }
+    #connectBtn.connected:hover { background: #27ae60; }
+    #status { font-size: 12px; color: #aaa; margin-left: 8px; }
+
+    #canvasWrapper {
+      flex: 1;
+      overflow: auto;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      background: #000;
+    }
+    #rdp-canvas {
+      display: block;
+      cursor: crosshair;
+      outline: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <label>Host</label>
+    <input type="text"     id="host"   value="localhost" placeholder="RDP host" />
+    <label>Port</label>
+    <input type="number"   id="port"   value="3389" />
+    <label>Domain</label>
+    <input type="text"     id="domain" value="" placeholder="(optional)" />
+    <label>User</label>
+    <input type="text"     id="user"   value="" />
+    <label>Password</label>
+    <input type="password" id="pass"   value="" />
+    <label>Width</label>
+    <input type="number"   id="width"  value="1280" />
+    <label>Height</label>
+    <input type="number"   id="height" value="800" />
+    <label><input type="checkbox" id="swapAltMeta" /> Swap Alt/Meta</label>
+    <button id="connectBtn" onclick="toggleConnect()">Connect</button>
+    <span id="status">Not connected</span>
+  </div>
+  <div id="canvasWrapper">
+    <canvas id="rdp-canvas" tabindex="0"></canvas>
+  </div>
+
+  <script type="module">
+    import init, { connect } from './pkg/rdp_wasm.js';
+
+    const canvas = document.getElementById('rdp-canvas');
+    const ctx    = canvas.getContext('2d');
+    let controller = null;
+
+    await init();
+
+    // ── Cookie helpers ────────────────────────────────────────────────────────
+    function setCookie(name, value) {
+      document.cookie = encodeURIComponent(name) + '=' + encodeURIComponent(value) +
+        '; max-age=31536000; SameSite=Strict';
+    }
+    function getCookie(name) {
+      const key = encodeURIComponent(name) + '=';
+      for (const part of document.cookie.split(';')) {
+        const s = part.trim();
+        if (s.startsWith(key)) return decodeURIComponent(s.slice(key.length));
+      }
+      return null;
+    }
+    function loadCookies() {
+      for (const id of ['host', 'port', 'domain', 'width', 'height']) {
+        const v = getCookie('rdp_' + id);
+        if (v !== null) document.getElementById(id).value = v;
+      }
+      const sam = getCookie('rdp_swapAltMeta');
+      if (sam !== null) document.getElementById('swapAltMeta').checked = (sam === '1');
+    }
+    function saveCookies() {
+      for (const id of ['host', 'port', 'domain', 'width', 'height']) {
+        setCookie('rdp_' + id, document.getElementById(id).value.trim());
+      }
+      setCookie('rdp_swapAltMeta', document.getElementById('swapAltMeta').checked ? '1' : '0');
+    }
+    loadCookies();
+
+    // Draw a bitmap update from the server.
+    // bpp is bits-per-pixel; data is a Uint8Array in RGB(A) order.
+    function onBitmap(x, y, w, h, bpp, data) {
+      const imageData  = ctx.createImageData(w, h);
+      const pixels     = imageData.data;
+      const bytesPerPx = bpp === 32 ? 4 : bpp === 24 ? 3 : 2;
+
+      for (let i = 0; i < w * h; i++) {
+        const src = i * bytesPerPx;
+        let r, g, b;
+        if (bpp === 32 || bpp === 24) {
+          b = data[src]; g = data[src + 1]; r = data[src + 2];
+        } else {
+          // 16-bpp RGB565
+          const px = data[src] | (data[src + 1] << 8);
+          r = ((px >> 11) & 0x1F) << 3;
+          g = ((px >>  5) & 0x3F) << 2;
+          b =  (px        & 0x1F) << 3;
+        }
+        pixels[i * 4]     = r;
+        pixels[i * 4 + 1] = g;
+        pixels[i * 4 + 2] = b;
+        pixels[i * 4 + 3] = 255;
+      }
+      ctx.putImageData(imageData, x, y);
+    }
+
+    // ── Server-side mouse pointer ─────────────────────────────────────────────
+    const pointerCache = new Map();
+
+    function onPointerHide() { canvas.style.cursor = 'none'; }
+
+    function onPointerCached(idx) {
+      const css = pointerCache.get(idx);
+      if (css) canvas.style.cursor = css;
+    }
+
+    function onPointerUpdate(idx, xorBpp, hotX, hotY, w, h, andMask, xorData) {
+      const css = buildCursorCss(xorBpp, hotX, hotY, w, h, andMask, xorData);
+      if (!css) return;
+      pointerCache.set(idx, css);
+      canvas.style.cursor = css;
+    }
+
+    function buildCursorCss(xorBpp, hotX, hotY, w, h, andMask, xorData) {
+      if (w <= 0 || h <= 0) return null;
+      const off = ('OffscreenCanvas' in window)
+        ? new OffscreenCanvas(w, h)
+        : Object.assign(document.createElement('canvas'), { width: w, height: h });
+      const octx = off.getContext('2d');
+      const img = octx.createImageData(w, h);
+      const px = img.data;
+
+      const andStride = (((w + 15) >> 4) << 1);
+      const andBit = (x, y) => {
+        const srcY = h - 1 - y; // bottom-up storage
+        const o = srcY * andStride + (x >> 3);
+        if (o >= andMask.length) return 1;
+        return (andMask[o] >> (7 - (x & 7))) & 1;
+      };
+
+      if (xorBpp === 1) {
+        const xorStride = andStride;
+        for (let y = 0; y < h; y++) {
+          const srcY = h - 1 - y;
+          for (let x = 0; x < w; x++) {
+            const a = andBit(x, y);
+            const xo = xorStride * srcY + (x >> 3);
+            const xb = xo < xorData.length ? (xorData[xo] >> (7 - (x & 7))) & 1 : 0;
+            const o = (y * w + x) << 2;
+            if      (a === 0 && xb === 0) { px[o]=0;   px[o+1]=0;   px[o+2]=0;   px[o+3]=255; }
+            else if (a === 0 && xb === 1) { px[o]=255; px[o+1]=255; px[o+2]=255; px[o+3]=255; }
+            else if (a === 1 && xb === 0) { px[o]=0;   px[o+1]=0;   px[o+2]=0;   px[o+3]=0;   }
+            else                          { px[o]=0;   px[o+1]=0;   px[o+2]=0;   px[o+3]=255; }
+          }
+        }
+      } else if (xorBpp === 32) {
+        const stride = w * 4;
+        for (let y = 0; y < h; y++) {
+          const srcY = h - 1 - y;
+          for (let x = 0; x < w; x++) {
+            const s = srcY * stride + x * 4;
+            const o = (y * w + x) << 2;
+            if (s + 3 >= xorData.length) { px[o]=px[o+1]=px[o+2]=px[o+3]=0; continue; }
+            const b = xorData[s], g = xorData[s+1], r = xorData[s+2], a = xorData[s+3];
+            if (a !== 0) { px[o]=r; px[o+1]=g; px[o+2]=b; px[o+3]=a; }
+            else if (andBit(x, y) === 0) { px[o]=r; px[o+1]=g; px[o+2]=b; px[o+3]=255; }
+            else { px[o]=px[o+1]=px[o+2]=px[o+3]=0; }
+          }
+        }
+      } else if (xorBpp === 24) {
+        const stride = ((w * 3 + 1) >> 1) << 1;
+        for (let y = 0; y < h; y++) {
+          const srcY = h - 1 - y;
+          for (let x = 0; x < w; x++) {
+            const s = srcY * stride + x * 3;
+            const o = (y * w + x) << 2;
+            if (s + 2 >= xorData.length) { px[o]=px[o+1]=px[o+2]=px[o+3]=0; continue; }
+            if (andBit(x, y) === 0) { px[o]=xorData[s+2]; px[o+1]=xorData[s+1]; px[o+2]=xorData[s]; px[o+3]=255; }
+            else { px[o]=px[o+1]=px[o+2]=px[o+3]=0; }
+          }
+        }
+      } else {
+        console.warn('Unsupported cursor xorBpp:', xorBpp);
+      }
+
+      octx.putImageData(img, 0, 0);
+      let dataUrl;
+      if (off instanceof HTMLCanvasElement) {
+        dataUrl = off.toDataURL('image/png');
+      } else {
+        const tmp = document.createElement('canvas');
+        tmp.width = w; tmp.height = h;
+        tmp.getContext('2d').drawImage(off, 0, 0);
+        dataUrl = tmp.toDataURL('image/png');
+      }
+      const hx = Math.max(0, Math.min(w - 1, hotX|0));
+      const hy = Math.max(0, Math.min(h - 1, hotY|0));
+      return `url("${dataUrl}") ${hx} ${hy}, default`;
+    }
+
+    // ── Web Audio PCM scheduler ───────────────────────────────────────────────
+    let audioCtx = null;
+    let audioNextAt = 0;
+    const AUDIO_LOOKAHEAD = 0.15;
+    const AUDIO_MAX_QUEUE  = 2.0;
+
+    function onAudio(sampleRate, channels, bitsPerSample, uint8Data) {
+      if (!audioCtx || audioCtx.state === 'closed') return;
+      const bytesPerSample = bitsPerSample >> 3;
+      const numSamples = uint8Data.byteLength / (channels * bytesPerSample);
+      if (numSamples === 0) return;
+
+      const audioBuf = audioCtx.createBuffer(channels, numSamples, sampleRate);
+      if (bitsPerSample === 16) {
+        const int16 = new Int16Array(uint8Data.buffer, uint8Data.byteOffset, uint8Data.byteLength >> 1);
+        for (let ch = 0; ch < channels; ch++) {
+          const out = audioBuf.getChannelData(ch);
+          for (let i = 0; i < numSamples; i++) out[i] = int16[i * channels + ch] / 32768.0;
+        }
+      } else if (bitsPerSample === 8) {
+        for (let ch = 0; ch < channels; ch++) {
+          const out = audioBuf.getChannelData(ch);
+          for (let i = 0; i < numSamples; i++) out[i] = (uint8Data[i * channels + ch] - 128) / 128.0;
+        }
+      }
+
+      const src = audioCtx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(audioCtx.destination);
+      const now = audioCtx.currentTime;
+      if (audioNextAt < now + AUDIO_LOOKAHEAD) audioNextAt = now + AUDIO_LOOKAHEAD;
+      if (audioNextAt > now + AUDIO_MAX_QUEUE)  audioNextAt = now + AUDIO_LOOKAHEAD;
+      src.start(audioNextAt);
+      audioNextAt += audioBuf.duration;
+    }
+
+    // ── WebCodecs H.264 decoder ───────────────────────────────────────────────
+    let h264Dec = null;
+    let h264Timestamp = 0;
+    const h264FramePos = new Map();
+
+    function h264Supported() {
+      return typeof VideoDecoder !== 'undefined' && typeof EncodedVideoChunk !== 'undefined';
+    }
+
+    function createH264Decoder(width, height) {
+      if (!h264Supported()) return null;
+      const decoder = new VideoDecoder({
+        output(frame) {
+          const pos = h264FramePos.get(frame.timestamp);
+          h264FramePos.delete(frame.timestamp);
+          const x = pos ? pos.x : 0;
+          const y = pos ? pos.y : 0;
+          ctx.drawImage(frame, x, y);
+          frame.close();
+        },
+        error(e) {
+          console.warn('WebCodecs H.264 decoder error:', e);
+        }
+      });
+      decoder.configure({
+        codec: 'avc1.42E01E',
+        codedWidth: width,
+        codedHeight: height,
+        optimizeForLatency: true,
+      });
+      return decoder;
+    }
+
+    function onH264(destX, destY, isKey, uint8Data) {
+      if (!h264Dec || h264Dec.state === 'closed') return;
+      h264Timestamp += 1000;
+      h264FramePos.set(h264Timestamp, { x: destX, y: destY });
+      try {
+        h264Dec.decode(new EncodedVideoChunk({
+          type: isKey ? 'key' : 'delta',
+          timestamp: h264Timestamp,
+          data: uint8Data,
+        }));
+      } catch (e) {
+        console.warn('onH264 decode error:', e);
+      }
+    }
+
+    const statusEl = document.getElementById('status');
+
+    window.toggleConnect = function() {
+      if (controller) {
+        if (h264Dec) { h264Dec.close(); h264Dec = null; }
+        if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; audioNextAt = 0; }
+        controller = null;
+        document.getElementById('connectBtn').textContent = 'Connect';
+        document.getElementById('connectBtn').classList.remove('connected');
+        statusEl.textContent = 'Disconnected';
+      } else {
+        doConnect();
+      }
+    };
+
+    async function doConnect() {
+      const host   = document.getElementById('host').value.trim();
+      const port   = document.getElementById('port').value.trim();
+      const user   = document.getElementById('user').value.trim();
+      const pass   = document.getElementById('pass').value;
+      const domain = document.getElementById('domain').value.trim();
+      const width  = parseInt(document.getElementById('width').value)  || 1280;
+      const height = parseInt(document.getElementById('height').value) || 720;
+
+      saveCookies();
+
+      canvas.width  = width;
+      canvas.height = height;
+
+      h264Timestamp = 0;
+      h264FramePos.clear();
+      h264Dec = createH264Decoder(width, height);
+
+      if (audioCtx) { try { audioCtx.close(); } catch (_) {} }
+      audioCtx = new AudioContext({ latencyHint: 'playback' });
+      audioNextAt = 0;
+
+      pointerCache.clear();
+      canvas.style.cursor = 'default';
+
+      const target = `${host}:${port}`;
+      const wsUrl  = `ws://${location.host}/ws?target=${encodeURIComponent(target)}`;
+
+      statusEl.textContent = 'Connecting…';
+
+      try {
+        controller = await connect(wsUrl, domain, user, pass, width, height, onBitmap, onH264, onAudio, onPointerHide, onPointerCached, onPointerUpdate);
+        statusEl.textContent = 'Connected';
+        document.getElementById('connectBtn').textContent = 'Disconnect';
+        document.getElementById('connectBtn').classList.add('connected');
+        canvas.focus();
+      } catch (err) {
+        statusEl.textContent = 'Connection failed: ' + err;
+        controller = null;
+      }
+    }
+
+    // Keyboard input
+    const KEYMAP = {
+      "Escape": 0x0001, "Digit1": 0x0002, "Digit2": 0x0003, "Digit3": 0x0004,
+      "Digit4": 0x0005, "Digit5": 0x0006, "Digit6": 0x0007, "Digit7": 0x0008,
+      "Digit8": 0x0009, "Digit9": 0x000A, "Digit0": 0x000B, "Minus": 0x000C,
+      "Equal": 0x000D, "Backspace": 0x000E, "Tab": 0x000F,
+      "KeyQ": 0x0010, "KeyW": 0x0011, "KeyE": 0x0012, "KeyR": 0x0013,
+      "KeyT": 0x0014, "KeyY": 0x0015, "KeyU": 0x0016, "KeyI": 0x0017,
+      "KeyO": 0x0018, "KeyP": 0x0019, "BracketLeft": 0x001A, "BracketRight": 0x001B,
+      "Enter": 0x001C, "ControlLeft": 0x001D,
+      "KeyA": 0x001E, "KeyS": 0x001F, "KeyD": 0x0020, "KeyF": 0x0021,
+      "KeyG": 0x0022, "KeyH": 0x0023, "KeyJ": 0x0024, "KeyK": 0x0025,
+      "KeyL": 0x0026, "Semicolon": 0x0027, "Quote": 0x0028, "Backquote": 0x0029,
+      "ShiftLeft": 0x002A, "Backslash": 0x002B,
+      "KeyZ": 0x002C, "KeyX": 0x002D, "KeyC": 0x002E, "KeyV": 0x002F,
+      "KeyB": 0x0030, "KeyN": 0x0031, "KeyM": 0x0032,
+      "Comma": 0x0033, "Period": 0x0034, "Slash": 0x0035, "ShiftRight": 0x0036,
+      "NumpadMultiply": 0x0037, "AltLeft": 0x0038, "Space": 0x0039,
+      "CapsLock": 0x003A,
+      "F1": 0x003B, "F2": 0x003C, "F3": 0x003D, "F4": 0x003E, "F5": 0x003F,
+      "F6": 0x0040, "F7": 0x0041, "F8": 0x0042, "F9": 0x0043, "F10": 0x0044,
+      "ScrollLock": 0x0046,
+      "Numpad7": 0x0047, "Numpad8": 0x0048, "Numpad9": 0x0049,
+      "NumpadSubtract": 0x004A, "Numpad4": 0x004B, "Numpad5": 0x004C,
+      "Numpad6": 0x004D, "NumpadAdd": 0x004E, "Numpad1": 0x004F,
+      "Numpad2": 0x0050, "Numpad3": 0x0051, "Numpad0": 0x0052,
+      "NumpadDecimal": 0x0053, "F11": 0x0057, "F12": 0x0058,
+      "NumpadEqual": 0x0059,
+      // Extended keys (0xE0xx)
+      "NumpadEnter": 0xE01C, "ControlRight": 0xE01D, "NumpadDivide": 0xE035,
+      "PrintScreen": 0xE037, "AltRight": 0xE038, "NumLock": 0xE045,
+      "Pause": 0xE046, "Home": 0xE047, "ArrowUp": 0xE048, "PageUp": 0xE049,
+      "ArrowLeft": 0xE04B, "ArrowRight": 0xE04D, "End": 0xE04F,
+      "ArrowDown": 0xE050, "PageDown": 0xE051, "Insert": 0xE052,
+      "Delete": 0xE053, "MetaLeft": 0xE05B, "MetaRight": 0xE05C,
+      "ContextMenu": 0xE05D,
+      // Japanese keyboard
+      "IntlRo": 0x0073, "KanaMode": 0x0070, "IntlYen": 0x007D,
+      "Convert": 0x0079, "NonConvert": 0x007B,
+    };
+    const KBDFLAGS_EXTENDED = 0x0100;
+    const SWAP_ALT_META = {
+      "AltLeft": "MetaLeft", "AltRight": "MetaRight",
+      "MetaLeft": "AltLeft", "MetaRight": "AltRight",
+    };
+    function codeToRdp(code, swapAltMeta) {
+      if (swapAltMeta && SWAP_ALT_META[code]) code = SWAP_ALT_META[code];
+      const v = KEYMAP[code];
+      if (!v) return null;
+      if (v >= 0xE000) return { flags: KBDFLAGS_EXTENDED, scancode: v & 0xFF };
+      return { flags: 0, scancode: v };
+    }
+
+    canvas.addEventListener('keydown', (e) => {
+      if (!controller) return;
+      e.preventDefault();
+      const k = codeToRdp(e.code, document.getElementById('swapAltMeta').checked);
+      if (k) controller.key_down(k.flags, k.scancode);
+    });
+    canvas.addEventListener('keyup', (e) => {
+      if (!controller) return;
+      e.preventDefault();
+      const k = codeToRdp(e.code, document.getElementById('swapAltMeta').checked);
+      if (k) controller.key_up(k.scancode);
+    });
+
+    // Mouse input
+    canvas.addEventListener('mousemove', (e) => {
+      if (!controller) return;
+      const rect = canvas.getBoundingClientRect();
+      controller.mouse_move(e.clientX - rect.left, e.clientY - rect.top);
+    });
+    canvas.addEventListener('mousedown', (e) => {
+      if (!controller) return;
+      e.preventDefault();
+      canvas.focus();
+      const rect = canvas.getBoundingClientRect();
+      const btn  = e.button === 0 ? 1 : e.button === 1 ? 3 : 2;
+      controller.mouse_button(btn, true, e.clientX - rect.left, e.clientY - rect.top);
+    });
+    canvas.addEventListener('mouseup', (e) => {
+      if (!controller) return;
+      const rect = canvas.getBoundingClientRect();
+      const btn  = e.button === 0 ? 1 : e.button === 1 ? 3 : 2;
+      controller.mouse_button(btn, false, e.clientX - rect.left, e.clientY - rect.top);
+    });
+    canvas.addEventListener('wheel', (e) => {
+      if (!controller) return;
+      e.preventDefault();
+      controller.mouse_wheel(e.deltaY > 0 ? -120 : 120);
+    }, { passive: false });
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  </script>
+</body>
+</html>

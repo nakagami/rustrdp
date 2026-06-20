@@ -1,0 +1,22 @@
+[package]
+name = "rustrdp-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "WebSocket-to-TCP proxy + web server for the rustrdp browser client"
+license = "GPL-3.0"
+repository = "https://github.com/nakagami/rustrdp"
+include = ["src/**/*", "build.rs", "assets/**/*", "Cargo.toml", "README.md"]
+
+[[bin]]
+name = "rustrdp-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.23"
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["fs"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+tokio-native-tls = "0.3"
+native-tls = { version = "0.2", features = ["vendored"] }

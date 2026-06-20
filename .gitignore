@@ -1,0 +1,4 @@
+/target
+/static/pkg
+/rustrdp-proxy/assets
+Cargo.lock

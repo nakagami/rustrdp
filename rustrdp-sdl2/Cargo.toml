@@ -1,0 +1,28 @@
+[package]
+name = "rustrdp-sdl2"
+version = "0.1.0"
+edition = "2021"
+description = "Native desktop RDP client using SDL2"
+license = "GPL-3.0"
+repository = "https://github.com/nakagami/rustrdp"
+
+[[bin]]
+name = "rustrdp-sdl2"
+path = "src/main.rs"
+
+[dependencies]
+rustrdp-core = { path = "../rustrdp-core", version = "0.1.0" }
+socket2 = { version = "0.5", features = ["all"] }
+ffmpeg-next = "8"
+tokio = { version = "1", features = ["full"] }
+sdl2 = { version = "0.35", features = ["ttf", "unsafe_textures"] }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+thiserror = "1"
+async-trait = "0.1"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+
+[build-dependencies]
+pkg-config = "0.3"

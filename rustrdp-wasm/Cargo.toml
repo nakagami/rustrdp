@@ -1,0 +1,24 @@
+[package]
+name = "rustrdp-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rustrdp-core = { path = "../rustrdp-core" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "WebSocket", "MessageEvent", "BinaryType",
+    "CloseEvent", "ErrorEvent", "Event",
+    "Window", "console",
+] }
+futures-channel = "0.3"
+futures-util = "0.3"
+log = "0.4"
+console_log = "1"
+async-trait = "0.1"

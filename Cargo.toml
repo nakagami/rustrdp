@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "rustrdp-core",
+    "rustrdp-wasm",
+    "rustrdp-proxy",
+    "rustrdp-sdl2",
+]
+resolver = "2"
