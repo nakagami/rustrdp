@@ -122,6 +122,35 @@ impl<T: Transport> RdpSession<T> {
         kbd_layout: u32,
         avc_factory: Option<&dyn Fn() -> Option<Box<dyn crate::avc::AvcDecoder>>>,
     ) -> Result<Self, RdpError> {
+        Self::login_with_options(
+            transport,
+            domain,
+            user,
+            password,
+            width,
+            height,
+            kbd_layout,
+            avc_factory,
+            false,
+        )
+        .await
+    }
+
+    /// Perform full RDP login with optional graphics codec capability overrides.
+    ///
+    /// When `disable_avc444` is true, only AVC420-capable graphics capabilities
+    /// are advertised to the server.
+    pub async fn login_with_options(
+        transport: T,
+        domain: &str,
+        user: &str,
+        password: &str,
+        width: u16,
+        height: u16,
+        kbd_layout: u32,
+        avc_factory: Option<&dyn Fn() -> Option<Box<dyn crate::avc::AvcDecoder>>>,
+        disable_avc444: bool,
+    ) -> Result<Self, RdpError> {
         // Step 1: X.224 connection negotiation
         let tpkt = Tpkt::new(transport);
         let mut x224 = X224::new(tpkt);
@@ -263,6 +292,7 @@ impl<T: Transport> RdpSession<T> {
             drdynvc_channel,
             drdynvc_handler: {
                 let mut h = DrdynvcHandler::new();
+                h.set_disable_avc444(disable_avc444);
                 if let Some(factory) = avc_factory {
                     h.set_avc_decoder(factory());
                     h.set_avc_decoder2(factory());

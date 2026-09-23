@@ -51,6 +51,7 @@ pub struct DrdynvcHandler {
     avc_dec: Option<Box<dyn crate::avc::AvcDecoder>>,
     /// Optional secondary AVC decoder for AVC444 LC=2 chroma-upgrade.
     avc_dec2: Option<Box<dyn crate::avc::AvcDecoder>>,
+    disable_avc444: bool,
 }
 
 impl DrdynvcHandler {
@@ -61,6 +62,7 @@ impl DrdynvcHandler {
             server_version: 1,
             avc_dec: None,
             avc_dec2: None,
+            disable_avc444: false,
         }
     }
 
@@ -73,6 +75,10 @@ impl DrdynvcHandler {
     /// Inject the secondary AVC decoder for AVC444 LC=2 chroma-upgrade.
     pub fn set_avc_decoder2(&mut self, dec: Option<Box<dyn crate::avc::AvcDecoder>>) {
         self.avc_dec2 = dec;
+    }
+
+    pub fn set_disable_avc444(&mut self, disable: bool) {
+        self.disable_avc444 = disable;
     }
 
     /// Process one DVC PDU.
@@ -235,7 +241,11 @@ impl DrdynvcHandler {
             // introduced here without changing the public API.
             let avc_dec = self.avc_dec.take();
             let avc_dec2 = self.avc_dec2.take();
-            let mut gfx = RdpgfxHandler::with_avc_pair(avc_dec, avc_dec2);
+            let mut gfx = RdpgfxHandler::with_avc_pair_and_options(
+                avc_dec,
+                avc_dec2,
+                self.disable_avc444,
+            );
             // Build CAPS_ADVERTISE and wrap it in a DATA PDU
             let caps_pdus = gfx.on_channel_created();
             self.channels.insert(ch_id, DvcChannel::Gfx(gfx));

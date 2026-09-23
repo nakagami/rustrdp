@@ -292,7 +292,7 @@ impl RdpConnection {
             read_buf: Vec::new(),
         };
 
-        let session = RdpSession::login(
+        let session = RdpSession::login_with_options(
             transport,
             &config.domain,
             &config.username,
@@ -301,6 +301,7 @@ impl RdpConnection {
             config.height,
             0x0409,
             Some(&crate::h264::H264Decoder::new_boxed),
+            config.disable_avc444,
         )
         .await?;
 

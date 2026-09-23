@@ -120,6 +120,7 @@ pub struct RdpgfxHandler {
     /// Injected AVC decoder.  `None` when no H.264 support is configured
     /// (e.g. rdp-wasm, CLI tools that don't need video decode).
     avc_dec: Option<Box<dyn crate::avc::AvcDecoder>>,
+    disable_avc444: bool,
     /// Secondary AVC decoder for the AVC444 auxiliary chroma stream.
     /// When present, LC=0 stream2 data is fed here (priming), and LC=2 frames
     /// are decoded here and combined with the cached luma plane.
@@ -160,6 +161,15 @@ impl RdpgfxHandler {
         avc_dec: Option<Box<dyn crate::avc::AvcDecoder>>,
         avc_dec2: Option<Box<dyn crate::avc::AvcDecoder>>,
     ) -> Self {
+        Self::with_avc_pair_and_options(avc_dec, avc_dec2, false)
+    }
+
+    /// Create a handler with optional AVC444 capability advertisement disabled.
+    pub fn with_avc_pair_and_options(
+        avc_dec: Option<Box<dyn crate::avc::AvcDecoder>>,
+        avc_dec2: Option<Box<dyn crate::avc::AvcDecoder>>,
+        disable_avc444: bool,
+    ) -> Self {
         if avc_dec.is_some() {
             if avc_dec2.is_some() {
                 log::debug!("[rdpgfx] AVC decoder configured (primary + auxiliary for LC=2)");
@@ -178,6 +188,7 @@ impl RdpgfxHandler {
             needs_force_refresh: false,
             pending_avc_regions_queue: VecDeque::new(),
             avc_dec,
+            disable_avc444,
             avc_dec2,
             avc444_y_cache: None,
             last_stream1_idr: Vec::new(),
@@ -210,7 +221,7 @@ impl RdpgfxHandler {
     /// Called when the DVC channel was just created.
     /// Returns CAPS_ADVERTISE PDU(s) to send.
     pub fn on_channel_created(&mut self) -> Vec<Vec<u8>> {
-        vec![build_caps_advertise()]
+        vec![build_caps_advertise_with_options(self.disable_avc444)]
     }
 
     /// Called when the server sent a large/full-screen raw Bitmap Update in
@@ -2123,10 +2134,15 @@ fn extract_region(data: &[u8], stride: i32, x: i32, y: i32, w: i32, h: i32) -> V
 /// Build RDPGFX_CAPS_ADVERTISE_PDU (client→server).
 /// Advertises multiple capability sets so the server can pick the highest it supports.
 pub fn build_caps_advertise() -> Vec<u8> {
+    build_caps_advertise_with_options(false)
+}
+
+fn build_caps_advertise_with_options(disable_avc444: bool) -> Vec<u8> {
     let mut caps = Vec::new();
 
     // capsSetCount
-    caps.extend_from_slice(&11u16.to_le_bytes());
+    let cap_set_count = if disable_avc444 { 2 } else { 11 };
+    caps.extend_from_slice(&(cap_set_count as u16).to_le_bytes());
 
     let push_cap = |caps: &mut Vec<u8>, version: u32, flags: u32| {
         caps.extend_from_slice(&version.to_le_bytes());
@@ -2139,17 +2155,19 @@ pub fn build_caps_advertise() -> Vec<u8> {
         CAP_VERSION_81,
         CAP_FLAG_SMALL_CACHE | CAP_FLAG_AVC420_ENABLED,
     );
-    push_cap(&mut caps, CAP_VERSION_10, CAP_FLAG_SMALL_CACHE);
-    caps.extend_from_slice(&CAP_VERSION_101.to_le_bytes());
-    caps.extend_from_slice(&16u32.to_le_bytes());
-    caps.extend_from_slice(&[0u8; 16]);
-    push_cap(&mut caps, CAP_VERSION_102, CAP_FLAG_SMALL_CACHE);
-    push_cap(&mut caps, CAP_VERSION_103, 0);
-    push_cap(&mut caps, CAP_VERSION_104, CAP_FLAG_SMALL_CACHE);
-    push_cap(&mut caps, CAP_VERSION_105, CAP_FLAG_SMALL_CACHE);
-    push_cap(&mut caps, CAP_VERSION_106, CAP_FLAG_SMALL_CACHE);
-    push_cap(&mut caps, 0x000A0601, CAP_FLAG_SMALL_CACHE);
-    push_cap(&mut caps, CAP_VERSION_107, CAP_FLAG_SMALL_CACHE);
+    if !disable_avc444 {
+        push_cap(&mut caps, CAP_VERSION_10, CAP_FLAG_SMALL_CACHE);
+        caps.extend_from_slice(&CAP_VERSION_101.to_le_bytes());
+        caps.extend_from_slice(&16u32.to_le_bytes());
+        caps.extend_from_slice(&[0u8; 16]);
+        push_cap(&mut caps, CAP_VERSION_102, CAP_FLAG_SMALL_CACHE);
+        push_cap(&mut caps, CAP_VERSION_103, 0);
+        push_cap(&mut caps, CAP_VERSION_104, CAP_FLAG_SMALL_CACHE);
+        push_cap(&mut caps, CAP_VERSION_105, CAP_FLAG_SMALL_CACHE);
+        push_cap(&mut caps, CAP_VERSION_106, CAP_FLAG_SMALL_CACHE);
+        push_cap(&mut caps, 0x000A0601, CAP_FLAG_SMALL_CACHE);
+        push_cap(&mut caps, CAP_VERSION_107, CAP_FLAG_SMALL_CACHE);
+    }
 
     let pdu_len = (GFX_HEADER_SIZE + caps.len()) as u32;
     let mut pdu = Vec::with_capacity(pdu_len as usize);
@@ -2158,6 +2176,52 @@ pub fn build_caps_advertise() -> Vec<u8> {
     pdu.extend_from_slice(&pdu_len.to_le_bytes());
     pdu.extend_from_slice(&caps);
     pdu
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn advertised_versions(pdu: &[u8]) -> Vec<u32> {
+        let count = u16::from_le_bytes([pdu[8], pdu[9]]) as usize;
+        let mut offset = 10;
+        let mut versions = Vec::with_capacity(count);
+        for _ in 0..count {
+            let version = u32::from_le_bytes([
+                pdu[offset],
+                pdu[offset + 1],
+                pdu[offset + 2],
+                pdu[offset + 3],
+            ]);
+            let data_len = u32::from_le_bytes([
+                pdu[offset + 4],
+                pdu[offset + 5],
+                pdu[offset + 6],
+                pdu[offset + 7],
+            ]) as usize;
+            versions.push(version);
+            offset += 8 + data_len;
+        }
+        assert_eq!(offset, pdu.len());
+        versions
+    }
+
+    #[test]
+    fn disabling_avc444_advertises_only_avc420_capabilities() {
+        let pdu = build_caps_advertise_with_options(true);
+        assert_eq!(advertised_versions(&pdu), [CAP_VERSION_8, CAP_VERSION_81]);
+        assert_eq!(
+            u32::from_le_bytes([pdu[30], pdu[31], pdu[32], pdu[33]]),
+            CAP_FLAG_SMALL_CACHE | CAP_FLAG_AVC420_ENABLED
+        );
+    }
+
+    #[test]
+    fn default_caps_advertisement_still_includes_avc444_capabilities() {
+        let versions = advertised_versions(&build_caps_advertise());
+        assert_eq!(versions.len(), 11);
+        assert_eq!(versions.last(), Some(&CAP_VERSION_107));
+    }
 }
 
 /// Build RDPGFX_FRAME_ACKNOWLEDGE_PDU (client→server).

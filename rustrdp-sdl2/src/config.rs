@@ -7,6 +7,9 @@ struct Args {
     /// Swap Alt and Meta (Super/GUI) keys
     #[arg(long, default_value_t = false)]
     swap_alt_meta: bool,
+    /// Disable AVC444/AVC444v2 and use AVC420 only
+    #[arg(long, default_value_t = false)]
+    disable_avc444: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -19,6 +22,7 @@ pub struct RdpConfig {
     pub width: u16,
     pub height: u16,
     pub swap_alt_meta: bool,
+    pub disable_avc444: bool,
 }
 
 impl RdpConfig {
@@ -38,6 +42,8 @@ impl RdpConfig {
                 .map(|v| v.to_lowercase() == "true" || v == "1")
                 .unwrap_or(false);
 
+        let disable_avc444 = args.disable_avc444;
+
         Ok(RdpConfig {
             host,
             port,
@@ -47,6 +53,7 @@ impl RdpConfig {
             width,
             height,
             swap_alt_meta,
+            disable_avc444,
         })
     }
 }
