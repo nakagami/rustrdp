@@ -1,9 +1,15 @@
+pub mod clearcodec;
 pub mod drdynvc;
 pub mod lic;
 pub mod nla;
+pub mod nscodec;
 pub mod pdu;
+pub mod planar;
 pub mod rdpgfx;
 pub mod rdpsnd;
+pub mod rfx;
+pub mod rfx_progressive;
+pub mod rfx_rlgr;
 pub mod sec;
 pub mod t125;
 pub mod tpkt;

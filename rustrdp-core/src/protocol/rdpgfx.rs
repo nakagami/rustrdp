@@ -5,6 +5,10 @@
 use crate::bitmap::Bitmap;
 use crate::avc::NV12Frame;
 use crate::protocol::zgfx::ZgfxContext;
+use super::clearcodec::ClearCodecContext;
+use super::planar::decode_planar;
+use super::rfx::RfxDecoder;
+use super::rfx_progressive::RfxProgressiveDecoder;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
@@ -34,6 +38,10 @@ const CMDID_MAP_SURFACE_TO_WINDOW: u16 = 0x0018;
 
 // ── Codec IDs ─────────────────────────────────────────────────────────────────
 const CODEC_UNCOMPRESSED: u16 = 0x0000;
+const CODEC_CAVIDEO: u16 = 0x0003;
+const CODEC_PLANAR: u16 = 0x0004;
+const CODEC_CLEARCODEC: u16 = 0x0008;
+const CODEC_PROGRESSIVE: u16 = 0x0009;
 const CODEC_AVC420: u16 = 0x000B;
 const CODEC_AVC444: u16 = 0x000E;
 const CODEC_AVC444V2: u16 = 0x000F;
@@ -136,6 +144,9 @@ pub struct RdpgfxHandler {
     soft_reset_count: usize,
     /// True once the primary AVC decoder has been switched to SW fallback mode.
     using_sw_fallback: bool,
+    clear_ctx: ClearCodecContext,
+    rfx_dec: RfxDecoder,
+    rfx_prog_dec: RfxProgressiveDecoder,
 }
 
 impl RdpgfxHandler {
@@ -194,6 +205,9 @@ impl RdpgfxHandler {
             last_stream1_idr: Vec::new(),
             soft_reset_count: 0,
             using_sw_fallback: false,
+            clear_ctx: ClearCodecContext::new(),
+            rfx_dec: RfxDecoder::new(),
+            rfx_prog_dec: RfxProgressiveDecoder::new(),
         }
     }
 
@@ -473,6 +487,8 @@ impl RdpgfxHandler {
         self.last_stream1_idr.clear();
         self.soft_reset_count = 0;
         self.using_sw_fallback = false;
+        self.clear_ctx.reset_cache();
+        self.rfx_prog_dec.reset();
         // Reset both AVC decoders so stale pipeline frames do not bleed
         // into the new surface configuration.
         if let Some(dec) = &mut self.avc_dec {
@@ -550,6 +566,83 @@ impl RdpgfxHandler {
                         surf_id, dest_left, dest_top, w, h, abs_x, abs_y
                     );
                     bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                }
+            }
+            CODEC_PLANAR => {
+                let pixels = decode_planar(bmp_data, w as usize, h as usize);
+                self.blit_to_surface(surf_id, dest_left as i32, dest_top as i32, w, h, &pixels);
+                if mapped {
+                    bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                }
+            }
+            CODEC_CLEARCODEC => {
+                let mut pixels = vec![0u8; w as usize * h as usize * 4];
+                if self.clear_ctx.decode(
+                    bmp_data,
+                    w as usize,
+                    h as usize,
+                    &mut pixels,
+                    0,
+                    0,
+                    w as usize,
+                    h as usize,
+                ) {
+                    self.blit_to_surface(surf_id, dest_left as i32, dest_top as i32, w, h, &pixels);
+                    if mapped {
+                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                    }
+                }
+            }
+            CODEC_CAVIDEO => {
+                if let Some(surf) = self.surfaces.get_mut(&surf_id) {
+                    let sw = surf.width as usize;
+                    let sh = surf.height as usize;
+                    self.rfx_dec.decode(
+                        bmp_data,
+                        dest_left as usize,
+                        dest_top as usize,
+                        &mut surf.data,
+                        sw,
+                        sh,
+                    );
+                    if mapped {
+                        let pixels = copy_surface_rect(
+                            &surf.data,
+                            sw,
+                            sh,
+                            dest_left as usize,
+                            dest_top as usize,
+                            w as usize,
+                            h as usize,
+                        );
+                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                    }
+                }
+            }
+            CODEC_PROGRESSIVE => {
+                if let Some(surf) = self.surfaces.get_mut(&surf_id) {
+                    let sw = surf.width as usize;
+                    let sh = surf.height as usize;
+                    self.rfx_prog_dec.decode(
+                        bmp_data,
+                        dest_left as usize,
+                        dest_top as usize,
+                        &mut surf.data,
+                        sw,
+                        sh,
+                    );
+                    if mapped {
+                        let pixels = copy_surface_rect(
+                            &surf.data,
+                            sw,
+                            sh,
+                            dest_left as usize,
+                            dest_top as usize,
+                            w as usize,
+                            h as usize,
+                        );
+                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                    }
                 }
             }
             CODEC_AVC420 => {
@@ -741,6 +834,53 @@ impl RdpgfxHandler {
                         surf_id, w, h, abs_x, abs_y
                     );
                     bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                }
+            }
+            CODEC_PLANAR => {
+                let pixels = decode_planar(bmp_data, w as usize, h as usize);
+                self.blit_to_surface(surf_id, 0, 0, w, h, &pixels);
+                if mapped {
+                    bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                }
+            }
+            CODEC_CLEARCODEC => {
+                let mut pixels = vec![0u8; w as usize * h as usize * 4];
+                if self.clear_ctx.decode(
+                    bmp_data,
+                    w as usize,
+                    h as usize,
+                    &mut pixels,
+                    0,
+                    0,
+                    w as usize,
+                    h as usize,
+                ) {
+                    self.blit_to_surface(surf_id, 0, 0, w, h, &pixels);
+                    if mapped {
+                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                    }
+                }
+            }
+            CODEC_CAVIDEO => {
+                if let Some(surf) = self.surfaces.get_mut(&surf_id) {
+                    let sw = surf.width as usize;
+                    let sh = surf.height as usize;
+                    self.rfx_dec.decode(bmp_data, 0, 0, &mut surf.data, sw, sh);
+                    if mapped {
+                        let pixels = copy_surface_rect(&surf.data, sw, sh, 0, 0, w as usize, h as usize);
+                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                    }
+                }
+            }
+            CODEC_PROGRESSIVE => {
+                if let Some(surf) = self.surfaces.get_mut(&surf_id) {
+                    let sw = surf.width as usize;
+                    let sh = surf.height as usize;
+                    self.rfx_prog_dec.decode(bmp_data, 0, 0, &mut surf.data, sw, sh);
+                    if mapped {
+                        let pixels = copy_surface_rect(&surf.data, sw, sh, 0, 0, w as usize, h as usize);
+                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
+                    }
                 }
             }
             CODEC_AVC420 => {
@@ -2124,6 +2264,33 @@ fn extract_region(data: &[u8], stride: i32, x: i32, y: i32, w: i32, h: i32) -> V
         let n = (w * 4) as usize;
         if src_off + n <= data.len() && dst_off + n <= out.len() {
             out[dst_off..dst_off + n].copy_from_slice(&data[src_off..src_off + n]);
+        }
+    }
+    out
+}
+
+fn copy_surface_rect(
+    data: &[u8],
+    surf_w: usize,
+    surf_h: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 4];
+    for row in 0..h {
+        let sy = y + row;
+        if sy >= surf_h {
+            break;
+        }
+        let sx = x;
+        let sw_len = w.min(surf_w.saturating_sub(sx));
+        let src_idx = (sy * surf_w + sx) * 4;
+        let dst_idx = row * w * 4;
+        let bytes = sw_len * 4;
+        if src_idx + bytes <= data.len() && dst_idx + bytes <= out.len() {
+            out[dst_idx..dst_idx + bytes].copy_from_slice(&data[src_idx..src_idx + bytes]);
         }
     }
     out

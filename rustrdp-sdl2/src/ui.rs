@@ -99,12 +99,14 @@ impl RdpUI {
         let texture_creator = canvas.texture_creator();
         // ARGB8888 = BGRA in memory on little-endian (macOS/Linux/Windows x86).
         // AVC frames from VideoToolbox are already BGRA — no per-pixel swap needed.
-        let texture = texture_creator.create_texture_streaming(
+        let mut texture = texture_creator.create_texture_streaming(
             PixelFormatEnum::ARGB8888,
             width as u32,
             height as u32,
         )?;
+        texture.set_blend_mode(sdl2::render::BlendMode::Blend);
         let back_buf = vec![0u8; width as usize * height as usize * 4];
+        texture.update(None, &back_buf, width as usize * 4)?;
 
         // Set BT.709 YUV→RGB conversion for HD H.264 frames (≥720p).
         // SDL2 defaults to BT.601 which maps the chroma differently, producing
@@ -161,12 +163,15 @@ impl RdpUI {
         self.canvas
             .window_mut()
             .set_size(width as u32, height as u32)?;
-        self.texture = self.texture_creator.create_texture_streaming(
+        let mut texture = self.texture_creator.create_texture_streaming(
             PixelFormatEnum::ARGB8888,
             width as u32,
             height as u32,
         )?;
+        texture.set_blend_mode(sdl2::render::BlendMode::Blend);
         self.back_buf = vec![0u8; width as usize * height as usize * 4];
+        texture.update(None, &self.back_buf, width as usize * 4)?;
+        self.texture = texture;
         self.width = width;
         self.height = height;
         // Clear NV12 state on resize
@@ -178,6 +183,14 @@ impl RdpUI {
             self.nv12_tex_w = 0;
             self.nv12_tex_h = 0;
         }
+        Ok(())
+    }
+
+    /// Clear the entire BGRA overlay back-buffer and GPU texture to transparent.
+    pub fn clear_overlay(&mut self) -> Result<(), Box<dyn Error>> {
+        self.back_buf.fill(0);
+        let row_bytes = self.width as usize * 4;
+        self.texture.update(None, &self.back_buf, row_bytes)?;
         Ok(())
     }
 
@@ -270,27 +283,28 @@ impl RdpUI {
                 dst_w as u32,
                 dst_h as u32,
             ));
-            // Track whether this frame covers the entire screen so that
-            // present_composed can skip the background texture blit.
+            // When this frame covers the entire screen, clear the BGRA overlay texture
+            // so stale non-H264 patches do not obscure the new H264 baseline.
+            // Matches grdpsdl2's clearOverlayDirty on full-screen YUV frames.
             self.nv12_fullscreen = frame.screen_x == 0
                 && frame.screen_y == 0
                 && dst_w >= scr_w
                 && dst_h >= scr_h;
+            if self.nv12_fullscreen {
+                self.clear_overlay()?;
+            }
         }
         Ok(())
     }
 
-    /// Compose the BGRA background texture with the NV12 overlay and present.
+    /// Compose the NV12 background video with the BGRA overlay and present.
     ///
-    /// When the last NV12 frame covered the full screen (`nv12_fullscreen`),
-    /// the background BGRA texture blit is skipped — the NV12 overlay already
-    /// fills every pixel, making the blit redundant.  This matches
-    /// grdpsdl2's optimisation that skips SDL_RenderClear when a full-screen
-    /// YUV frame is present.
+    /// Background layer: NV12 hardware-decoded video frame.
+    /// Foreground overlay: BGRA texture (with SDL_BLENDMODE_BLEND) for UI, mouse, and bitmaps.
     pub fn present_composed(&mut self) -> Result<(), Box<dyn Error>> {
-        if !self.nv12_fullscreen {
-            self.canvas.copy(&self.texture, None, None)?;
-        }
+        self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+        self.canvas.clear();
+
         if let Some(rect) = self.nv12_last_rect {
             if !self.nv12_tex.is_null() {
                 let dst = sdl2::sys::SDL_Rect {
@@ -309,6 +323,7 @@ impl RdpUI {
                 }
             }
         }
+        self.canvas.copy(&self.texture, None, None)?;
         self.canvas.present();
         Ok(())
     }
@@ -317,8 +332,8 @@ impl RdpUI {
     /// Blit one bitmap tile into the CPU back-buffer, then upload that rect to the SDL texture.
     ///
     /// Texture format is ARGB8888 (= BGRA byte order on little-endian).
-    /// 32-bpp bitmap data from RDPGFX/AVC is already BGRA, so bpp=32 uses a direct
-    /// `copy_from_slice` per row (pure memcpy — fast even in debug builds).
+    /// All bitmaps have alpha forced to 0xFF (opaque) so that overlay blending
+    /// does not let underlying YUV or garbage shine through as green/black artifacts.
     fn blit_bitmap_to_texture(&mut self, bitmap: &Bitmap) -> Result<bool, Box<dyn Error>> {
         let bw = bitmap.width as usize; // source row stride
         let bh = bitmap.height as usize;
@@ -367,21 +382,38 @@ impl RdpUI {
             _ => return Ok(false),
         };
         let src_data = &bitmap.data;
-        let back_pitch = scr_w * 4;
 
-        // Write pixels into the CPU back-buffer (BGRA format).
+        let mut patch_buf = vec![0u8; clip_w * clip_h * 4];
+
+        // Write pixels into the CPU back-buffer (BGRA format) and temporary patch buffer.
         for row in 0..clip_h {
             let src_start = ((src_y + row) * bw + src_x) * src_bpp;
             let back_start = ((dest_y + row) * scr_w + dest_x) * 4;
+            let patch_start = row * clip_w * 4;
             let back_row = &mut self.back_buf[back_start..back_start + clip_w * 4];
+            let patch_row = &mut patch_buf[patch_start..patch_start + clip_w * 4];
             match bitmap.bits_per_pixel {
                 32 => {
                     let src_end = src_start + clip_w * 4;
                     if src_end > src_data.len() {
                         return Ok(false);
                     }
-                    // Source is BGRA; back-buffer is BGRA: direct memcpy, no per-pixel work.
-                    back_row.copy_from_slice(&src_data[src_start..src_end]);
+                    let src_row = &src_data[src_start..src_end];
+                    for col in 0..clip_w {
+                        let s = col * 4;
+                        let d = col * 4;
+                        let b = src_row[s];
+                        let g = src_row[s + 1];
+                        let r = src_row[s + 2];
+                        back_row[d] = b;
+                        back_row[d + 1] = g;
+                        back_row[d + 2] = r;
+                        back_row[d + 3] = 255;
+                        patch_row[d] = b;
+                        patch_row[d + 1] = g;
+                        patch_row[d + 2] = r;
+                        patch_row[d + 3] = 255;
+                    }
                 }
                 24 => {
                     let src_end = src_start + clip_w * 3;
@@ -392,11 +424,17 @@ impl RdpUI {
                     for col in 0..clip_w {
                         let s = col * 3;
                         let d = col * 4;
-                        // Source is BGR; BGRA back-buffer: add A=255, no swap.
-                        back_row[d] = src_row[s];
-                        back_row[d + 1] = src_row[s + 1];
-                        back_row[d + 2] = src_row[s + 2];
+                        let b = src_row[s];
+                        let g = src_row[s + 1];
+                        let r = src_row[s + 2];
+                        back_row[d] = b;
+                        back_row[d + 1] = g;
+                        back_row[d + 2] = r;
                         back_row[d + 3] = 255;
+                        patch_row[d] = b;
+                        patch_row[d + 1] = g;
+                        patch_row[d + 2] = r;
+                        patch_row[d + 3] = 255;
                     }
                 }
                 16 => {
@@ -412,21 +450,26 @@ impl RdpUI {
                         let r5 = ((v >> 11) & 0x1f) as u8;
                         let g6 = ((v >> 5) & 0x3f) as u8;
                         let b5 = (v & 0x1f) as u8;
-                        // Expand to BGRA.
-                        back_row[d] = (b5 << 3) | (b5 >> 2);
-                        back_row[d + 1] = (g6 << 2) | (g6 >> 4);
-                        back_row[d + 2] = (r5 << 3) | (r5 >> 2);
+                        let b = (b5 << 3) | (b5 >> 2);
+                        let g = (g6 << 2) | (g6 >> 4);
+                        let r = (r5 << 3) | (r5 >> 2);
+                        back_row[d] = b;
+                        back_row[d + 1] = g;
+                        back_row[d + 2] = r;
                         back_row[d + 3] = 255;
+                        patch_row[d] = b;
+                        patch_row[d + 1] = g;
+                        patch_row[d + 2] = r;
+                        patch_row[d + 3] = 255;
                     }
                 }
                 _ => {}
             }
         }
 
-        // Upload the updated rect from back_buf to the SDL texture via SDL's C memcpy path.
-        let back_start = (dest_y * scr_w + dest_x) * 4;
+        // Upload the updated rect to the SDL texture
         self.texture
-            .update(Some(rect), &self.back_buf[back_start..], back_pitch)?;
+            .update(Some(rect), &patch_buf, clip_w * 4)?;
         Ok(true)
     }
 
