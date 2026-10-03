@@ -85,6 +85,8 @@ pub struct RdpSession<T: Transport> {
     rdpsnd_frag_total: usize,
     /// Channel ID assigned to the "drdynvc" static virtual channel
     drdynvc_channel: Option<u16>,
+    /// Channel ID assigned to the message channel (auto-detect / network probe)
+    msg_channel: Option<u16>,
     /// DRDYNVC protocol handler
     drdynvc_handler: DrdynvcHandler,
     /// Fragment reassembly buffer for drdynvc channel PDUs
@@ -93,6 +95,8 @@ pub struct RdpSession<T: Transport> {
     drdynvc_frag_total: usize,
     /// Pending audio events from DVC that haven't been delivered yet
     pending_audio: std::collections::VecDeque<crate::protocol::rdpsnd::AudioEvent>,
+    /// Pending events from DRDYNVC / FastPath / etc that haven't been delivered yet
+    pending_events: std::collections::VecDeque<RdpEvent>,
     /// Timestamp of the last force-refresh (suppress→allow) sent to the server.
     /// Used to rate-limit keyframe requests to at most once every 2 seconds.
     last_force_refresh: Option<std::time::Instant>,
@@ -275,6 +279,8 @@ impl<T: Transport> RdpSession<T> {
         log::debug!("[client] rdpsnd_channel={:?}", rdpsnd_channel);
         let drdynvc_channel = server_data.channels.get(2).copied();
         log::debug!("[client] drdynvc_channel={:?}", drdynvc_channel);
+        let msg_channel = server_data.msg_channel;
+        log::debug!("[client] msg_channel={:?}", msg_channel);
 
         let mut session = RdpSession {
             mcs,
@@ -290,6 +296,7 @@ impl<T: Transport> RdpSession<T> {
             rdpsnd_frag: Vec::new(),
             rdpsnd_frag_total: 0,
             drdynvc_channel,
+            msg_channel,
             drdynvc_handler: {
                 let mut h = DrdynvcHandler::new();
                 h.set_disable_avc444(disable_avc444);
@@ -302,6 +309,7 @@ impl<T: Transport> RdpSession<T> {
             drdynvc_frag: Vec::new(),
             drdynvc_frag_total: 0,
             pending_audio: std::collections::VecDeque::new(),
+            pending_events: std::collections::VecDeque::new(),
             last_force_refresh: None,
             pending_acks: std::collections::VecDeque::new(),
         };
@@ -505,6 +513,11 @@ impl<T: Transport> RdpSession<T> {
                 });
             }
 
+            // Deliver any pending display/resize events before waiting for more data
+            if let Some(ev) = self.pending_events.pop_front() {
+                return Ok(ev);
+            }
+
             log::debug!("[recv_event] waiting for recv_data...");
             let result = self.mcs.recv_data().await;
             log::debug!(
@@ -555,17 +568,26 @@ impl<T: Transport> RdpSession<T> {
                 if let Some((width, height)) = reset_size {
                     self.width = width;
                     self.height = height;
-                    return Ok(RdpEvent::Resize { width, height });
+                    self.pending_events.push_back(RdpEvent::Resize { width, height });
                 }
                 if !nv12_frames.is_empty() {
-                    return Ok(RdpEvent::NV12Frame(nv12_frames));
+                    self.pending_events.push_back(RdpEvent::NV12Frame(nv12_frames));
                 }
                 if !h264_nals.is_empty() {
-                    return Ok(RdpEvent::H264Nal(h264_nals));
+                    self.pending_events.push_back(RdpEvent::H264Nal(h264_nals));
                 }
                 if !bitmaps.is_empty() {
-                    return Ok(RdpEvent::Bitmap(bitmaps));
+                    self.pending_events.push_back(RdpEvent::Bitmap(bitmaps));
                 }
+                if let Some(ev) = self.pending_events.pop_front() {
+                    return Ok(ev);
+                }
+                continue;
+            }
+
+            // Ignore message channel packets (auto-detect / bandwidth probes)
+            if Some(ch) == self.msg_channel {
+                log::debug!("[recv_event] ignoring msg_channel packet len={}", data.len());
                 continue;
             }
 

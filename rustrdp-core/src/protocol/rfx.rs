@@ -39,14 +39,14 @@ pub fn parse_rfx_quant(data: &[u8]) -> RfxQuant {
     }
     RfxQuant {
         ll3: data[0] & 0x0F,
-        lh3: (data[0] >> 4) & 0x0F,
-        hl3: data[1] & 0x0F,
+        hl3: (data[0] >> 4) & 0x0F,
+        lh3: data[1] & 0x0F,
         hh3: (data[1] >> 4) & 0x0F,
-        lh2: data[2] & 0x0F,
-        hl2: (data[2] >> 4) & 0x0F,
+        hl2: data[2] & 0x0F,
+        lh2: (data[2] >> 4) & 0x0F,
         hh2: data[3] & 0x0F,
-        lh1: (data[3] >> 4) & 0x0F,
-        hl1: data[4] & 0x0F,
+        hl1: (data[3] >> 4) & 0x0F,
+        lh1: data[4] & 0x0F,
         hh1: (data[4] >> 4) & 0x0F,
     }
 }
@@ -76,7 +76,8 @@ impl RfxDecoder {
         surf_data: &mut [u8],
         surf_w: usize,
         surf_h: usize,
-    ) {
+    ) -> Vec<(usize, usize, usize, usize)> {
+        let mut rects = Vec::new();
         let mut offset = 0;
         while offset + 6 <= data.len() {
             let block_type = u16::from_le_bytes([data[offset], data[offset + 1]]);
@@ -107,13 +108,14 @@ impl RfxDecoder {
                 WBT_SYNC | WBT_CODEC_VERSIONS | WBT_CHANNELS | WBT_CONTEXT | WBT_FRAME_BEGIN
                 | WBT_FRAME_END | WBT_REGION => {}
                 WBT_EXTENSION => {
-                    self.decode_tileset(content, left, top, surf_data, surf_w, surf_h);
+                    self.decode_tileset(content, left, top, surf_data, surf_w, surf_h, &mut rects);
                 }
                 _ => {}
             }
 
             offset += block_len;
         }
+        rects
     }
 
     fn decode_tileset(
@@ -124,6 +126,7 @@ impl RfxDecoder {
         surf_data: &mut [u8],
         surf_w: usize,
         surf_h: usize,
+        rects: &mut Vec<(usize, usize, usize, usize)>,
     ) {
         if data.len() < 14 {
             return;
@@ -168,7 +171,9 @@ impl RfxDecoder {
             }
 
             let tile_content = &data[off + 6..off + tile_len];
-            self.decode_tile(tile_content, rlgr_mode, left, top, surf_data, surf_w, surf_h);
+            if let Some(rect) = self.decode_tile(tile_content, rlgr_mode, left, top, surf_data, surf_w, surf_h) {
+                rects.push(rect);
+            }
             off += tile_len;
         }
     }
@@ -182,9 +187,9 @@ impl RfxDecoder {
         surf_data: &mut [u8],
         surf_w: usize,
         surf_h: usize,
-    ) {
+    ) -> Option<(usize, usize, usize, usize)> {
         if data.len() < 13 {
-            return;
+            return None;
         }
 
         let q_idx_y = data[0] as usize;
@@ -198,7 +203,7 @@ impl RfxDecoder {
 
         let mut off = 13;
         if off + y_len + cb_len + cr_len > data.len() {
-            return;
+            return None;
         }
 
         let y_data = &data[off..off + y_len];
@@ -231,6 +236,14 @@ impl RfxDecoder {
             surf_w,
             surf_h,
         );
+
+        if abs_x < surf_w && abs_y < surf_h {
+            let w = RFX_TILE_SIZE.min(surf_w - abs_x);
+            let h = RFX_TILE_SIZE.min(surf_h - abs_y);
+            Some((abs_x, abs_y, w, h))
+        } else {
+            None
+        }
     }
 }
 
@@ -241,25 +254,42 @@ pub fn rfx_decode_component(data: &[u8], quant: RfxQuant, rlgr_mode: usize, work
         rlgr1_decode(data, work);
     }
 
-    // Differential decode LL3
-    for i in 4033..4096 {
-        work[i] = work[i].wrapping_add(work[i - 1]);
+    // Differential decode LL3 and dequantize LL3 in a single pass.
+    if quant.ll3 > 1 {
+        let shift = quant.ll3 - 1;
+        work[4032] = work[4032].wrapping_shl(shift as u32);
+        for i in 4033..4096 {
+            work[i] = work[i - 1].wrapping_add(work[i].wrapping_shl(shift as u32));
+        }
+    } else {
+        for i in 4033..4096 {
+            work[i] = work[i].wrapping_add(work[i - 1]);
+        }
     }
 
-    // Dequantize (shift left)
-    rfx_shift_slice(&mut work[0..1024], quant.hl1);
-    rfx_shift_slice(&mut work[1024..2048], quant.lh1);
-    rfx_shift_slice(&mut work[2048..3072], quant.hh1);
-    rfx_shift_slice(&mut work[3072..3328], quant.hl2);
-    rfx_shift_slice(&mut work[3328..3584], quant.lh2);
-    rfx_shift_slice(&mut work[3584..3840], quant.hh2);
-    rfx_shift_slice(&mut work[3840..3904], quant.hl3);
-    rfx_shift_slice(&mut work[3904..3968], quant.lh3);
-    rfx_shift_slice(&mut work[3968..4032], quant.hh3);
-    rfx_shift_slice(&mut work[4032..4096], quant.ll3);
+    // Dequantize all subbands except LL3
+    rfx_shift_subband(&mut work[0..1024], quant.hl1);
+    rfx_shift_subband(&mut work[1024..2048], quant.lh1);
+    rfx_shift_subband(&mut work[2048..3072], quant.hh1);
+    rfx_shift_subband(&mut work[3072..3328], quant.hl2);
+    rfx_shift_subband(&mut work[3328..3584], quant.lh2);
+    rfx_shift_subband(&mut work[3584..3840], quant.hh2);
+    rfx_shift_subband(&mut work[3840..3904], quant.hl3);
+    rfx_shift_subband(&mut work[3904..3968], quant.lh3);
+    rfx_shift_subband(&mut work[3968..4032], quant.hh3);
 
     // Inverse 2D DWT
     rfx_inverse_dwt_2d(work);
+}
+
+pub fn rfx_shift_subband(data: &mut [i16], factor: u8) {
+    if factor <= 1 {
+        return;
+    }
+    let shift = factor - 1;
+    for v in data.iter_mut() {
+        *v = v.wrapping_shl(shift as u32);
+    }
 }
 
 pub fn rfx_shift_slice(data: &mut [i16], shift: u8) {
@@ -267,100 +297,101 @@ pub fn rfx_shift_slice(data: &mut [i16], shift: u8) {
         return;
     }
     for v in data.iter_mut() {
-        *v <<= shift;
+        *v = v.wrapping_shl(shift as u32);
     }
 }
 
-#[inline(always)]
-fn clampi16(val: i32) -> i16 {
-    val.clamp(-32768, 32767) as i16
-}
-
-pub fn rfx_idwt_subband(low: &[i16], high: &[i16], dst: &mut [i16], count: usize) {
-    let half = count / 2;
-    if half == 0 {
-        return;
-    }
-    let mut h0 = high[0] as i32;
-    let mut l0 = low[0] as i32;
-    let mut x0 = clampi16(l0 - h0);
-    let mut x2 = x0;
-
-    for j in 0..(half - 1) {
-        let h1 = high[j + 1] as i32;
-        l0 = low[j + 1] as i32;
-        x2 = clampi16(l0 - ((h0 + h1) / 2));
-        let x1 = clampi16(((x0 as i32 + x2 as i32) / 2) + 2 * h0);
-        dst[j * 2] = x0;
-        dst[j * 2 + 1] = x1;
-        x0 = x2;
-        h0 = h1;
-    }
-
-    dst[(half - 1) * 2] = x2;
-    dst[(half - 1) * 2 + 1] = clampi16(x2 as i32 + 2 * h0);
-}
-
-pub fn rfx_inverse_dwt_2d_level(buffer: &mut [i16], size: usize) {
-    let half = size / 2;
-    let quarter = half * half;
+pub fn rfx_idwt_2d_level(buf: &mut [i16], n: usize) {
+    let nn = n * n;
+    let size = 2 * n;
     let mut tmp = vec![0i16; size * size];
 
-    // Subband regions in buffer:
-    // HL: buffer[0..quarter]
-    // LH: buffer[quarter..2*quarter]
-    // HH: buffer[2*quarter..3*quarter]
-    // LL: buffer[3*quarter..4*quarter]
+    let hl = &buf[0..nn];
+    let lh = &buf[nn..2 * nn];
+    let hh = &buf[2 * nn..3 * nn];
+    let ll = &buf[3 * nn..4 * nn];
 
-    // Step 1: 1D IDWT vertically on (LL, LH) -> low_cols and (HL, HH) -> high_cols
-    for col in 0..half {
-        let mut low_col = vec![0i16; half];
-        let mut high_col = vec![0i16; half];
-        let mut dst_col_l = vec![0i16; size];
-        let mut dst_col_h = vec![0i16; size];
+    // Step 1: Horizontal IDWT on each row
+    for row in 0..n {
+        let row_off = row * n;
+        let l_dst_off = row * size;
+        let h_dst_off = (row + n) * size;
 
-        for r in 0..half {
-            low_col[r] = buffer[3 * quarter + r * half + col];
-            high_col[r] = buffer[quarter + r * half + col];
+        let prev_even_l = (ll[row_off] as i32 - ((hl[row_off] as i32 * 2 + 1) >> 1)) as i16;
+        let prev_even_h = (lh[row_off] as i32 - ((hh[row_off] as i32 * 2 + 1) >> 1)) as i16;
+        tmp[l_dst_off] = prev_even_l;
+        tmp[h_dst_off] = prev_even_h;
+
+        let mut p_even_l = prev_even_l as i32;
+        let mut p_even_h = prev_even_h as i32;
+
+        for col in 1..n {
+            let x = col << 1;
+            let even_l = ll[row_off + col] as i32
+                - ((hl[row_off + col - 1] as i32 + hl[row_off + col] as i32 + 1) >> 1);
+            let even_h = lh[row_off + col] as i32
+                - ((hh[row_off + col - 1] as i32 + hh[row_off + col] as i32 + 1) >> 1);
+
+            tmp[l_dst_off + x - 1] = ((hl[row_off + col - 1] as i32) << 1)
+                .wrapping_add((p_even_l + even_l) >> 1) as i16;
+            tmp[h_dst_off + x - 1] = ((hh[row_off + col - 1] as i32) << 1)
+                .wrapping_add((p_even_h + even_h) >> 1) as i16;
+
+            tmp[l_dst_off + x] = even_l as i16;
+            tmp[h_dst_off + x] = even_h as i16;
+
+            p_even_l = even_l;
+            p_even_h = even_h;
         }
-        rfx_idwt_subband(&low_col, &high_col, &mut dst_col_l, size);
 
-        for r in 0..half {
-            low_col[r] = buffer[r * half + col];
-            high_col[r] = buffer[2 * quarter + r * half + col];
-        }
-        rfx_idwt_subband(&low_col, &high_col, &mut dst_col_h, size);
-
-        for r in 0..size {
-            tmp[r * size + col] = dst_col_l[r];
-            tmp[r * size + half + col] = dst_col_h[r];
-        }
+        let x = (n - 1) << 1;
+        tmp[l_dst_off + x + 1] =
+            (((hl[row_off + n - 1] as i32) << 1).wrapping_add(p_even_l)) as i16;
+        tmp[h_dst_off + x + 1] =
+            (((hh[row_off + n - 1] as i32) << 1).wrapping_add(p_even_h)) as i16;
     }
 
-    // Step 2: 1D IDWT horizontally on rows
-    for r in 0..size {
-        let (low_row, high_row) = tmp[r * size..(r + 1) * size].split_at(half);
-        let mut dst_row = vec![0i16; size];
-        rfx_idwt_subband(low_row, high_row, &mut dst_row, size);
-        buffer[3 * quarter + r * size..3 * quarter + (r + 1) * size].copy_from_slice(&dst_row);
+    // Step 2: Vertical IDWT on each column
+    for col in 0..size {
+        let l_val = tmp[col] as i32;
+        let h_val = tmp[n * size + col] as i32;
+        buf[col] = (l_val - ((h_val * 2 + 1) >> 1)) as i16;
+
+        for row in 1..n {
+            let l_idx = row * size + col;
+            let h_idx = (row + n) * size + col;
+            let h_prev_idx = (row - 1 + n) * size + col;
+
+            let even = tmp[l_idx] as i32
+                - ((tmp[h_prev_idx] as i32 + tmp[h_idx] as i32 + 1) >> 1);
+            buf[2 * row * size + col] = even as i16;
+
+            let prev_even = buf[(2 * row - 2) * size + col] as i32;
+            let odd = ((tmp[h_prev_idx] as i32) << 1).wrapping_add((prev_even + even) >> 1);
+            buf[(2 * row - 1) * size + col] = odd as i16;
+        }
+
+        let last_even = buf[(2 * n - 2) * size + col] as i32;
+        let last_h = tmp[(2 * n - 1) * size + col] as i32;
+        buf[(2 * n - 1) * size + col] = ((last_h << 1).wrapping_add(last_even)) as i16;
     }
 }
 
 pub fn rfx_inverse_dwt_2d(buffer: &mut [i16]) {
-    // Level 3: 8x8 subbands inside 4096 (offset 4096 - 64*4 = 3840)
+    // Level 3: 8x8 subbands -> 16x16 output (offset 3840..4096, 256 elements, n = 8)
     let mut lev3_buf = vec![0i16; 256];
     lev3_buf.copy_from_slice(&buffer[3840..4096]);
-    rfx_inverse_dwt_2d_level(&mut lev3_buf, 8);
+    rfx_idwt_2d_level(&mut lev3_buf, 8);
     buffer[3840..4096].copy_from_slice(&lev3_buf);
 
-    // Level 2: 16x16 subbands inside 4096 (offset 4096 - 256*4 = 3072)
+    // Level 2: 16x16 subbands -> 32x32 output (offset 3072..4096, 1024 elements, n = 16)
     let mut lev2_buf = vec![0i16; 1024];
     lev2_buf.copy_from_slice(&buffer[3072..4096]);
-    rfx_inverse_dwt_2d_level(&mut lev2_buf, 16);
+    rfx_idwt_2d_level(&mut lev2_buf, 16);
     buffer[3072..4096].copy_from_slice(&lev2_buf);
 
-    // Level 1: 32x32 subbands -> 64x64 output (offset 0..4096)
-    rfx_inverse_dwt_2d_level(buffer, 64);
+    // Level 1: 32x32 subbands -> 64x64 output (offset 0..4096, 4096 elements, n = 32)
+    rfx_idwt_2d_level(buffer, 32);
 }
 
 pub fn rfx_place_tile_abs(
@@ -387,9 +418,9 @@ pub fn rfx_place_tile_abs(
             }
 
             let idx = row_start + x;
-            let y_val = y_coeffs[idx] as i32;
-            let cb_val = cb_coeffs[idx] as i32;
-            let cr_val = cr_coeffs[idx] as i32;
+            let y_val = y_coeffs[idx] as i64;
+            let cb_val = cb_coeffs[idx] as i64;
+            let cr_val = cr_coeffs[idx] as i64;
 
             let ys = (y_val + 4096) << 16;
             let b = ((cb_val * 115992 + ys) >> 21).clamp(0, 255) as u8;

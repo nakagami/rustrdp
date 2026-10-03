@@ -597,7 +597,7 @@ impl RdpgfxHandler {
                 if let Some(surf) = self.surfaces.get_mut(&surf_id) {
                     let sw = surf.width as usize;
                     let sh = surf.height as usize;
-                    self.rfx_dec.decode(
+                    let rects = self.rfx_dec.decode(
                         bmp_data,
                         dest_left as usize,
                         dest_top as usize,
@@ -605,25 +605,14 @@ impl RdpgfxHandler {
                         sw,
                         sh,
                     );
-                    if mapped {
-                        let pixels = copy_surface_rect(
-                            &surf.data,
-                            sw,
-                            sh,
-                            dest_left as usize,
-                            dest_top as usize,
-                            w as usize,
-                            h as usize,
-                        );
-                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
-                    }
+                    emit_tile_rects(surf, &rects, bitmaps);
                 }
             }
             CODEC_PROGRESSIVE => {
                 if let Some(surf) = self.surfaces.get_mut(&surf_id) {
                     let sw = surf.width as usize;
                     let sh = surf.height as usize;
-                    self.rfx_prog_dec.decode(
+                    let rects = self.rfx_prog_dec.decode(
                         bmp_data,
                         dest_left as usize,
                         dest_top as usize,
@@ -631,18 +620,7 @@ impl RdpgfxHandler {
                         sw,
                         sh,
                     );
-                    if mapped {
-                        let pixels = copy_surface_rect(
-                            &surf.data,
-                            sw,
-                            sh,
-                            dest_left as usize,
-                            dest_top as usize,
-                            w as usize,
-                            h as usize,
-                        );
-                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
-                    }
+                    emit_tile_rects(surf, &rects, bitmaps);
                 }
             }
             CODEC_AVC420 => {
@@ -652,7 +630,7 @@ impl RdpgfxHandler {
                         nv12.screen_y = abs_y;
                         nv12_frames.push(nv12);
                     }
-                } else if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
+                } else if let Some((pixels, fw, fh, regions, force_regions)) = self.decode_avc420(bmp_data) {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     let mut discard = Vec::new();
@@ -670,7 +648,7 @@ impl RdpgfxHandler {
                         dest_top as i32,
                         abs_x,
                         abs_y,
-                        false,
+                        force_regions,
                         &regions,
                     );
                 } else if self.avc_dec.is_none() && mapped {
@@ -865,22 +843,16 @@ impl RdpgfxHandler {
                 if let Some(surf) = self.surfaces.get_mut(&surf_id) {
                     let sw = surf.width as usize;
                     let sh = surf.height as usize;
-                    self.rfx_dec.decode(bmp_data, 0, 0, &mut surf.data, sw, sh);
-                    if mapped {
-                        let pixels = copy_surface_rect(&surf.data, sw, sh, 0, 0, w as usize, h as usize);
-                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
-                    }
+                    let rects = self.rfx_dec.decode(bmp_data, 0, 0, &mut surf.data, sw, sh);
+                    emit_tile_rects(surf, &rects, bitmaps);
                 }
             }
             CODEC_PROGRESSIVE => {
                 if let Some(surf) = self.surfaces.get_mut(&surf_id) {
                     let sw = surf.width as usize;
                     let sh = surf.height as usize;
-                    self.rfx_prog_dec.decode(bmp_data, 0, 0, &mut surf.data, sw, sh);
-                    if mapped {
-                        let pixels = copy_surface_rect(&surf.data, sw, sh, 0, 0, w as usize, h as usize);
-                        bitmaps.push(make_bitmap(abs_x, abs_y, w, h, pixels));
-                    }
+                    let rects = self.rfx_prog_dec.decode(bmp_data, 0, 0, &mut surf.data, sw, sh);
+                    emit_tile_rects(surf, &rects, bitmaps);
                 }
             }
             CODEC_AVC420 => {
@@ -890,7 +862,7 @@ impl RdpgfxHandler {
                         nv12.screen_y = abs_y;
                         nv12_frames.push(nv12);
                     }
-                } else if let Some((pixels, fw, fh, regions)) = self.decode_avc420(bmp_data) {
+                } else if let Some((pixels, fw, fh, regions, force_regions)) = self.decode_avc420(bmp_data) {
                     let (fw, fh) = (fw as i32, fh as i32);
                     let (ew, eh) = (fw.min(w), fh.min(h));
                     log::debug!(
@@ -912,7 +884,7 @@ impl RdpgfxHandler {
                         0,
                         abs_x,
                         abs_y,
-                        false,
+                        force_regions,
                         &regions,
                     );
                 } else if self.avc_dec.is_none() && mapped {
@@ -1200,11 +1172,68 @@ impl RdpgfxHandler {
 
     // ── H.264 / AVC decode helpers ─────────────────────────────────────────────
 
-    fn decode_avc420(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>)> {
+    fn decode_avc420(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>, bool)> {
         let stream = parse_avc420(data)?;
         let regions = stream.regions;
-        self.decode_h264(&stream.h264_data)
-            .map(|(pixels, w, h)| (pixels, w, h, regions))
+        let uses_region_fifo = self
+            .avc_dec
+            .as_ref()
+            .map(|dec| dec.uses_region_fifo())
+            .unwrap_or(false);
+
+        if uses_region_fifo {
+            self.pending_avc_regions_queue.push_back(regions.clone());
+        }
+
+        if let Some(ref mut dec) = self.avc_dec {
+            let hints: Vec<(u16, u16, u16, u16)> = regions
+                .iter()
+                .map(|r| (r.left, r.top, r.right, r.bottom))
+                .collect();
+            dec.set_region_hint(&hints);
+        }
+
+        let result = self.decode_h264(&stream.h264_data);
+
+        let (flushed, drain_count) = if let Some(ref mut dec) = self.avc_dec {
+            (dec.take_decoder_flushed(), dec.take_drain_count())
+        } else {
+            (false, 0)
+        };
+
+        if flushed {
+            let queue_len_before = self.pending_avc_regions_queue.len();
+            self.pending_avc_regions_queue.clear();
+            if uses_region_fifo {
+                self.pending_avc_regions_queue.push_back(regions.clone());
+            }
+            log::debug!(
+                "[rdpgfx] decode_avc420: decoder flushed during decode — cleared FIFO (had {} entries), re-pushed current regions",
+                queue_len_before
+            );
+        }
+
+        let is_mismatch = self.avc_dec_take_full_blit();
+
+        let effective_regions = if drain_count > 0 {
+            if uses_region_fifo {
+                let mut popped = None;
+                for _ in 0..drain_count {
+                    popped = self.pending_avc_regions_queue.pop_front();
+                }
+                popped.unwrap_or_else(|| regions.clone())
+            } else {
+                regions.clone()
+            }
+        } else {
+            regions.clone()
+        };
+
+        if result.is_none() {
+            return None;
+        }
+
+        result.map(|(pixels, w, h)| (pixels, w, h, effective_regions, is_mismatch))
     }
 
     fn decode_avc444(&mut self, data: &[u8]) -> Option<(Vec<u8>, u32, u32, Vec<AvcRect>, bool)> {
@@ -2269,6 +2298,24 @@ fn extract_region(data: &[u8], stride: i32, x: i32, y: i32, w: i32, h: i32) -> V
     out
 }
 
+fn emit_tile_rects(
+    surf: &Surface,
+    rects: &[(usize, usize, usize, usize)],
+    bitmaps: &mut Vec<Bitmap>,
+) {
+    if !surf.mapped || rects.is_empty() {
+        return;
+    }
+    let sw = surf.width as usize;
+    let sh = surf.height as usize;
+    for &(rx, ry, rw, rh) in rects {
+        let pixels = copy_surface_rect(&surf.data, sw, sh, rx, ry, rw, rh);
+        let abs_x = surf.output_x as i32 + rx as i32;
+        let abs_y = surf.output_y as i32 + ry as i32;
+        bitmaps.push(make_bitmap(abs_x, abs_y, rw as i32, rh as i32, pixels));
+    }
+}
+
 fn copy_surface_rect(
     data: &[u8],
     surf_w: usize,
@@ -2307,22 +2354,28 @@ pub fn build_caps_advertise() -> Vec<u8> {
 fn build_caps_advertise_with_options(disable_avc444: bool) -> Vec<u8> {
     let mut caps = Vec::new();
 
-    // capsSetCount
-    let cap_set_count = if disable_avc444 { 2 } else { 11 };
-    caps.extend_from_slice(&(cap_set_count as u16).to_le_bytes());
-
     let push_cap = |caps: &mut Vec<u8>, version: u32, flags: u32| {
         caps.extend_from_slice(&version.to_le_bytes());
         caps.extend_from_slice(&4u32.to_le_bytes()); // capsDataLength
         caps.extend_from_slice(&flags.to_le_bytes());
     };
-    push_cap(&mut caps, CAP_VERSION_8, CAP_FLAG_THIN_CLIENT);
-    push_cap(
-        &mut caps,
-        CAP_VERSION_81,
-        CAP_FLAG_SMALL_CACHE | CAP_FLAG_AVC420_ENABLED,
-    );
-    if !disable_avc444 {
+
+    if disable_avc444 {
+        caps.extend_from_slice(&2u16.to_le_bytes()); // capsSetCount = 2
+        push_cap(&mut caps, CAP_VERSION_8, CAP_FLAG_THIN_CLIENT);
+        push_cap(
+            &mut caps,
+            CAP_VERSION_81,
+            CAP_FLAG_SMALL_CACHE | CAP_FLAG_AVC420_ENABLED,
+        );
+    } else {
+        caps.extend_from_slice(&11u16.to_le_bytes()); // capsSetCount = 11
+        push_cap(&mut caps, CAP_VERSION_8, CAP_FLAG_THIN_CLIENT);
+        push_cap(
+            &mut caps,
+            CAP_VERSION_81,
+            CAP_FLAG_SMALL_CACHE | CAP_FLAG_AVC420_ENABLED,
+        );
         push_cap(&mut caps, CAP_VERSION_10, CAP_FLAG_SMALL_CACHE);
         caps.extend_from_slice(&CAP_VERSION_101.to_le_bytes());
         caps.extend_from_slice(&16u32.to_le_bytes());

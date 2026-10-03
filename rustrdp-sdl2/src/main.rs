@@ -278,60 +278,58 @@ async fn run() -> Result<(), Box<dyn Error>> {
         //
         // Mirrors grdpsdl2's goroutine: RecvEvent() → event channel.
         // Runs concurrently on the same OS thread via cooperative multitasking.
-        // The 8 ms timeout ensures the input-drain loop fires regularly even
-        // when no RDP data arrives, matching grdpsdl2's WaitEventTimeout(8).
         let task = tokio::task::spawn_local(async move {
             let mut session = rdp_session;
             loop {
-                // Drain all pending input commands before waiting for the next RDP frame.
-                // If input_tx is dropped (SDL loop exited), exit immediately.
-                loop {
-                    match input_rx.try_recv() {
-                        Ok(cmd) => {
-                            let result = match cmd {
-                                InputCmd::KeyDown { flags, scancode } => {
-                                    session.send_key_down(flags, scancode).await
+                tokio::select! {
+                    biased;
+                    cmd_opt = input_rx.recv() => {
+                        match cmd_opt {
+                            Some(cmd) => {
+                                let result = match cmd {
+                                    InputCmd::KeyDown { flags, scancode } => {
+                                        session.send_key_down(flags, scancode).await
+                                    }
+                                    InputCmd::KeyUp { flags, scancode } => session.send_key_up(flags, scancode).await,
+                                    InputCmd::MouseMove { x, y } => session.send_mouse_move(x, y).await,
+                                    InputCmd::MouseButton { btn, down, x, y } => {
+                                        session.send_mouse_button(btn, down, x, y).await
+                                    }
+                                    InputCmd::MouseWheel { delta } => session.send_mouse_wheel(delta).await,
+                                };
+                                if let Err(e) = result {
+                                    log::error!("Input send error: {}", e);
+                                    return;
                                 }
-                                InputCmd::KeyUp { flags, scancode } => session.send_key_up(flags, scancode).await,
-                                InputCmd::MouseMove { x, y } => session.send_mouse_move(x, y).await,
-                                InputCmd::MouseButton { btn, down, x, y } => {
-                                    session.send_mouse_button(btn, down, x, y).await
-                                }
-                                InputCmd::MouseWheel { delta } => session.send_mouse_wheel(delta).await,
-                            };
-                            if let Err(e) = result {
-                                log::error!("Input send error: {}", e);
-                                return;
                             }
+                            None => return, // SDL loop exited (input_tx dropped)
                         }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => return, // SDL loop exited
                     }
-                }
-
-                match tokio::time::timeout(Duration::from_millis(8), session.recv_event()).await {
-                    Ok(Ok(event)) => {
-                        // NV12 video frames go through the dedicated drop-on-full
-                        // channel so that stale frames are discarded when the SDL
-                        // loop is momentarily behind, matching grdpsdl2's non-blocking
-                        // channel send for YUV frames.
-                        if matches!(event, RdpEvent::NV12Frame(_)) {
-                            let _ = video_tx.try_send(event);
-                        } else {
-                            let deactivated = matches!(event, RdpEvent::Deactivated);
-                            if event_tx.send(event).await.is_err() {
-                                break; // SDL side dropped — application is exiting
+                    res = session.recv_event() => {
+                        match res {
+                            Ok(event) => {
+                                // NV12 video frames go through the dedicated drop-on-full
+                                // channel so that stale frames are discarded when the SDL
+                                // loop is momentarily behind, matching grdpsdl2's non-blocking
+                                // channel send for YUV frames.
+                                if matches!(event, RdpEvent::NV12Frame(_)) {
+                                    let _ = video_tx.try_send(event);
+                                } else {
+                                    let deactivated = matches!(event, RdpEvent::Deactivated);
+                                    if event_tx.send(event).await.is_err() {
+                                        break; // SDL side dropped — application is exiting
+                                    }
+                                    if deactivated {
+                                        break;
+                                    }
+                                }
                             }
-                            if deactivated {
+                            Err(e) => {
+                                log::error!("RDP session error: {}", e);
                                 break;
                             }
                         }
                     }
-                    Ok(Err(e)) => {
-                        log::error!("RDP session error: {}", e);
-                        break;
-                    }
-                    Err(_timeout) => {} // 8 ms with no data — loop back to drain input
                 }
             }
         });
@@ -716,6 +714,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         // Upload each frame to GPU but defer present until after
                         // all events are drained — avoids N VSync blocks per loop.
                         for frame in frames {
+                            let is_full_screen = frame.screen_x == 0
+                                && frame.screen_y == 0
+                                && frame.width >= session_width as u32
+                                && frame.height >= session_height as u32;
+                            if is_full_screen {
+                                let _ = rdp_ui.clear_overlay();
+                            }
                             if let Err(e) = rdp_ui.upload_nv12_frame(&frame) {
                                 log::error!("Failed to upload NV12 frame: {}", e);
                             }

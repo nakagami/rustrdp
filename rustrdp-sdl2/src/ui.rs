@@ -18,6 +18,56 @@ extern "C" {
     ) -> c_int;
 }
 
+fn create_and_init_nv12_texture(
+    canvas_raw: *mut sdl2::sys::SDL_Renderer,
+    width: u32,
+    height: u32,
+) -> Result<*mut sdl2::sys::SDL_Texture, String> {
+    let tex = unsafe {
+        sdl2::sys::SDL_CreateTexture(
+            canvas_raw,
+            0x3231_564E_u32, // SDL_PIXELFORMAT_NV12
+            sdl2::sys::SDL_TextureAccess::SDL_TEXTUREACCESS_STREAMING as c_int,
+            width as c_int,
+            height as c_int,
+        )
+    };
+    if tex.is_null() {
+        let err_msg = unsafe {
+            let s = sdl2::sys::SDL_GetError();
+            if s.is_null() {
+                "SDL_CreateTexture NV12 failed".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
+            }
+        };
+        return Err(err_msg);
+    }
+
+    // Initialize NV12 texture with black (Y=0, UV=128) to prevent green flash
+    // before the first video frame arrives.
+    let w = width as usize;
+    let h = height as usize;
+    let ph = (h + 1) / 2;
+    let y_buf = vec![0u8; w * h];
+    let uv_buf = vec![128u8; w * ph];
+    let ret = unsafe {
+        SDL_UpdateNVTexture(
+            tex,
+            std::ptr::null(),
+            y_buf.as_ptr(),
+            w as c_int,
+            uv_buf.as_ptr(),
+            w as c_int,
+        )
+    };
+    if ret < 0 {
+        log::warn!("Failed to initialize NV12 texture with black: ret={}", ret);
+    }
+
+    Ok(tex)
+}
+
 // Fields are declared in drop order (first declared → first dropped).
 // nv12_tex must drop before canvas (SDL_DestroyTexture before SDL_DestroyRenderer).
 pub struct RdpUI {
@@ -25,12 +75,7 @@ pub struct RdpUI {
     nv12_tex: *mut sdl2::sys::SDL_Texture,
     nv12_tex_w: u32,
     nv12_tex_h: u32,
-    nv12_last_rect: Option<Rect>,
-    /// True when the last NV12 frame covered the entire screen.
-    /// Used to skip the background texture blit in `present_composed`,
-    /// matching grdpsdl2's optimisation that skips SDL_RenderClear when
-    /// full-screen YUV is present.
-    nv12_fullscreen: bool,
+    nv12_ready: bool,
     texture: Texture,                               // dropped after nv12_tex
     texture_creator: TextureCreator<WindowContext>,
     canvas: Canvas<Window>,                         // dropped last: SDL_DestroyRenderer
@@ -118,12 +163,19 @@ impl RdpUI {
             );
         }
 
+        let (nv12_tex, nv12_tex_w, nv12_tex_h) = match create_and_init_nv12_texture(canvas.raw(), width as u32, height as u32) {
+            Ok(tex) => (tex, width as u32, height as u32),
+            Err(e) => {
+                log::warn!("NV12 texture unavailable, will use BGRA fallback: {}", e);
+                (std::ptr::null_mut(), 0, 0)
+            }
+        };
+
         Ok(RdpUI {
-            nv12_tex: std::ptr::null_mut(),
-            nv12_tex_w: 0,
-            nv12_tex_h: 0,
-            nv12_last_rect: None,
-            nv12_fullscreen: false,
+            nv12_tex,
+            nv12_tex_w,
+            nv12_tex_h,
+            nv12_ready: false,
             texture,
             texture_creator,
             canvas,
@@ -174,14 +226,18 @@ impl RdpUI {
         self.texture = texture;
         self.width = width;
         self.height = height;
-        // Clear NV12 state on resize
-        self.nv12_last_rect = None;
-        self.nv12_fullscreen = false;
+        // Recreate NV12 texture at the new dimensions
         if !self.nv12_tex.is_null() {
             unsafe { sdl2::sys::SDL_DestroyTexture(self.nv12_tex); }
             self.nv12_tex = std::ptr::null_mut();
             self.nv12_tex_w = 0;
             self.nv12_tex_h = 0;
+            self.nv12_ready = false;
+        }
+        if let Ok(tex) = create_and_init_nv12_texture(self.canvas.raw(), width as u32, height as u32) {
+            self.nv12_tex = tex;
+            self.nv12_tex_w = width as u32;
+            self.nv12_tex_h = height as u32;
         }
         Ok(())
     }
@@ -210,89 +266,56 @@ impl RdpUI {
     /// Upload a raw NV12 frame to the GPU texture but do **not** present.
     /// Call `present_composed` once after draining all pending frames.
     pub fn upload_nv12_frame(&mut self, frame: &rustrdp_core::avc::NV12Frame) -> Result<(), Box<dyn Error>> {
-        let w = frame.width;
-        let h = frame.height;
+        let scr_w = self.width as i32;
+        let scr_h = self.height as i32;
 
-        if self.nv12_tex.is_null() || self.nv12_tex_w != w || self.nv12_tex_h != h {
+        if self.nv12_tex.is_null() || self.nv12_tex_w != self.width as u32 || self.nv12_tex_h != self.height as u32 {
             if !self.nv12_tex.is_null() {
                 unsafe { sdl2::sys::SDL_DestroyTexture(self.nv12_tex); }
+                self.nv12_tex = std::ptr::null_mut();
             }
-            self.nv12_tex = unsafe {
-                sdl2::sys::SDL_CreateTexture(
-                    self.canvas.raw(),
-                    0x3231_564E_u32,
-                    sdl2::sys::SDL_TextureAccess::SDL_TEXTUREACCESS_STREAMING as c_int,
-                    w as c_int,
-                    h as c_int,
+            if let Ok(tex) = create_and_init_nv12_texture(self.canvas.raw(), self.width as u32, self.height as u32) {
+                self.nv12_tex = tex;
+                self.nv12_tex_w = self.width as u32;
+                self.nv12_tex_h = self.height as u32;
+            } else {
+                return Err("Failed to create NV12 texture".into());
+            }
+        }
+
+        let dst_w = (frame.width as i32).min(scr_w - frame.screen_x).max(0);
+        let dst_h = (frame.height as i32).min(scr_h - frame.screen_y).max(0);
+
+        if dst_w > 0 && dst_h > 0 {
+            let update_rect = sdl2::sys::SDL_Rect {
+                x: frame.screen_x as c_int,
+                y: frame.screen_y as c_int,
+                w: dst_w as c_int,
+                h: dst_h as c_int,
+            };
+
+            let ret = unsafe {
+                SDL_UpdateNVTexture(
+                    self.nv12_tex,
+                    &update_rect,
+                    frame.y.as_ptr(),
+                    frame.y_stride as c_int,
+                    frame.uv.as_ptr(),
+                    frame.uv_stride as c_int,
                 )
             };
-            if self.nv12_tex.is_null() {
+            if ret < 0 {
                 let err_msg = unsafe {
                     let s = sdl2::sys::SDL_GetError();
                     if s.is_null() {
-                        "SDL_CreateTexture NV12 failed".to_string()
+                        format!("SDL_UpdateNVTexture failed: {}", ret)
                     } else {
                         std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
                     }
                 };
                 return Err(err_msg.into());
             }
-            self.nv12_tex_w = w;
-            self.nv12_tex_h = h;
-            log::debug!("[ui] created NV12 texture {}x{}", w, h);
-        }
-
-        let ret = unsafe {
-            SDL_UpdateNVTexture(
-                self.nv12_tex,
-                std::ptr::null(),
-                frame.y.as_ptr(),
-                frame.y_stride as c_int,
-                frame.uv.as_ptr(),
-                frame.uv_stride as c_int,
-            )
-        };
-        if ret < 0 {
-            let err_msg = unsafe {
-                let s = sdl2::sys::SDL_GetError();
-                if s.is_null() {
-                    format!("SDL_UpdateNVTexture failed: {}", ret)
-                } else {
-                    std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
-                }
-            };
-            return Err(err_msg.into());
-        }
-
-        let scr_w = self.width as i32;
-        let scr_h = self.height as i32;
-        let dst_w = (w as i32).min(scr_w - frame.screen_x).max(0);
-        let dst_h = (h as i32).min(scr_h - frame.screen_y).max(0);
-        let uncovered_x = scr_w - (frame.screen_x + dst_w);
-        let uncovered_y = scr_h - (frame.screen_y + dst_h);
-        log::debug!(
-            "[ui] upload_nv12_frame: frame={}x{} screen_pos=({},{}) dst={}x{} screen={}x{} uncovered_right={} uncovered_bottom={}",
-            w, h, frame.screen_x, frame.screen_y,
-            dst_w, dst_h, scr_w, scr_h,
-            uncovered_x, uncovered_y
-        );
-        if dst_w > 0 && dst_h > 0 {
-            self.nv12_last_rect = Some(Rect::new(
-                frame.screen_x,
-                frame.screen_y,
-                dst_w as u32,
-                dst_h as u32,
-            ));
-            // When this frame covers the entire screen, clear the BGRA overlay texture
-            // so stale non-H264 patches do not obscure the new H264 baseline.
-            // Matches grdpsdl2's clearOverlayDirty on full-screen YUV frames.
-            self.nv12_fullscreen = frame.screen_x == 0
-                && frame.screen_y == 0
-                && dst_w >= scr_w
-                && dst_h >= scr_h;
-            if self.nv12_fullscreen {
-                self.clear_overlay()?;
-            }
+            self.nv12_ready = true;
         }
         Ok(())
     }
@@ -305,26 +328,49 @@ impl RdpUI {
         self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
         self.canvas.clear();
 
-        if let Some(rect) = self.nv12_last_rect {
-            if !self.nv12_tex.is_null() {
-                let dst = sdl2::sys::SDL_Rect {
-                    x: rect.x(),
-                    y: rect.y(),
-                    w: rect.width() as c_int,
-                    h: rect.height() as c_int,
-                };
-                unsafe {
-                    sdl2::sys::SDL_RenderCopy(
-                        self.canvas.raw(),
-                        self.nv12_tex,
-                        std::ptr::null(),
-                        &dst,
-                    );
-                }
+        if self.nv12_ready && !self.nv12_tex.is_null() {
+            unsafe {
+                sdl2::sys::SDL_RenderCopy(
+                    self.canvas.raw(),
+                    self.nv12_tex,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
             }
         }
         self.canvas.copy(&self.texture, None, None)?;
         self.canvas.present();
+        Ok(())
+    }
+
+    /// Save current canvas content to a BMP file.
+    pub fn save_screenshot(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
+        self.canvas.set_draw_color(sdl2::pixels::Color::RGB(0, 0, 0));
+        self.canvas.clear();
+
+        if self.nv12_ready && !self.nv12_tex.is_null() {
+            unsafe {
+                sdl2::sys::SDL_RenderCopy(
+                    self.canvas.raw(),
+                    self.nv12_tex,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+            }
+        }
+        self.canvas.copy(&self.texture, None, None)?;
+        let pixels = self.canvas.read_pixels(None, PixelFormatEnum::RGB24)?;
+        self.canvas.present();
+
+        let surface = sdl2::surface::Surface::from_data(
+            pixels.as_slice().to_vec().leak(),
+            self.width as u32,
+            self.height as u32,
+            self.width as u32 * 3,
+            PixelFormatEnum::RGB24,
+        )?;
+        surface.save_bmp(path)?;
+        log::info!("Screenshot saved to {}", path);
         Ok(())
     }
 
