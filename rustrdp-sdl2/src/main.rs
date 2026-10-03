@@ -158,6 +158,7 @@ enum InputCmd {
     MouseMove { x: u16, y: u16 },
     MouseButton { btn: u8, down: bool, x: u16, y: u16 },
     MouseWheel { delta: i16 },
+    ForceRefresh,
 }
 
 // Use current_thread runtime so that spawn_local works without requiring Send bounds.
@@ -296,6 +297,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                         session.send_mouse_button(btn, down, x, y).await
                                     }
                                     InputCmd::MouseWheel { delta } => session.send_mouse_wheel(delta).await,
+                                    InputCmd::ForceRefresh => session.send_force_refresh().await,
                                 };
                                 if let Err(e) = result {
                                     log::error!("Input send error: {}", e);
@@ -340,6 +342,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         //
         // last_server_activity arms the video-stall watchdog.  None means the
         // watchdog is disarmed (no data received yet this session).
+        let session_start = Instant::now();
+        let mut ever_showed_frame = false;
+        let mut never_shown_last_keyframe: Option<Instant> = None;
         let mut last_server_activity: Option<Instant> = None;
         // pending_resize: (new_w, new_h, timestamp of last resize event).
         // After RESIZE_DEBOUNCE idle time the session reconnects with the new size.
@@ -480,6 +485,32 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
 
+            // Watchdog for initial black screen / never-shown-a-frame:
+            // Send ForceRefresh and MouseMove at 2.5s if no genuine frame has been shown yet.
+            if !ever_showed_frame && pending_resize.is_none() {
+                let elapsed = session_start.elapsed();
+                if elapsed >= Duration::from_millis(2500)
+                    && (never_shown_last_keyframe.is_none()
+                        || never_shown_last_keyframe.unwrap().elapsed() >= Duration::from_secs(2))
+                {
+                    log::warn!(
+                        "Black screen, sending ForceRefresh and MouseMove sinceStart={:.3}s",
+                        elapsed.as_secs_f64()
+                    );
+                    pending_inputs.push(InputCmd::MouseMove { x: 500, y: 500 });
+                    pending_inputs.push(InputCmd::ForceRefresh);
+                    never_shown_last_keyframe = Some(Instant::now());
+                }
+                if elapsed > VIDEO_STALL_TIMEOUT {
+                    log::warn!(
+                        "Video stalled without ever showing a frame, reconnecting stalled={:.3}s",
+                        elapsed.as_secs_f64()
+                    );
+                    reconnect_dims = Some((session_width, session_height));
+                    running = false;
+                }
+            }
+
             // Video stall watchdog: if server traffic stops for VIDEO_STALL_TIMEOUT
             // (and no resize is pending), check whether the I/O task is still alive.
             // If the task has already exited (network error), reconnect immediately.
@@ -540,6 +571,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                     Ok(RdpEvent::Bitmap(bitmaps)) => {
                         last_server_activity = Some(Instant::now());
+                        if !bitmaps.is_empty() {
+                            ever_showed_frame = true;
+                        }
                         if log::log_enabled!(log::Level::Trace) {
                             if let Some(first) = bitmaps.first() {
                                 log::trace!(
@@ -711,6 +745,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 match video_rx.try_recv() {
                     Ok(RdpEvent::NV12Frame(frames)) => {
                         last_server_activity = Some(Instant::now());
+                        if !frames.is_empty() {
+                            ever_showed_frame = true;
+                        }
                         // Upload each frame to GPU but defer present until after
                         // all events are drained — avoids N VSync blocks per loop.
                         for frame in frames {

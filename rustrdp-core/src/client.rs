@@ -447,7 +447,7 @@ impl<T: Transport> RdpSession<T> {
     /// Send a suppress→allow SuppressOutput PDU pair to request a fresh IDR keyframe.
     /// The suppress PDU (0x00) has no desktop rectangle (4 bytes total).
     /// The allow PDU (0x01) includes the full desktop rectangle (12 bytes total).
-    async fn send_force_refresh(&mut self) -> Result<(), RdpError> {
+    pub async fn send_force_refresh(&mut self) -> Result<(), RdpError> {
         // SUPPRESS: AllowDisplayUpdates=0x00 + 3 bytes padding (no rect)
         let suppress_body = [0x00u8, 0x00, 0x00, 0x00];
         let pdu = build_data_pdu(
